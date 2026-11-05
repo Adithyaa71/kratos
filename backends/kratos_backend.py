@@ -254,7 +254,21 @@ def act(payload: dict[str, Any]) -> dict[str, Any]:
     target = payload.get("target")
     started = time.time()
 
-    def done(applied: bool, readback: Any = None, reason: str | None = None) -> dict[str, Any]:
+    def done(
+        applied: bool,
+        readback: Any = None,
+        reason: str | None = None,
+        method: str | None = None,
+    ) -> dict[str, Any]:
+        """Report the outcome, and how it was delivered.
+
+        `method` is `semantic` when the control's own interface carried the
+        action and `physical` when the mouse or keyboard did it at a position.
+        The distinction matters: a position is a guess about where a control
+        was a moment ago, and an action that quietly downgraded to one is not
+        the action that was asked for. It stays allowed -- most of this desktop
+        exposes no pattern to invoke -- but it is recorded.
+        """
         result = {
             "applied": bool(applied),
             "readback": readback,
@@ -262,6 +276,8 @@ def act(payload: dict[str, Any]) -> dict[str, Any]:
         }
         if reason:
             result["reason"] = reason
+        if method:
+            result["method"] = method
         return result
 
     if kind in ("wait", "none"):
@@ -317,12 +333,12 @@ def act(payload: dict[str, Any]) -> dict[str, Any]:
 
     if kind == "click":
         actions.click(x, y)
-        return done(True)
+        return done(True, method="physical")
 
     if kind == "scroll":
         actions.click(x, y)
         actions.scroll(int(payload.get("amount") or 3))
-        return done(True)
+        return done(True, method="physical")
 
     if kind == "type":
         text = payload.get("text") or ""
@@ -348,8 +364,15 @@ def act(payload: dict[str, Any]) -> dict[str, Any]:
         # expose no value at all, and treating "unreadable" as failure would
         # make the broker fall back after every successful keystroke.
         if readback is not None and text[:40] not in readback:
-            return done(False, readback, "the field did not take the text")
-        return done(True, readback)
+            return done(
+                False,
+                readback,
+                "the field did not take the text",
+                method="semantic" if placed else "physical",
+            )
+        # `placed` records which path ran: the value pattern wrote the whole
+        # string atomically, or we clicked where the field was and typed.
+        return done(True, readback, method="semantic" if placed else "physical")
 
     if kind == "select":
         actions.click(x, y)
@@ -358,7 +381,7 @@ def act(payload: dict[str, Any]) -> dict[str, Any]:
             time.sleep(0.2)
             actions.type_text(wanted)
             actions.press_key("enter")
-        return done(True)
+        return done(True, method="physical")
 
     return done(False, reason=f"unsupported kind {kind}")
 

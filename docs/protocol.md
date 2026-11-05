@@ -372,6 +372,40 @@ are reported because a broker started by hand, from a shell with
 editing -- and the first symptom of that is a key that appears to have
 vanished.
 
+### 4.7a What an act result now carries
+
+Three fields added after the first live sessions, all optional and all
+additive:
+
+| field | on | meaning |
+|---|---|---|
+| `refusal` | `refused` | `ambiguous`, `unsure`, or `no_such_action` |
+| `method` | anything dispatched | `semantic` or `physical` |
+| `effect.settle_ms` / `effect.settled` | anything dispatched | how long the broker waited for the screen to move, and whether it ended early |
+
+**`refusal` splits two failures that used to look alike.** A low confidence can
+mean *nothing here looks right* or *two of these look identical*, and the fixes
+are opposite: re-describe the step, or name the container. When the top two
+options score within 0.10 of each other the decision carries
+`ambiguous_with`, listing what it was torn between, and the refusal says
+`ambiguous`.
+
+**`method` makes a downgrade visible.** `semantic` means the control's own
+interface carried the action -- a UI Automation pattern, a DOM event.
+`physical` means the mouse or keyboard did it at a position, because no
+pattern was available. That is allowed, since most of a Windows desktop
+exposes nothing to invoke, but a position is a guess about where a control was
+a moment ago, and an action that silently became one is not the action that
+was asked for. Both are recorded in the journal.
+
+**`settle_ms` is earned, not fixed.** The broker used to sleep 350ms after
+every action. It now polls the target's pixels against the drift measured
+moments before and returns as soon as they move, waiting out
+`settle_max_ms` (default 1200) only when nothing does -- which is the case
+that has to be waited out before `no_effect` can honestly be claimed.
+`settled: false` beside `executed` means the pixels never moved and the
+structure or a read-back carried the proof.
+
 ### 4.8 `log.tail`
 
 ```json
@@ -608,6 +642,17 @@ reassembles in order and emits one pipe line. A missing chunk within 4s is
 ---
 
 ## 7. Error codes — closed set
+
+Every error carries **`retry_safe`**. The question an agent has after a failure
+is not what went wrong but *may I send that again*, and for anything that moves
+a mouse the answer is sometimes no: a backend that stopped answering
+mid-dispatch may already have delivered the input. Anything the broker turned
+away never reached a screen and is safe to repeat. The field defaults to `true`
+when absent, so an older peer is not read as forbidding retries, and the broker
+can lower it per-case with more knowledge than the code alone carries.
+
+The `retry?` column below is advice about whether repeating helps; `retry_safe`
+is the narrower question of whether repeating is *safe*.
 
 | code | meaning | retry? |
 |---|---|---|

@@ -156,6 +156,19 @@ to say anything. When you see it, call `desktop_verify`.
 
 Work down the list. **Never route around a refusal.**
 
+### `refused` — read the `refusal` field first
+
+It says which of three things happened, and they have different fixes:
+
+| `refusal` | what it means | what to do |
+|---|---|---|
+| `ambiguous` | two targets scored alike; `decision.ambiguous_with` names them | name the container: "the Send button **in the compose dialog**". Do not re-phrase the action |
+| `unsure` | nothing scored well | describe the target differently, pass `window`, or pin an id |
+| `no_such_action` | the screen does not offer this | observe again and choose a different step |
+
+Re-phrasing an `ambiguous` refusal usually produces the same refusal, because
+the problem is the screen, not your sentence.
+
 ### `refused` — the model was not sure enough
 The `decision` block shows how close it came and against what bar.
 

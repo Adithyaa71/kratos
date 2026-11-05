@@ -450,7 +450,7 @@
         /* already dispatched above */
       }
     }
-    return { applied: true, readback: valueOf(el) };
+    return { applied: true, method: "semantic", readback: valueOf(el) };
   }
 
   function act(payload) {
@@ -458,14 +458,14 @@
 
     if (kind === "navigate") {
       location.assign(payload.url);
-      return { applied: true, readback: null };
+      return { applied: true, method: "semantic", readback: null };
     }
     if (kind === "wait" || kind === "none") {
-      return { applied: true, readback: null };
+      return { applied: true, method: "semantic", readback: null };
     }
     if (kind === "scroll" && !payload.target) {
       window.scrollBy({ top: (payload.amount || 3) * 100, behavior: "instant" });
-      return { applied: true, readback: null };
+      return { applied: true, method: "semantic", readback: null };
     }
     if (kind === "key" && !payload.target) {
       // A keypress goes wherever focus is. Demanding an element here is what
@@ -501,7 +501,7 @@
         return { applied: document.activeElement === el, readback: valueOf(el) };
       case "scroll":
         el.scrollBy({ top: (payload.amount || 3) * 100, behavior: "instant" });
-        return { applied: true, readback: null };
+        return { applied: true, method: "semantic", readback: null };
       case "select":
         return selectOption(el, payload.text);
       default:

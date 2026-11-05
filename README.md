@@ -11,7 +11,7 @@ That is the whole design. Your agent decides. This holds the machine.
 
 <br>
 
-[![tests](https://img.shields.io/badge/tests-283%20passing-3fb950?style=flat-square)](#)
+[![tests](https://img.shields.io/badge/tests-289%20passing-3fb950?style=flat-square)](#)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-3fb950?style=flat-square)](#)
 [![rust](https://img.shields.io/badge/rust-10%20crates-f0883e?style=flat-square)](#)
 [![transport](https://img.shields.io/badge/transport-named%20pipe%20·%20no%20TCP-2f81f7?style=flat-square)](#)
@@ -220,6 +220,39 @@ switch, the extension id, the log — is in that window too.
 An agent connecting afterwards finds the running one. The pipe name is the only
 thing that has to match.
 
+## The wait is earned
+
+A fixed settle is a confession that you do not know when the UI is ready. The
+old build slept **350ms** after every action — 350ms of a 484ms cycle, paid in
+full by a button that responded in forty.
+
+It now polls the target's own pixels against the drift measured moments
+before, and returns the instant they move. A control that does nothing still
+costs the ceiling (`settle_max_ms`, default 1200) — that case has to be waited
+out before `no_effect` can honestly be claimed. Every result says which it was:
+
+```json
+"effect": { "evidence": "structural+readback", "settle_ms": 96, "settled": true }
+```
+
+`settled: false` next to `executed` is worth reading: the pixels never moved
+and the structure or a read-back carried the proof on its own.
+
+Two more things a result now says, for the same reason — an agent cannot act
+on what it is not told:
+
+- **`refusal`** — `ambiguous`, `unsure`, or `no_such_action`. A low confidence
+  used to mean either *nothing here looks right* or *two of these look
+  identical*, and those have opposite fixes. When the top two options score
+  within 0.10 of each other the decision names what it was torn between, and
+  the agent is told to name the container rather than re-phrase.
+- **`method`** — `semantic` or `physical`. A backend that finds no UI
+  Automation pattern and clicks the middle of the element has aimed at a
+  rectangle, and a rectangle can have moved. Still allowed; no longer silent.
+
+And every error carries **`retry_safe`**, because *may I send that again* is a
+different question from *what went wrong*.
+
 ## The gate
 
 Every action passes through, in order: **kill → rate limit → never-allowed →
@@ -291,7 +324,7 @@ as one:
 | browser perception, 32 elements | **20ms**, all with containers and selectors |
 | UI Automation, 24 elements | **223ms**; 168 on a dense window, 2.1s |
 | a decision, live | **~300ms**, typed and calibrated |
-| full action around an instant backend | **484ms** — 350ms of it a deliberate settle |
+| full action around an instant backend | **484ms** before the wait became earned (350ms of it was a fixed settle) |
 | proof step | **134ms**, three screen grabs |
 | cost | **~$0.00008** per action · ≈12,000 actions per dollar |
 

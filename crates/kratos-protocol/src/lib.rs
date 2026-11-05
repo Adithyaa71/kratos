@@ -140,16 +140,47 @@ pub struct WireError {
     pub message: String,
     #[serde(default = "empty_obj", skip_serializing_if = "Value::is_null")]
     pub detail: Value,
+    /// Whether sending this request again is safe.
+    ///
+    /// The question an agent actually has after a failure is not *what went
+    /// wrong* but *may I try that again* -- and for anything that moves a
+    /// mouse the honest answer is sometimes no, because the input may already
+    /// have reached the application. Saying so here means every client gets
+    /// the same answer instead of each one guessing from the code.
+    #[serde(default = "yes")]
+    pub retry_safe: bool,
 }
 
 impl WireError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
-        WireError { code: code.to_string(), message: message.into(), detail: empty_obj() }
+        let retry_safe = retry_is_safe(code);
+        WireError { code: code.to_string(), message: message.into(), detail: empty_obj(), retry_safe }
     }
 
     pub fn with_detail(code: &str, message: impl Into<String>, detail: Value) -> Self {
-        WireError { code: code.to_string(), message: message.into(), detail }
+        let retry_safe = retry_is_safe(code);
+        WireError { code: code.to_string(), message: message.into(), detail, retry_safe }
     }
+
+    /// Mark this failure as one where input may already have been delivered.
+    ///
+    /// Used where the broker knows more than the code does: a backend that
+    /// timed out mid-dispatch has a different answer from one that refused the
+    /// request outright, even though both can surface as `backend_error`.
+    pub fn unsafe_to_retry(mut self) -> Self {
+        self.retry_safe = false;
+        self
+    }
+}
+
+/// Whether a failure with this code can be retried without repeating an
+/// effect that already happened.
+///
+/// The rule is about delivery, not about blame: a request the broker rejected
+/// never reached a screen and is always safe to send again, while anything
+/// that may have been handed to a backend is not.
+pub fn retry_is_safe(code: &str) -> bool {
+    !matches!(code, codes::BACKEND_TIMEOUT | codes::INTERNAL)
 }
 
 impl std::fmt::Display for WireError {
@@ -620,6 +651,16 @@ pub struct Decision {
     pub threshold: f64,
     pub decider: String,
     pub decide_ms: u64,
+    /// The options the model could not separate, when two or more scored
+    /// within noise of each other.
+    ///
+    /// A low confidence can mean two different things, and they have different
+    /// fixes: *nothing here looks right* is answered by picking a different
+    /// step, while *two of these look identical* is answered by naming the
+    /// container. Folding both into one number told the agent to try harder
+    /// when what it needed was to be more specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguous_with: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -682,6 +723,17 @@ pub struct Effect {
     /// `structural`, `readback`, `window`, `region`, or the single value
     /// `none` / `inconclusive`.
     pub evidence: String,
+    /// How long the broker waited for the screen to move after dispatching,
+    /// in milliseconds. Reported because it is the largest controllable cost
+    /// in an action and the only honest way to show that the wait is now
+    /// earned rather than fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle_ms: Option<u64>,
+    /// True when the wait ended because something moved, false when it ended
+    /// because the ceiling was reached. A `false` here beside an `executed`
+    /// means the structure or a read-back carried the proof, not the pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -697,10 +749,21 @@ pub struct ActRes {
     pub effect: Option<Effect>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// `semantic` or `physical`: see [`BackendActRes::method`]. Present on
+    /// anything that was dispatched, and recorded in the journal, so a run of
+    /// physical actions is visible afterwards rather than inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in_ms: Option<u64>,
+    /// Which kind of refusal this is, for an agent that branches on it:
+    /// `ambiguous` (two targets scored alike -- name the container),
+    /// `unsure` (nothing scored well -- describe it differently),
+    /// `no_such_action` (the screen does not offer this -- pick another step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
     /// Plain-language account of the outcome, for the agent to act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -719,8 +782,10 @@ impl ActRes {
             gate: None,
             effect: None,
             backend: None,
+            method: None,
             confirm_token: None,
             expires_in_ms: None,
+            refusal: None,
             detail: None,
             next: None,
             took_ms,
@@ -862,6 +927,17 @@ pub struct BackendActRes {
     pub applied: bool,
     #[serde(default)]
     pub readback: Option<String>,
+    /// How the action was delivered: `semantic` through the control's own
+    /// interface -- a UI Automation pattern, a DOM event -- or `physical`
+    /// through the mouse and keyboard at a position.
+    ///
+    /// A backend that cannot find a pattern and clicks the middle of the
+    /// element instead has done something meaningfully different from what was
+    /// asked: it has aimed at a rectangle, and a rectangle can have moved. That
+    /// is allowed, because refusing would make half the desktop undriveable,
+    /// but it is not allowed to be invisible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     #[serde(default)]
     pub took_ms: u64,
 }
@@ -869,6 +945,75 @@ pub struct BackendActRes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_request_may_be_retried_and_a_half_delivered_one_may_not() {
+        // The question is delivery, not blame. Anything the broker turned away
+        // never reached a screen.
+        for code in [
+            codes::BAD_REQUEST,
+            codes::UNAUTHORIZED,
+            codes::GATE_BLOCKED,
+            codes::KILL_SWITCH,
+            codes::RATE_LIMITED,
+            codes::NO_BACKEND,
+            codes::NO_TARGET,
+            codes::DECIDER_ERROR,
+            codes::LEASE_HELD,
+        ] {
+            assert!(retry_is_safe(code), "{code} should be safe to retry");
+            assert!(WireError::new(code, "x").retry_safe);
+        }
+        // A backend that stopped answering mid-dispatch may already have moved
+        // the mouse; sending it again would do it twice.
+        for code in [codes::BACKEND_TIMEOUT, codes::INTERNAL] {
+            assert!(!retry_is_safe(code), "{code} must not be marked retryable");
+            assert!(!WireError::new(code, "x").retry_safe);
+        }
+    }
+
+    #[test]
+    fn retry_safety_survives_the_wire_and_can_be_overridden() {
+        let e = WireError::new(codes::BACKEND_ERROR, "the page refused").unsafe_to_retry();
+        let line = serde_json::to_string(&e).unwrap();
+        let back: WireError = serde_json::from_str(&line).unwrap();
+        assert!(!back.retry_safe);
+
+        // An old peer that does not send the field must not be read as unsafe:
+        // the default is the permissive one, and the broker overrides it.
+        let old: WireError =
+            serde_json::from_str(r#"{"code":"bad_request","message":"x","detail":{}}"#).unwrap();
+        assert!(old.retry_safe);
+    }
+
+    #[test]
+    fn a_refusal_names_its_kind_and_a_dispatch_names_its_method() {
+        let mut res = ActRes::new(status::REFUSED, 12);
+        res.refusal = Some("ambiguous".into());
+        let v = serde_json::to_value(&res).unwrap();
+        assert_eq!(v["refusal"], "ambiguous");
+        // Absent fields stay absent: a result that dispatched nothing must not
+        // claim a delivery method.
+        assert!(v.get("method").is_none());
+
+        let mut done = ActRes::new(status::EXECUTED, 12);
+        done.method = Some("physical".into());
+        let v = serde_json::to_value(&done).unwrap();
+        assert_eq!(v["method"], "physical");
+        assert!(v.get("refusal").is_none());
+    }
+
+    #[test]
+    fn the_settle_wait_is_reported_with_whether_it_ended_early() {
+        let e = Effect { settle_ms: Some(96), settled: Some(true), ..Default::default() };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["settle_ms"], 96);
+        assert_eq!(v["settled"], true);
+        // `settled: false` beside an executed status means the pixels never
+        // moved and something else carried the proof -- so it has to survive.
+        let back: Effect = serde_json::from_value(v).unwrap();
+        assert_eq!(back.settle_ms, Some(96));
+    }
 
     #[test]
     fn request_round_trips_byte_for_byte() {

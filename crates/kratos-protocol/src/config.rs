@@ -20,6 +20,14 @@ pub struct Config {
     /// Broker exits after this long without an agent request, provided no UI
     /// is attached. Section 5.5.
     pub idle_exit_ms: u64,
+    /// How long to keep looking for a change after dispatching an action
+    /// before giving up and calling it `no_effect`.
+    ///
+    /// This is a ceiling, not a wait. The broker polls the target's pixels and
+    /// returns the moment they move, so a responsive UI costs a fraction of
+    /// this and an inert control costs all of it. A fixed settle paid the
+    /// worst case every time.
+    pub settle_max_ms: u64,
     pub decider: Decider,
     pub thresholds: Thresholds,
     pub kill: KillConfig,
@@ -34,6 +42,7 @@ impl Default for Config {
             schema: SCHEMA,
             pipe_name: "kratos.v1".into(),
             idle_exit_ms: 300_000,
+            settle_max_ms: 1_200,
             decider: Decider::default(),
             thresholds: Thresholds::default(),
             kill: KillConfig::default(),
@@ -395,6 +404,8 @@ mod tests {
         let text = serde_json::to_string(&c).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back.idle_exit_ms, 300_000);
+        // The ceiling on the post-action wait, not the wait itself.
+        assert_eq!(back.settle_max_ms, 1_200);
         assert_eq!(back.kill.hotkey, "ctrl+alt+k");
         assert_eq!(back.gate.rate_limit_per_minute, 30);
         assert_eq!(back.thresholds.type_, 0.75);

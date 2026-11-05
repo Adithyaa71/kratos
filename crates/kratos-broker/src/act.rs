@@ -28,12 +28,30 @@ use crate::state::{Broker, ObservationRecord, Parked, PeerHandle};
 /// How long the before/after drift measurement is allowed to take.
 const DRIFT_GAP: Duration = Duration::from_millis(35);
 
-/// Settle time between dispatching an action and looking at the result.
+/// How close two options have to score before the model is called torn
+/// rather than unsure.
 ///
-/// Long enough for a browser to repaint and a menu to open, short enough not
-/// to dominate the cycle. Browser action cycles measured 2,900ms on the
-/// previous build, so this is noise against them.
-const SETTLE: Duration = Duration::from_millis(350);
+/// Not a tuning knob so much as a definition: a gap this small between the
+/// best and second-best option means the evidence did not separate them, and
+/// an agent told "not sure enough" would re-phrase when it should be naming
+/// the container instead.
+const AMBIGUITY_MARGIN: f64 = 0.10;
+
+/// How often to look, while waiting for the screen to move.
+///
+/// A grab of the virtual desktop costs about 33ms on its own, so this is a
+/// floor rather than a real period: the loop is capture-bound, and asking for
+/// 10ms here only means "again, immediately".
+const SETTLE_POLL: Duration = Duration::from_millis(10);
+
+/// After the pixels first move, wait this long and look once more.
+///
+/// A UI caught mid-animation gives a true "something changed" and a half-drawn
+/// accessibility tree. This is the difference between returning as soon as
+/// something happened and returning as soon as it has finished happening --
+/// still a fraction of a fixed settle, and the observe that follows is of a
+/// finished frame.
+const SETTLE_CONFIRM: Duration = Duration::from_millis(60);
 
 // ---------------------------------------------------------------------------
 // Backend plumbing
@@ -413,6 +431,30 @@ async fn decide(
             .and_then(|id| elements.iter().find(|e| e.id == id).cloned()),
     };
 
+    // Torn between two options, or just unsure about all of them? The two
+    // have different fixes, so they are told apart here rather than averaged
+    // into one number.
+    let ambiguous_with = answers.choice("target").and_then(|t| {
+        let mut ranked: Vec<(&String, &f64)> = t.probabilities.iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let (first, second) = (ranked.first()?, ranked.get(1)?);
+        if first.1 - second.1 >= AMBIGUITY_MARGIN {
+            return None;
+        }
+        let name = |opt: &str| {
+            resolve_option(opt, &candidates)
+                .and_then(|id| elements.iter().find(|e| e.id == id))
+                .map(|e| e.criterion())
+                .unwrap_or_else(|| "none of these".to_string())
+        };
+        let tied: Vec<String> = ranked
+            .iter()
+            .take_while(|(_, p)| *first.1 - **p < AMBIGUITY_MARGIN)
+            .map(|(opt, _)| name(opt))
+            .collect();
+        (tied.len() > 1).then_some(tied)
+    });
+
     let decision = Decision {
         kind: kind.as_str().to_string(),
         target_id: target.as_ref().map(|e| e.id.clone()),
@@ -423,6 +465,7 @@ async fn decide(
         threshold,
         decider: answers.model.clone(),
         decide_ms,
+        ambiguous_with,
     };
     Ok(Resolved { kind, target, decision })
 }
@@ -755,11 +798,28 @@ async fn act_inner(
         res.gen = Some(generation);
         res.gate = Some(gate_report);
         res.decision = Some(resolved.decision.clone());
-        res.detail = Some(format!(
-            "the decision model is not sure enough: {:.2} against a bar of {:.2} for a {}",
-            resolved.decision.confidence, resolved.decision.threshold, resolved.decision.kind
-        ));
-        res.next = Some(targeting_advice(broker, &obs_source).await);
+        match &resolved.decision.ambiguous_with {
+            // Torn: say between what, because that is the whole fix.
+            Some(tied) => {
+                res.refusal = Some("ambiguous".into());
+                res.detail = Some(format!(
+                    "two targets scored alike and the model could not separate them: {}",
+                    tied.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(" and ")
+                ));
+                res.next = Some(
+                    "name the one you mean by its container -- the dialog, pane, form or                      section it is in -- or pin it: observe, then pass that element's id as                      target_id"
+                        .into(),
+                );
+            }
+            None => {
+                res.refusal = Some("unsure".into());
+                res.detail = Some(format!(
+                    "the decision model is not sure enough: {:.2} against a bar of {:.2} for a {}",
+                    resolved.decision.confidence, resolved.decision.threshold, resolved.decision.kind
+                ));
+                res.next = Some(targeting_advice(broker, &obs_source).await);
+            }
+        }
         broker.counters.record(st::REFUSED);
         journal_line(broker, peer, &req, &win, &res, Some(&resolved.decision), None).await;
         return Ok(res);
@@ -770,6 +830,7 @@ async fn act_inner(
         res.gen = Some(generation);
         res.gate = Some(gate_report);
         res.decision = Some(resolved.decision.clone());
+        res.refusal = Some("no_such_action".into());
         res.detail =
             Some("this instruction does not describe an action available on this screen".into());
         res.next = Some("re-read the screen with observe and choose a different step".into());
@@ -880,20 +941,56 @@ async fn act_inner(
         }
     };
 
-    tokio::time::sleep(SETTLE).await;
-
-    // The third and last grab.
-    let shot_after = tokio::task::spawn_blocking(move || {
-        let after = kratos_shot::capture();
-        (
-            after.as_ref().and_then(|f| f.region(window_rect, kratos_shot::FULL_W, kratos_shot::FULL_H)),
-            region.and_then(|r| {
-                after.as_ref().and_then(|f| f.region(Some(r), kratos_shot::REGION_N, kratos_shot::REGION_N))
-            }),
-        )
+    // -- 7b. wait for the screen to move, not for a fixed interval ---------
+    //
+    // The old build slept 350ms here whatever happened, which was 350ms of a
+    // 484ms action and was paid in full by a button that responded in 40ms.
+    // Now the target's own pixels are polled against the drift measured a
+    // moment ago, and the wait ends when they move. An inert control still
+    // costs the ceiling -- that case has to be waited out before `no_effect`
+    // can honestly be claimed.
+    let budget = Duration::from_millis(broker.config.read().await.settle_max_ms);
+    let before_w = shot_before.0.clone();
+    let before_r = shot_before.1.clone();
+    let (shot_after, settle_ms, settled) = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let crop = |s: &Option<kratos_shot::Screenshot>| {
+            (
+                s.as_ref().and_then(|f| f.region(window_rect, kratos_shot::FULL_W, kratos_shot::FULL_H)),
+                region.and_then(|r| {
+                    s.as_ref()
+                        .and_then(|f| f.region(Some(r), kratos_shot::REGION_N, kratos_shot::REGION_N))
+                }),
+            )
+        };
+        loop {
+            let shot = kratos_shot::capture();
+            let last = crop(&shot);
+            let w = kratos_shot::assess(
+                kratos_shot::changed(before_w.as_ref(), last.0.as_ref()),
+                window_baseline,
+                kratos_shot::FULL_THRESHOLD,
+            );
+            let r = kratos_shot::assess(
+                kratos_shot::changed(before_r.as_ref(), last.1.as_ref()),
+                region_baseline,
+                kratos_shot::REGION_THRESHOLD,
+            );
+            if w.is_changed() || r.is_changed() {
+                // Let it finish, then take the frame the evidence is built from.
+                std::thread::sleep(SETTLE_CONFIRM);
+                let shot = kratos_shot::capture();
+                let settled = crop(&shot);
+                return (settled, started.elapsed().as_millis() as u64, true);
+            }
+            if started.elapsed() >= budget {
+                return (last, started.elapsed().as_millis() as u64, false);
+            }
+            std::thread::sleep(SETTLE_POLL);
+        }
     })
     .await
-    .unwrap_or((None, None));
+    .unwrap_or(((None, None), 0, false));
 
     let after = observe_with_fallback(broker, class, None, req.window.as_deref(), Duration::from_millis(8_000))
         .await
@@ -911,6 +1008,9 @@ async fn act_inner(
         expected.as_deref(),
     );
 
+    let mut effect = effect;
+    effect.settle_ms = Some(settle_ms);
+    effect.settled = Some(settled);
     let proved = effect.evidence != "none" && effect.evidence != "inconclusive";
     let status = if resolved.kind.is_mutating() && !proved { st::NO_EFFECT } else { st::EXECUTED };
 
@@ -920,6 +1020,7 @@ async fn act_inner(
     res.decision = Some(resolved.decision.clone());
     res.effect = Some(effect.clone());
     res.backend = Some(act_source);
+    res.method = backend_res.method.clone();
     if status == st::NO_EFFECT {
         res.detail = Some(if effect.evidence == "inconclusive" {
             "the action was dispatched, and the screen was too busy for the pixels to say whether \
@@ -1000,6 +1101,10 @@ fn assemble_effect(
         screen_changed: None,
         region_changed,
         region_baseline: region.2,
+        // Filled in by the caller, which is the only place that knows how
+        // long it waited.
+        settle_ms: None,
+        settled: None,
         readback,
         evidence,
     }
@@ -1118,11 +1223,24 @@ async fn journal_line(
         "took_ms": res.took_ms,
     });
     let obj = record.as_object_mut().expect("object");
+    // How it was delivered and, when refused, which kind of refusal. Both are
+    // things you want to count across a session: a run of `physical` says a
+    // backend is not finding patterns, and a run of `ambiguous` says the
+    // screen has look-alike controls rather than that the agent is vague.
+    if let Some(m) = &res.method {
+        obj.insert("method".into(), json!(m));
+    }
+    if let Some(r) = &res.refusal {
+        obj.insert("refusal".into(), json!(r));
+    }
     if let Some(g) = &res.gate {
         obj.insert("gate".into(), json!(g.rule));
         obj.insert("gate_category".into(), json!(g.category));
     }
     if let Some(d) = decision {
+        if let Some(tied) = &d.ambiguous_with {
+            obj.insert("ambiguous_with".into(), json!(tied));
+        }
         obj.insert("kind".into(), json!(d.kind));
         obj.insert("target_id".into(), json!(d.target_id));
         obj.insert("target_label".into(), json!(d.target_label));
@@ -1139,6 +1257,8 @@ async fn journal_line(
         obj.insert("window_baseline".into(), json!(e.window_baseline));
         obj.insert("region_changed".into(), json!(e.region_changed));
         obj.insert("evidence".into(), json!(e.evidence));
+        obj.insert("settle_ms".into(), json!(e.settle_ms));
+        obj.insert("settled".into(), json!(e.settled));
     }
     broker.journal.read().await.append(record);
 }
