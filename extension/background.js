@@ -20,6 +20,10 @@ const KEEPALIVE_MINUTES = 0.4;
 let port = null;
 let brand = "chrome";
 let reconnectDelay = 1000;
+/// Why the port is not open, in Chromium's own words. The service worker's
+/// console is asleep exactly when you want to read it, so this is kept here
+/// and shown in the popup, which is where someone looks first.
+let lastReason = "";
 
 // -- brand ------------------------------------------------------------------
 
@@ -50,6 +54,8 @@ function connect() {
     schedule(`could not start the native host: ${e}`);
     return;
   }
+  // connectNative resolves lazily: a bad id or a missing registration shows up
+  // on the disconnect listener below, not here.
 
   port.onMessage.addListener(onBrokerMessage);
   port.onDisconnect.addListener(() => {
@@ -58,10 +64,12 @@ function connect() {
     schedule(`native host disconnected: ${why}`);
   });
   reconnectDelay = 1000;
+  lastReason = "";
   setBadge("on", "#3d8b4a");
 }
 
 function schedule(reason) {
+  lastReason = reason;
   console.warn("[kratos]", reason, `retrying in ${reconnectDelay}ms`);
   setBadge("off", "#8b3d3d");
   const delay = reconnectDelay;
@@ -287,6 +295,20 @@ chrome.alarms.onAlarm.addListener(() => {
   // The alarm exists to keep this worker resident while a port is open; if the
   // port died while we were asleep, this is also where it comes back.
   if (!port) connect();
+});
+
+// The popup asks for this; nothing else may. It reports state only -- there is
+// no message here that drives a page, because the broker is the only thing
+// allowed to ask for that.
+chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+  if (!msg || msg.op !== "bridge.status") return false;
+  if (msg.retry) {
+    // Someone is watching, so do not make them wait out the backoff.
+    reconnectDelay = 1000;
+    if (!port) connect();
+  }
+  reply({ connected: !!port, reason: lastReason, brand, host: HOST });
+  return false;
 });
 
 // Also connect when the worker is spun up by anything else.

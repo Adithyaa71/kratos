@@ -67,6 +67,29 @@
         color: var(--muted);
         margin: 12px 0 0;
       }
+      .mono {
+        font-family: Consolas, ui-monospace, monospace;
+        font-size: 11px;
+        word-break: break-all;
+      }
+      .why {
+        margin: 8px 0 0;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: color-mix(in srgb, var(--off) 12%, transparent);
+        color: var(--off);
+        font-size: 12px;
+      }
+      button {
+        margin-top: 8px;
+        font: inherit;
+        padding: 4px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: transparent;
+        color: var(--fg);
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -75,6 +98,8 @@
       <span class="key">Broker</span>
       <span class="val dot off" id="state">checking</span>
     </div>
+    <div id="why" class="why" hidden></div>
+    <button id="retry" hidden>Try again</button>
     <div class="row">
       <span class="key">Browser</span>
       <span class="val" id="brand">&mdash;</span>
@@ -82,6 +107,10 @@
     <div class="row">
       <span class="key">This tab</span>
       <span class="val" id="elements">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="key">Extension ID</span>
+      <span class="val mono" id="id">&mdash;</span>
     </div>
     <p id="note">
       This bridge reports page structure to the broker when asked. It does
