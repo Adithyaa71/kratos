@@ -56,6 +56,16 @@ Three steps, and the second is the one everyone misses.
 
 ### b. Register the native host
 
+The easy way: open the settings window, go to **Browser**, paste the id into
+**Extension ID**, tick the browsers, press **Register**. That writes the
+manifest and the registry keys itself and tells you where it put them.
+
+```bash
+./target/release/kratos-ui.exe
+```
+
+If you would rather not open a window, the script does the same thing:
+
 The extension cannot reach the broker on its own. A browser will only launch a
 local program named in a registry-registered manifest, which is why the popup
 currently says **Broker: not running** even when one is.
@@ -117,6 +127,7 @@ Agents SDK, or anything else with an MCP stdio client. In a JSON config:
 | `KRATOS_PIPE` | `kratos.v1` | a second, isolated broker |
 | `KRATOS_BROKER_EXE` | beside `kratos-mcp.exe` | the binaries live apart |
 | `KRATOS_CONFIG` / `KRATOS_JOURNAL` | `%LOCALAPPDATA%\kratos\…` | alternate state |
+| `KRATOS_IDLE_EXIT_MS` | from the config file | hold a hand-started broker open (`0` = never exit) |
 
 ### Skipping MCP entirely
 
@@ -141,10 +152,13 @@ with the holder's name and how long is left, not a collision on the mouse.
 for free:
 
 1. `tools/list` → **starts nothing**. Enumerating capabilities must not spawn a
-   background process. Measured: 14ms, no pipe created.
+   background process. Measured: **0.19ms** to answer, **7.6ms** including
+   starting the shim process itself, and the benchmark asserts afterwards that
+   no pipe was created.
 2. the first `desktop_*` call → shim connects; nothing listening; it spawns
    `kratos-broker.exe` detached, waits for the pipe with backoff, and carries on.
-   **Measured: 49ms median from cold.**
+   **Measured: 13ms median from cold** — spawn, pipe, ACL, handshake, first
+   reply.
 3. five minutes with no agent calls → the broker exits. A settings window being
    open suppresses that; a backend does not, because backends reconnect.
 4. the next call brings it back, as a fresh process.
@@ -152,9 +166,42 @@ for free:
 Two harnesses racing to spawn one broker is safe: a named mutex and
 `first_pipe_instance` both guard the name, and the loser exits quietly.
 
-The **Start broker** button in the settings window is only for looking at a
-broker when no agent is driving. Nothing is registered at logon; a machine
-nobody is driving runs no part of this.
+Nothing is registered at logon; a machine nobody is driving runs no part of
+this.
+
+### Starting it yourself
+
+You never have to. But when you want to watch one — a new backend, a gate rule
+you are tuning, a session you would rather did not blink out between tasks —
+there are three ways, in order of convenience:
+
+**1. The settings window.** Status tab → **Start broker**. Also where **Stop
+broker** and **Reload settings** live.
+
+```bash
+./target/release/kratos-ui.exe
+```
+
+**2. The script**, which keeps it in the foreground with its log on your
+console and does not let it idle out:
+
+```bash
+start-daemon.cmd                   # the default pipe, kratos.v1
+start-daemon.cmd kratos.agent-a    # a broker of its own, for one agent
+```
+
+**3. The binary**, if you want to choose everything:
+
+```bash
+set KRATOS_PIPE=kratos.v1
+set KRATOS_IDLE_EXIT_MS=0
+target\release\kratos-broker.exe
+```
+
+An agent connecting later finds the running broker and uses it — the pipe name
+is the only thing that has to match. Starting one by hand does not change
+behaviour, grant anything, or survive a reboot; it is the same process the
+first tool call would have spawned, with its stderr somewhere you can see it.
 
 ---
 
@@ -222,21 +269,30 @@ to happen at all", and applies to every agent on the broker, not just one.
 
 ## 7. Efficiency
 
-Measured on this machine, release build.
+Release build. Every figure below is reproducible on your own machine:
+
+```bash
+cargo run --release -p kratos-bench -- --out docs/benchmarks.md
+```
 
 ### Framework overhead — what the broker itself costs
 
-| | |
+| | p50 |
 |---|---|
-| `desktop_status` round trip | **<1ms** |
-| `desktop_observe`, 40 elements | **1ms** |
-| `desktop_act` dry run (observe + decide + gate) | **1ms** |
-| `desktop_verify` | **<1ms** |
-| MCP shim start + initialize + tools/list | **14ms**, no broker spawned |
-| cold start (spawn broker → pipe → handshake → status) | **49ms** |
+| `status` round trip — agent → pipe → broker → agent | **0.031ms** |
+| `log.tail 50` over the pipe | **0.038ms** |
+| connect + ACL check + handshake | **0.098ms** |
+| candidate compression, 64 elements | **0.025ms** |
+| gate verdict — block, deny, review, brand, rate | **0.005ms** |
+| MCP `tools/list` | **0.19ms**, and starts no broker |
+| cold start — spawn → pipe → handshake → status | **13ms** |
+| one screen grab, 1920×1080 virtual desktop | **33ms** |
 
 The pipe, framing, routing, gate, lease and journal together are effectively
-free. Nothing in the plumbing is worth optimising.
+free: the whole chain costs less than a tenth of a millisecond, and the gate is
+two hundred times cheaper than that. Nothing in the plumbing is worth
+optimising — the full table, and what it does and does not include, is in
+[benchmarks.md](benchmarks.md).
 
 ### A full action, with everything instant around it
 

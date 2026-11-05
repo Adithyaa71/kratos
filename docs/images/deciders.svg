@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" width="1200" height="520" font-family="ui-sans-serif,-apple-system,'Segoe UI',Inter,Roboto,sans-serif">
+  <defs>
+    <linearGradient id="bg3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#121926"/>
+    </linearGradient>
+    <filter id="g3" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="520" rx="18" fill="url(#bg3)"/>
+
+  <text x="48" y="60" fill="#e6edf3" font-size="27" font-weight="700">The decision model is a part you can replace.</text>
+  <text x="48" y="92" fill="#8b949e" font-size="17">Hosted, open-weight, or one you trained yourself &#8212; the broker does not care which.</text>
+
+  <!-- the three plugs -->
+  <text x="48" y="146" fill="#6e7681" font-size="13.5" font-weight="600" letter-spacing="2.5">PICK ONE</text>
+
+  <rect x="48" y="164" width="300" height="78" rx="11" fill="#1a1426" stroke="#a371f7" stroke-width="1.8"/>
+  <text x="70" y="194" fill="#d2a8ff" font-size="18" font-weight="700">Jev</text>
+  <text x="70" y="216" fill="#8b949e" font-size="13.5">TypeSafe System One, hosted</text>
+  <text x="70" y="234" fill="#6e7681" font-size="13">~300ms &#183; typed &#183; calibrated out of the box</text>
+
+  <rect x="48" y="252" width="300" height="78" rx="11" fill="#1a1426" stroke="#a371f7" stroke-width="1.8"/>
+  <text x="70" y="282" fill="#d2a8ff" font-size="18" font-weight="700">Clef / Clef-flash</text>
+  <text x="70" y="304" fill="#8b949e" font-size="13.5">Cloudflare, open weights</text>
+  <text x="70" y="322" fill="#6e7681" font-size="13">same wire shape &#183; only the endpoint differs</text>
+
+  <rect x="48" y="340" width="300" height="94" rx="11" fill="#161b22" stroke="#3fb950" stroke-width="1.8"/>
+  <text x="70" y="370" fill="#56d364" font-size="18" font-weight="700">your own</text>
+  <text x="70" y="392" fill="#8b949e" font-size="13.5">local weights, llama.cpp, vLLM, a scorer</text>
+  <text x="70" y="410" fill="#8b949e" font-size="13.5">RLHF, RLAIF, RLCD, plain supervised &#8212;</text>
+  <text x="70" y="428" fill="#8b949e" font-size="13.5">how it was trained is not this code's business</text>
+
+  <!-- the port -->
+  <rect x="404" y="164" width="356" height="270" rx="13" fill="#0d1a2b" stroke="#2f81f7" stroke-width="2.5"/>
+  <text x="428" y="198" fill="#79c0ff" font-size="19" font-weight="700">trait DecisionProvider</text>
+  <text x="428" y="222" fill="#8b949e" font-size="13.5">one port, three methods, no runtime</text>
+
+  <rect x="428" y="240" width="308" height="34" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="444" y="262" fill="#e6edf3" font-size="14" font-family="ui-monospace,Consolas,monospace">fn name() -&gt; String</text>
+
+  <rect x="428" y="282" width="308" height="34" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="444" y="304" fill="#e6edf3" font-size="14" font-family="ui-monospace,Consolas,monospace">fn configured() -&gt; bool</text>
+
+  <rect x="428" y="324" width="308" height="52" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="444" y="345" fill="#e6edf3" font-size="14" font-family="ui-monospace,Consolas,monospace">fn ask(state, questions)</text>
+  <text x="444" y="366" fill="#8b949e" font-size="14" font-family="ui-monospace,Consolas,monospace">  -&gt; Answers</text>
+
+  <text x="428" y="402" fill="#6e7681" font-size="13.5">Blocking on purpose: the implementations are</text>
+  <text x="428" y="422" fill="#6e7681" font-size="13.5">HTTP round trips, called from a blocking pool.</text>
+
+  <!-- the contract -->
+  <rect x="816" y="164" width="336" height="150" rx="13" fill="#0f2417" stroke="#3fb950" stroke-width="2"/>
+  <text x="840" y="196" fill="#56d364" font-size="18" font-weight="700">Accepted</text>
+  <text x="840" y="224" fill="#e6edf3" font-size="14.5">a label</text>
+  <text x="840" y="248" fill="#e6edf3" font-size="14.5">+ a probability over every option</text>
+  <text x="840" y="272" fill="#e6edf3" font-size="14.5">+ a calibrated confidence</text>
+  <text x="840" y="300" fill="#8b949e" font-size="13.5">checked at parse time, before anything moves</text>
+
+  <rect x="816" y="330" width="336" height="104" rx="13" fill="#2b1013" stroke="#f85149" stroke-width="2"/>
+  <text x="840" y="362" fill="#ff7b72" font-size="18" font-weight="700">Rejected</text>
+  <text x="840" y="388" fill="#e6edf3" font-size="14.5">a label on its own</text>
+  <text x="840" y="414" fill="#8b949e" font-size="13.5">Without a number, every threshold in this</text>
+  <text x="840" y="430" fill="#8b949e" font-size="13.5">repository is decoration.</text>
+
+  <!-- wires -->
+  <path d="M348,203 L404,230" stroke="#a371f7" stroke-width="2" opacity=".6"/>
+  <path d="M348,291 L404,280" stroke="#a371f7" stroke-width="2" opacity=".6"/>
+  <path d="M348,387 L404,330" stroke="#3fb950" stroke-width="2" opacity=".6"/>
+  <path d="M760,260 L816,240" stroke="#3fb950" stroke-width="2" opacity=".6"/>
+  <path d="M760,340 L816,370" stroke="#f85149" stroke-width="2" opacity=".5"/>
+
+  <circle r="5" fill="#d2a8ff" filter="url(#g3)">
+    <animateMotion dur="3.6s" repeatCount="indefinite" calcMode="linear" path="M348,203 L404,230"/>
+    <animate attributeName="opacity" values="0;1;0" dur="3.6s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="5" fill="#56d364" filter="url(#g3)">
+    <animateMotion dur="3.6s" begin="1.3s" repeatCount="indefinite" calcMode="linear" path="M760,260 L816,240"/>
+    <animate attributeName="opacity" values="0;1;0" dur="3.6s" begin="1.3s" repeatCount="indefinite"/>
+  </circle>
+
+  <line x1="48" y1="466" x2="1152" y2="466" stroke="#21262d" stroke-width="1.5"/>
+  <text x="48" y="496" fill="#6e7681" font-size="14.5">Switching models is a settings change, not a port. The gate, the kill switch, the lease and the evidence rules are unaffected by which one answers.</text>
+</svg>

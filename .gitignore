@@ -32,3 +32,6 @@ native-host.json
 .vscode/
 .idea/
 *.swp
+
+# Working material for the README: renders, frames, samples.
+/draft/

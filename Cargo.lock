@@ -1078,6 +1078,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kratos-bench"
+version = "0.1.0"
+dependencies = [
+ "kratos-decide",
+ "kratos-gate",
+ "kratos-ipc",
+ "kratos-protocol",
+ "kratos-shot",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "kratos-broker"
 version = "0.1.0"
 dependencies = [
@@ -1165,6 +1178,7 @@ dependencies = [
  "kratos-protocol",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

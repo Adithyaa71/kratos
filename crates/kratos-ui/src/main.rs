@@ -11,6 +11,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bridge;
 mod worker;
 
 use std::sync::{Arc, Mutex};
@@ -42,6 +43,7 @@ fn main() -> eframe::Result {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Status,
+    Bridge,
     KillSwitch,
     Decider,
     Thresholds,
@@ -85,6 +87,13 @@ struct App {
     tab: Tab,
     draft: Draft,
     log_lines: usize,
+    /// The extension id being edited. Deliberately not part of `Draft`: it
+    /// lives in a manifest on disk, not in the broker's config, so the
+    /// one-second status poll must never overwrite what is half-typed here.
+    ext_id: String,
+    ext_brands: Vec<(String, bool)>,
+    /// Outcome of the last register or remove, as (ok, line).
+    ext_result: Vec<(bool, String)>,
 }
 
 impl App {
@@ -92,7 +101,21 @@ impl App {
         let pipe_base =
             std::env::var("KRATOS_PIPE").unwrap_or_else(|_| "kratos.v1".to_string());
         let (shared, tx) = worker::spawn(pipe_base);
-        App { shared, tx, tab: Tab::Status, draft: Draft::default(), log_lines: 0 }
+        App {
+            shared,
+            tx,
+            tab: Tab::Status,
+            draft: Draft::default(),
+            log_lines: 0,
+            // Prefilled from the manifest, so an existing registration is
+            // visible rather than merely assumed.
+            ext_id: bridge::registered_id().unwrap_or_default(),
+            ext_brands: bridge::BRANDS
+                .iter()
+                .map(|(b, _)| ((*b).to_string(), *b == "brave"))
+                .collect(),
+            ext_result: Vec::new(),
+        }
     }
 
     fn send(&self, cmd: Cmd) {
@@ -183,6 +206,7 @@ impl eframe::App for App {
                 ui.separator();
                 for (tab, label) in [
                     (Tab::Status, "Status"),
+                    (Tab::Bridge, "Browser"),
                     (Tab::KillSwitch, "Kill switch"),
                     (Tab::Decider, "Decision model"),
                     (Tab::Thresholds, "Confidence"),
@@ -222,6 +246,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Status => self.status_tab(ui, connected, status.as_ref()),
+                Tab::Bridge => self.bridge_tab(ui),
                 Tab::KillSwitch => self.kill_tab(ui, status.as_ref()),
                 Tab::Decider => self.decider_tab(ui),
                 Tab::Thresholds => self.thresholds_tab(ui),
@@ -342,6 +367,142 @@ impl App {
             c["blocked"].as_u64().unwrap_or(0),
             c["killed"].as_u64().unwrap_or(0),
         ));
+    }
+
+    /// Paste the id the browser generated; this writes the rest.
+    fn bridge_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "The browser extension is what makes a page readable as a document rather than as \
+             pixels: real roles, real labels, real CSS selectors, and inside iframes and shadow \
+             roots. It talks to the broker through a native-messaging host, and the manifest for \
+             that host has to name the id your browser generated when it loaded the extension.",
+        );
+        ui.add_space(6.0);
+        ui.weak(
+            "brave://extensions  (or chrome://, edge://)  ->  Developer mode  ->  Load unpacked \
+             ->  pick the `extension` folder  ->  copy the Extension ID",
+        );
+        ui.add_space(12.0);
+
+        let live = bridge::registered_id();
+        egui::Grid::new("bridge").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.strong("Extension ID");
+            ui.vertical(|ui| {
+                let valid = bridge::valid_id(self.ext_id.trim());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ext_id)
+                        .desired_width(420.0)
+                        .hint_text("32 letters, a to p"),
+                );
+                if !self.ext_id.trim().is_empty() && !valid {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 90, 80),
+                        format!("{} characters -- an id is 32 letters a-p", self.ext_id.trim().len()),
+                    );
+                } else if live.as_deref() == Some(self.ext_id.trim()) {
+                    ui.colored_label(egui::Color32::from_rgb(90, 170, 110), "registered");
+                }
+            });
+            ui.end_row();
+
+            ui.strong("Browsers");
+            ui.horizontal(|ui| {
+                for (brand, on) in &mut self.ext_brands {
+                    ui.checkbox(on, brand.as_str());
+                }
+            });
+            ui.end_row();
+
+            ui.strong("Host");
+            match bridge::host_exe() {
+                Some(exe) => {
+                    ui.label(exe.display().to_string());
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 90, 80),
+                        "kratos-host.exe is missing -- run: cargo build --release",
+                    );
+                }
+            }
+            ui.end_row();
+
+            ui.strong("Manifest");
+            ui.label(bridge::manifest_path().display().to_string());
+            ui.end_row();
+        });
+
+        ui.add_space(12.0);
+        let chosen: Vec<String> = self
+            .ext_brands
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(b, _)| b.clone())
+            .collect();
+        ui.horizontal(|ui| {
+            let ready = bridge::valid_id(self.ext_id.trim()) && !chosen.is_empty();
+            if ui.add_enabled(ready, egui::Button::new("Register")).clicked() {
+                self.ext_result.clear();
+                match bridge::register(&self.ext_id, &chosen) {
+                    Ok(report) => {
+                        self.ext_result.push((
+                            true,
+                            format!("manifest written: {}", report.manifest.display()),
+                        ));
+                        self.ext_result
+                            .push((true, format!("host: {}", report.host_exe.display())));
+                        for (brand, outcome) in report.lines {
+                            match outcome {
+                                Ok(key) => {
+                                    self.ext_result.push((true, format!("{brand}: {key}")));
+                                }
+                                Err(e) => {
+                                    self.ext_result.push((false, format!("{brand}: {e}")));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => self.ext_result.push((false, e)),
+                }
+            }
+            if ui.add_enabled(!chosen.is_empty(), egui::Button::new("Remove")).clicked() {
+                self.ext_result.clear();
+                for (brand, outcome) in bridge::unregister(&chosen) {
+                    match outcome {
+                        Ok(()) => self.ext_result.push((true, format!("{brand}: removed"))),
+                        Err(e) => self.ext_result.push((false, format!("{brand}: {e}"))),
+                    }
+                }
+            }
+        });
+
+        if !self.ext_result.is_empty() {
+            ui.add_space(10.0);
+            for (ok, line) in &self.ext_result {
+                let colour = if *ok {
+                    egui::Color32::from_rgb(90, 170, 110)
+                } else {
+                    egui::Color32::from_rgb(200, 90, 80)
+                };
+                ui.colored_label(colour, line);
+            }
+            ui.add_space(8.0);
+            ui.weak(
+                "Now quit the browser completely and reopen it. The host is looked up once when \
+                 the extension starts, so reloading the extension is not enough. Then reload any \
+                 tab you want readable -- content scripts are injected at page load.",
+            );
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.weak(
+            "Without the extension nothing is lost except speed and certainty in the browser: \
+             UI Automation still reaches every window on this machine, the browser included. The \
+             extension is what turns a page into labelled elements with selectors, at about a \
+             tenth the cost of the accessibility walk.",
+        );
     }
 
     fn kill_tab(&mut self, ui: &mut egui::Ui, status: Option<&Value>) {
@@ -765,6 +926,9 @@ mod tests {
             shared: Arc::new(Mutex::new(Shared::default())),
             tx: tokio::sync::mpsc::channel(1).0,
             tab: Tab::Status,
+            ext_id: String::new(),
+            ext_brands: Vec::new(),
+            ext_result: Vec::new(),
             draft: Draft::default(),
             log_lines: 0,
         };
@@ -789,6 +953,9 @@ mod tests {
             shared: Arc::new(Mutex::new(Shared::default())),
             tx: tokio::sync::mpsc::channel(1).0,
             tab: Tab::Status,
+            ext_id: String::new(),
+            ext_brands: Vec::new(),
+            ext_result: Vec::new(),
             draft: Draft::default(),
             log_lines: 0,
         };
@@ -808,6 +975,9 @@ mod tests {
             shared: Arc::new(Mutex::new(Shared::default())),
             tx: tokio::sync::mpsc::channel(1).0,
             tab: Tab::Status,
+            ext_id: String::new(),
+            ext_brands: Vec::new(),
+            ext_result: Vec::new(),
             draft: Draft::default(),
             log_lines: 0,
         };

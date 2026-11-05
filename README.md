@@ -11,13 +11,18 @@ That is the whole design. Your agent decides. This holds the machine.
 
 <br>
 
-[![tests](https://img.shields.io/badge/tests-274%20passing-3fb950?style=flat-square)](#)
+[![tests](https://img.shields.io/badge/tests-283%20passing-3fb950?style=flat-square)](#)
 [![clippy](https://img.shields.io/badge/clippy-0%20warnings-3fb950?style=flat-square)](#)
-[![rust](https://img.shields.io/badge/rust-9%20crates-f0883e?style=flat-square)](#)
+[![rust](https://img.shields.io/badge/rust-10%20crates-f0883e?style=flat-square)](#)
 [![transport](https://img.shields.io/badge/transport-named%20pipe%20·%20no%20TCP-2f81f7?style=flat-square)](#)
-[![cold start](https://img.shields.io/badge/cold%20start-49ms-a371f7?style=flat-square)](#)
+[![cold start](https://img.shields.io/badge/cold%20start-13ms-a371f7?style=flat-square)](docs/benchmarks.md)
+[![reach](https://img.shields.io/badge/reach-any%20Windows%20app-3fb950?style=flat-square)](#it-is-not-a-browser-tool)
 
 </div>
+
+<br>
+
+<img src="docs/images/kratos.gif" alt="One instruction executed and proved, one refused for want of a target" width="100%">
 
 <br>
 
@@ -78,6 +83,38 @@ as `executed`. So the coarse fingerprint is scoped to the target window, the
 baseline is measured immediately before acting, and a frame too busy to read
 returns **`inconclusive`** — which never counts as success.
 
+## It is not a browser tool
+
+The browser extension gets the loudest numbers, so it is worth being blunt
+about what this reaches: **every window on the machine**. UI Automation,
+Win32 and an OCR fallback are the default path; the extension is an
+optimisation for one kind of window.
+
+| | any window | a browser tab |
+|---|---|---|
+| how | UI Automation + Win32 + OCR | the MV3 extension |
+| reaches | Explorer, Settings, Office, Notepad, installers, Electron apps, terminals, native dialogs, anything with a handle | the page, its iframes and its shadow roots |
+| gives | role, label, value, enabled, bounds | …and container, CSS selector, URL |
+| acts by | the control, via UI Automation patterns, falling back to a click at its centre | the element, via DOM events — never a coordinate |
+| costs | 24 elements in 223ms; 168 in 2.1s on a dense window | 32 elements in 20ms |
+| needs | nothing | the extension loaded and registered |
+
+**The broker routes per window, not per session.** A tab goes to the extension
+when one is attached; everything else goes to UI Automation; a tab goes there
+too when it is not. One agent, one sentence, same gate, same evidence rules —
+whichever path answered. Nothing in your prompt changes.
+
+**If a window exposes nothing readable** — a canvas app, a remote desktop, a
+game — OCR reads the pixels and the elements come back with bounds and text but
+no tree. The decision model is told that is what it is looking at.
+
+So: `open Excel`, `click Save As in the File menu`, `type "Q3" into the
+filename box`, `focus the Settings window` are ordinary instructions here. The
+browser is one target among many; it is simply the one where we could do
+better than the accessibility tree, so we did.
+
+<br>
+
 ## Quickstart
 
 ```bash
@@ -119,16 +156,26 @@ Paste a key under **Decision model**. It is sealed with Windows DPAPI for your
 account — the config file is not a plaintext credential, a copy of it is
 useless on another machine, and nothing can read it back out over the wire.
 
-**4 · The browser extension** _(optional, and the single biggest upgrade)_
+**4 · The browser extension** _(optional — everything works without it)_
+
+Load `extension/` unpacked at `brave://extensions`, copy the id it generates,
+and paste it into the settings window: **Browser** → **Extension ID** →
+**Register**. That writes the native-host manifest and the per-browser registry
+keys for you, and shows you where it put them.
+
+<img src="docs/images/ui-browser-tab.svg" alt="The Browser tab: paste the extension id and press Register" width="760">
+
+Or from a shell, if you prefer:
 
 ```bash
-# load extension/ unpacked at brave://extensions, copy the id, then:
 powershell -File install-extension.ps1 -ExtensionId <your-id>
 ```
 
-Then **fully restart the browser** and reload any tab you want readable.
+Either way, **fully restart the browser** afterwards and reload any tab you
+want readable. The host is looked up once when the extension starts, so
+reloading the extension is not enough.
 
-Why it matters, measured on the same page:
+What it buys you, measured on the same page:
 
 | | dom-ext | uia |
 |---|---|---|
@@ -147,14 +194,27 @@ Nothing is registered at logon. The broker **does not exist** until the first
 `desktop_*` tool call, and it exits again after five idle minutes.
 
 ```
-tools/list        →  14ms,  starts nothing at all
-first real call   →  49ms,  spawns the broker detached and connects
+tools/list        →  0.19ms,  starts nothing at all
+first real call   →  13ms,    spawns the broker detached and connects
 5 min idle        →  gone
 next call         →  back, as a fresh process
 ```
 
 Two agents racing to spawn one is safe: a named mutex and `first_pipe_instance`
 both guard it, and the loser exits quietly.
+
+**When you do want to start it yourself** — watching a new backend, tuning a
+gate rule, keeping one session alive — there are three ways, and none of them
+changes behaviour:
+
+```bash
+./target/release/kratos-ui.exe     # Status → Start broker
+start-daemon.cmd                   # foreground, log on your console
+start-daemon.cmd kratos.agent-a    # a broker of its own, for one agent
+```
+
+An agent connecting afterwards finds the running one. The pipe name is the only
+thing that has to match.
 
 ## The gate
 
@@ -199,14 +259,33 @@ serialises it with a FIFO queue.
 
 ## Measured
 
-Release build, one laptop, real numbers:
+Not claimed — run it yourself, on your machine, in one command:
+
+```bash
+cargo run --release -p kratos-bench -- --out docs/benchmarks.md
+```
+
+| | p50 |
+|---|---|
+| MCP `tools/list` | **0.19ms**, and starts no broker |
+| cold start — spawn, pipe, ACL, handshake, status | **13ms** |
+| `status` round trip, agent to broker and back | **0.031ms** |
+| gate verdict — block, deny, review, brand, rate | **0.005ms** |
+| candidate compression, 64 elements | **0.025ms** |
+| screen grab, 1920×1080 virtual desktop | **33ms** |
+| element fingerprint, 96×96 crop | **0.29ms** |
+
+Everything there is this repository's own overhead, measured against the
+offline mock model: no network, no key, nothing of anybody else's. The full
+table and what it excludes: [**docs/benchmarks.md**](docs/benchmarks.md).
+
+Observed on a live desktop, which is a different kind of number and is labelled
+as one:
 
 | | |
 |---|---|
-| `tools/list` | **14ms**, spawns no process |
-| cold start — spawn, pipe, handshake, status | **49ms** |
-| framework overhead per read | **under 1ms** |
-| browser perception, 32 elements | **20ms** |
+| browser perception, 32 elements | **20ms**, all with containers and selectors |
+| UI Automation, 24 elements | **223ms**; 168 on a dense window, 2.1s |
 | a decision, live | **~300ms**, typed and calibrated |
 | full action around an instant backend | **484ms** — 350ms of it a deliberate settle |
 | proof step | **134ms**, three screen grabs |
@@ -221,6 +300,7 @@ refusals at **0.42–0.71**. Nothing in between.
 docs/protocol.md          the wire protocol, v1, locked before any code
 docs/workflow.md          how the pieces fit, and how to run them
 docs/brave.md             the browser profile, and what it may reach
+docs/benchmarks.md        the numbers above, and the command that made them
 
 crates/kratos-protocol    envelope, ops, errors, config       (no I/O at all)
 crates/kratos-ipc         named pipe, owner-only ACL, NDJSON, DPAPI
@@ -231,6 +311,7 @@ crates/kratos-broker      the daemon
 crates/kratos-mcp         MCP stdio shim
 crates/kratos-host        browser native-messaging relay
 crates/kratos-ui          settings: key, gate rules, kill switch, live log
+crates/kratos-bench       the benchmark, offline and reproducible
 
 extension/                MV3 · Brave, Chrome, Edge
 backends/                 the perception backend, self-contained:
@@ -240,17 +321,49 @@ backends/                 the perception backend, self-contained:
 skills/kratos/            how an agent should drive this
 ```
 
-## Bring your own model
+## Bring your own decision model
 
-The wire format is System One: `{state, questions:{name:{type, instructions,
-criteria}}}` with Bearer auth. TypeSafe's **Jev** speaks it. So does
-Cloudflare's open-weight **Clef** family — only the endpoint URL differs, so
-switching is a settings change, not a port.
+<img src="docs/images/deciders.svg" alt="The DecisionProvider port: Jev, Clef, or your own model" width="100%">
+
+<br>
+
+The model is a part, not a dependency. Three ship ready to use, and swapping
+between them is a dropdown in the settings window:
+
+| | what it is |
+|---|---|
+| **Jev** | TypeSafe System One, hosted. ~300ms, typed, calibrated. |
+| **Clef / Clef-flash** | Cloudflare, open weights. The same wire shape — only the endpoint differs. |
+| **mock** | offline, deterministic, no key. What the tests and the benchmark run against. |
+
+**A fourth option is yours.** The port is one trait with three methods and no
+runtime of its own:
+
+```rust
+pub trait DecisionProvider: Send + Sync {
+    fn name(&self) -> String;
+    fn configured(&self) -> bool;
+    fn ask(&self, state: &Value, questions: &BTreeMap<String, Question>)
+        -> Result<Answers, DecideError>;
+}
+```
+
+Local weights behind llama.cpp or vLLM, a hosted endpoint of your own, a
+fine-tune, a distilled classifier, or something that is not a language model at
+all — a ranker over the candidate list would satisfy this interface completely.
+**How it was trained is not this code's business**: RLHF, RLAIF, RLCD, plain
+supervised, hand-written heuristics. It is asked two typed questions and has to
+answer them.
 
 One hard requirement, enforced at parse time: a provider must return **a label
 with a probability distribution and a calibrated confidence**. One that returns
-only a label is rejected, because every threshold in this repo would otherwise
-become decoration.
+only a label is rejected, because every threshold in this repository would
+otherwise become decoration — and a confidence bar you cannot trust is worse
+than no bar at all.
+
+Everything else is unaffected by which model answers. The gate, the kill
+switch, the lease, the journal and the evidence rules do not know and do not
+ask.
 
 ## Safety, stated plainly
 

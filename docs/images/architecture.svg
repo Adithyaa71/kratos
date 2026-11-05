@@ -1,87 +1,120 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 520" width="1180" height="520" font-family="ui-sans-serif,-apple-system,'Segoe UI',Inter,Roboto,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 660" width="1200" height="660" font-family="ui-sans-serif,-apple-system,'Segoe UI',Inter,Roboto,sans-serif">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#0d1117"/>
       <stop offset="100%" stop-color="#121926"/>
     </linearGradient>
     <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
-      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feGaussianBlur stdDeviation="4" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,1 L9,5 L0,9 z" fill="#6e7681"/>
+    </marker>
   </defs>
 
-  <rect width="1180" height="520" rx="18" fill="url(#bg)"/>
+  <rect width="1200" height="660" rx="18" fill="url(#bg)"/>
 
-  <!-- ══ column headings ══ -->
-  <text x="150" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">DECIDES</text>
-  <text x="590" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">GOVERNS</text>
-  <text x="1010" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">TOUCHES</text>
+  <!-- ══════════════ title ══════════════ -->
+  <text x="48" y="60" fill="#e6edf3" font-size="30" font-weight="700">ΚΡΑΤΟΣ</text>
+  <text x="178" y="60" fill="#8b949e" font-size="19">your agent decides &#183; this holds the machine</text>
 
-  <!-- ══ 1. the agent ══ -->
-  <rect x="40" y="84" width="220" height="130" rx="14" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-  <text x="150" y="134" text-anchor="middle" fill="#e6edf3" font-size="24" font-weight="700">your agent</text>
-  <text x="150" y="164" text-anchor="middle" fill="#8b949e" font-size="15">says one sentence</text>
-  <text x="150" y="190" text-anchor="middle" fill="#58a6ff" font-size="14" font-style="italic">click the "Send" button</text>
+  <!-- column captions -->
+  <text x="48" y="112" fill="#a371f7" font-size="14" font-weight="700" letter-spacing="2.6">DECIDES</text>
+  <text x="430" y="112" fill="#2f81f7" font-size="14" font-weight="700" letter-spacing="2.6">GOVERNS</text>
+  <text x="836" y="112" fill="#3fb950" font-size="14" font-weight="700" letter-spacing="2.6">TOUCHES</text>
 
-  <!-- ══ 2. the broker ══ -->
-  <rect x="360" y="84" width="460" height="300" rx="16" fill="#0f1620" stroke="#2f81f7" stroke-width="2"/>
-  <text x="590" y="130" text-anchor="middle" fill="#e6edf3" font-size="26" font-weight="700">kratos-broker</text>
+  <!-- ══════════════ left: the agent and the model ══════════════ -->
+  <rect x="48" y="128" width="306" height="104" rx="13" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="70" y="160" fill="#e6edf3" font-size="19" font-weight="700">your agent</text>
+  <text x="70" y="186" fill="#8b949e" font-size="14">MCP over stdio, or the pipe direct</text>
+  <text x="70" y="210" fill="#6e7681" font-size="13.5">&#8220;click the Send button in the dialog&#8221;</text>
 
-  <rect x="392" y="156" width="396" height="48" rx="10" fill="#1a2230"/>
-  <text x="414" y="186" fill="#d2a8ff" font-size="17" font-weight="600">decide</text>
-  <text x="766" y="186" text-anchor="end" fill="#8b949e" font-size="14">which action · which element</text>
+  <rect x="48" y="252" width="306" height="178" rx="13" fill="#1a1426" stroke="#a371f7" stroke-width="2"/>
+  <text x="70" y="284" fill="#d2a8ff" font-size="19" font-weight="700">decision model</text>
+  <text x="70" y="307" fill="#8b949e" font-size="13.5">swappable &#183; one trait, three lines of config</text>
+  <text x="70" y="338" fill="#e6edf3" font-size="14.5">Jev &#183; hosted, typed</text>
+  <text x="70" y="362" fill="#e6edf3" font-size="14.5">Clef &#183; open weights, Cloudflare</text>
+  <text x="70" y="386" fill="#e6edf3" font-size="14.5">yours &#183; local, RLCD, anything</text>
+  <text x="70" y="414" fill="#f0883e" font-size="13">must return a distribution + calibrated confidence</text>
 
-  <rect x="392" y="212" width="396" height="48" rx="10" fill="#1a2230"/>
-  <text x="414" y="242" fill="#f0883e" font-size="17" font-weight="600">gate</text>
-  <text x="766" y="242" text-anchor="end" fill="#8b949e" font-size="14">allow · review · block</text>
+  <text x="70" y="466" fill="#6e7681" font-size="13.5">It answers two typed questions:</text>
+  <text x="70" y="490" fill="#8b949e" font-size="14">which kind of action &#183; which element</text>
+  <text x="70" y="516" fill="#8b949e" font-size="14">It emits <tspan fill="#f85149" font-weight="700">no text at all</tspan>, so it cannot</text>
+  <text x="70" y="538" fill="#8b949e" font-size="14">invent a recipient or a command.</text>
 
-  <rect x="392" y="268" width="396" height="48" rx="10" fill="#1a2230"/>
-  <text x="414" y="298" fill="#f85149" font-size="17" font-weight="600">kill switch</text>
-  <text x="766" y="298" text-anchor="end" fill="#8b949e" font-size="14">agents set it, never clear it</text>
+  <!-- ══════════════ middle: the broker ══════════════ -->
+  <rect x="430" y="128" width="340" height="302" rx="13" fill="#0d1a2b" stroke="#2f81f7" stroke-width="2.5"/>
+  <text x="454" y="162" fill="#79c0ff" font-size="20" font-weight="700">kratos-broker</text>
+  <text x="454" y="186" fill="#8b949e" font-size="13.5">one named pipe &#183; DACL: one SID &#183; no TCP</text>
 
-  <rect x="392" y="324" width="396" height="42" rx="10" fill="#1a2230"/>
-  <text x="414" y="351" fill="#8b949e" font-size="15">lease · journal · prove it changed</text>
+  <rect x="454" y="202" width="292" height="38" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="472" y="226" fill="#e6edf3" font-size="14.5">gate &#8212; block, review, allow</text>
 
-  <!-- ══ 3. the machine ══ -->
-  <rect x="890" y="84" width="250" height="122" rx="14" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
-  <text x="1015" y="124" text-anchor="middle" fill="#3fb950" font-size="21" font-weight="700">browser</text>
-  <text x="1015" y="150" text-anchor="middle" fill="#8b949e" font-size="14">extension · real DOM</text>
-  <text x="1015" y="176" text-anchor="middle" fill="#6e7681" font-size="13">acts on selectors, not pixels</text>
+  <rect x="454" y="246" width="292" height="38" rx="9" fill="#161b22" stroke="#f85149"/>
+  <text x="472" y="270" fill="#ff7b72" font-size="14.5">kill switch &#8212; agents may engage, never clear</text>
 
-  <rect x="890" y="224" width="250" height="110" rx="14" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
-  <text x="1015" y="262" text-anchor="middle" fill="#e6edf3" font-size="21" font-weight="700">any window</text>
-  <text x="1015" y="288" text-anchor="middle" fill="#8b949e" font-size="14">UI Automation · OCR</text>
-  <text x="1015" y="312" text-anchor="middle" fill="#6e7681" font-size="13">mouse and keyboard</text>
+  <rect x="454" y="290" width="292" height="38" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="472" y="314" fill="#e6edf3" font-size="14.5">input lease &#8212; one pointer, FIFO</text>
 
-  <!-- ══ wires ══ -->
-  <line x1="260" y1="149" x2="360" y2="149" stroke="#30363d" stroke-width="2.5"/>
-  <line x1="820" y1="180" x2="890" y2="145" stroke="#30363d" stroke-width="2.5"/>
-  <line x1="820" y1="280" x2="890" y2="279" stroke="#30363d" stroke-width="2.5"/>
+  <rect x="454" y="334" width="292" height="38" rx="9" fill="#161b22" stroke="#30363d"/>
+  <text x="472" y="358" fill="#e6edf3" font-size="14.5">journal &#8212; one JSONL line per action</text>
 
-  <text x="310" y="138" text-anchor="middle" fill="#2f81f7" font-size="12.5" font-weight="600">MCP</text>
-  <text x="310" y="176" text-anchor="middle" fill="#6e7681" font-size="12">named pipe</text>
+  <rect x="454" y="378" width="292" height="38" rx="9" fill="#0f2417" stroke="#3fb950"/>
+  <text x="472" y="402" fill="#56d364" font-size="14.5">evidence &#8212; prove it, or it is no_effect</text>
 
-  <!-- one packet, there and back, so the direction reads at a glance -->
-  <circle r="6" fill="#2f81f7" filter="url(#glow)">
-    <animateMotion dur="3s" repeatCount="indefinite" calcMode="linear" path="M260,149 L360,149"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" repeatCount="indefinite"/>
+  <!-- lifecycle note under the broker -->
+  <text x="430" y="470" fill="#6e7681" font-size="13.5" font-weight="600" letter-spacing="1.6">LIFECYCLE</text>
+  <text x="430" y="496" fill="#8b949e" font-size="14">nothing at logon &#183; spawned by the first call</text>
+  <text x="430" y="520" fill="#8b949e" font-size="14">in <tspan fill="#e6edf3" font-weight="700">13ms</tspan> &#183; gone again when idle</text>
+  <text x="430" y="544" fill="#6e7681" font-size="13.5">or start it yourself: start-daemon.cmd</text>
+
+  <!-- ══════════════ right: two equal ways to see and touch ══════════════ -->
+  <rect x="836" y="128" width="316" height="146" rx="13" fill="#0f2417" stroke="#3fb950" stroke-width="2"/>
+  <text x="858" y="160" fill="#56d364" font-size="18" font-weight="700">any window on the machine</text>
+  <text x="858" y="184" fill="#8b949e" font-size="13.5">UI Automation + Win32 + OCR fallback</text>
+  <text x="858" y="212" fill="#e6edf3" font-size="14">Explorer, Settings, Office, installers,</text>
+  <text x="858" y="234" fill="#e6edf3" font-size="14">terminals, Electron apps, dialogs,</text>
+  <text x="858" y="256" fill="#e6edf3" font-size="14">anything with a window handle</text>
+
+  <rect x="836" y="290" width="316" height="140" rx="13" fill="#0f2417" stroke="#3fb950" stroke-width="2"/>
+  <text x="858" y="322" fill="#56d364" font-size="18" font-weight="700">the browser, as a document</text>
+  <text x="858" y="346" fill="#8b949e" font-size="13.5">MV3 extension &#183; iframes and shadow DOM</text>
+  <text x="858" y="374" fill="#e6edf3" font-size="14">roles, labels, CSS selectors, values</text>
+  <text x="858" y="396" fill="#e6edf3" font-size="14">acts by selector &#8212; never by coordinate</text>
+  <text x="858" y="418" fill="#8b949e" font-size="13.5">32 elements in 20ms, all with containers</text>
+
+  <text x="836" y="470" fill="#6e7681" font-size="13.5" font-weight="600" letter-spacing="1.6">ROUTING</text>
+  <text x="836" y="496" fill="#8b949e" font-size="14">Both are peers on the same pipe. The</text>
+  <text x="836" y="520" fill="#8b949e" font-size="14">broker picks per window: the extension</text>
+  <text x="836" y="544" fill="#8b949e" font-size="14">for a tab, UI Automation for everything</text>
+  <text x="836" y="568" fill="#8b949e" font-size="14">else &#8212; and for the tab when it is absent.</text>
+
+  <!-- ══════════════ wires ══════════════ -->
+  <path d="M354,180 L430,180" stroke="#6e7681" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M430,300 L354,300" stroke="#a371f7" stroke-width="2" opacity=".75"/>
+  <path d="M400,300 L400,250 M400,250 L430,250" stroke="none"/>
+  <path d="M770,200 L836,200" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M770,360 L836,360" stroke="#3fb950" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- one request, travelling -->
+  <circle r="5.5" fill="#79c0ff" filter="url(#glow)">
+    <animateMotion dur="4s" repeatCount="indefinite" calcMode="linear"
+      path="M354,180 L430,180 L600,180 L600,300 L430,300 L354,300"/>
+    <animate attributeName="opacity" values="0;1;1;1;0" dur="4s" repeatCount="indefinite"/>
   </circle>
-  <circle r="6" fill="#3fb950" filter="url(#glow)">
-    <animateMotion dur="3s" begin="0.8s" repeatCount="indefinite" calcMode="linear" path="M820,180 L890,145"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" begin="0.8s" repeatCount="indefinite"/>
+  <circle r="5.5" fill="#56d364" filter="url(#glow)">
+    <animateMotion dur="4s" begin="1.2s" repeatCount="indefinite" calcMode="linear"
+      path="M770,200 L836,200"/>
+    <animate attributeName="opacity" values="0;1;0" dur="4s" begin="1.2s" repeatCount="indefinite"/>
   </circle>
-  <circle r="6" fill="#a371f7" filter="url(#glow)">
-    <animateMotion dur="3s" begin="1.9s" repeatCount="indefinite" calcMode="linear" path="M360,149 L260,149"/>
-    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" begin="1.9s" repeatCount="indefinite"/>
+  <circle r="5.5" fill="#56d364" filter="url(#glow)">
+    <animateMotion dur="4s" begin="2.1s" repeatCount="indefinite" calcMode="linear"
+      path="M770,360 L836,360"/>
+    <animate attributeName="opacity" values="0;1;0" dur="4s" begin="2.1s" repeatCount="indefinite"/>
   </circle>
 
-  <!-- the gate catches the eye on each pass -->
-  <rect x="392" y="212" width="396" height="48" rx="10" fill="none" stroke="#f0883e" stroke-width="2.5" opacity="0">
-    <animate attributeName="opacity" values="0;0.9;0" dur="3s" begin="1.2s" repeatCount="indefinite"/>
-  </rect>
-
-  <!-- ══ the one sentence that matters ══ -->
-  <line x1="40" y1="424" x2="1140" y2="424" stroke="#21262d" stroke-width="1.5"/>
-  <text x="40" y="462" fill="#e6edf3" font-size="17" font-weight="600">The model picks the action and the element.</text>
-  <text x="40" y="488" fill="#8b949e" font-size="16">Every literal — the text, the keys, the URL — comes from your sentence. It generates nothing.</text>
+  <!-- ══════════════ footer ══════════════ -->
+  <line x1="48" y1="600" x2="1152" y2="600" stroke="#21262d" stroke-width="1.5"/>
+  <text x="48" y="632" fill="#6e7681" font-size="14.5">Ten Rust crates &#183; one MV3 extension &#183; one Python perception backend &#183; no TCP &#183; no agent may clear a kill switch</text>
 </svg>

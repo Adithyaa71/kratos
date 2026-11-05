@@ -57,6 +57,36 @@ refused, not interpreted. If you want words typed, you supply them in quotes.
 | `desktop_kill` | stop everything, or one browser, or one app. You cannot undo it |
 | `desktop_log` | what was decided and what changed, recently |
 
+### Any window, not only the browser
+
+Both perception paths are peers and the broker picks per window. You do not
+choose, and you do not phrase anything differently:
+
+| the target | what answers | what you get |
+|---|---|---|
+| a browser tab, extension loaded | the extension | roles, labels, containers, CSS selectors, URL |
+| a browser tab, no extension | UI Automation | roles, labels, bounds |
+| any other window | UI Automation + Win32 | roles, labels, bounds, patterns |
+| a window that exposes nothing | OCR | text and bounds, no tree |
+
+So these are all ordinary instructions here:
+
+```
+desktop_act  instruction="open Excel"
+desktop_act  instruction="click Save As in the File menu"        window="Excel"
+desktop_act  instruction="type \"Q3-report\" into the File name box"  window="Save As"
+desktop_act  instruction="click the Yes button"                  window="Confirm"
+```
+
+Native windows are slower to read than a browser tab -- a dense one can take
+two seconds against the extension's twenty milliseconds -- so prefer `window`
+to narrow the walk, and pin an `id` when you are taking several steps in the
+same dialog.
+
+`prefer` forces a path when you have a reason: `prefer: "dom-ext"` to insist on
+the extension, `prefer: "uia"` to read a browser's own chrome -- its toolbar,
+its menus, its address bar -- which the page-level extension cannot see.
+
 ### Four approaches to a step, in order of preference
 
 1. **Describe it.** `click the "Send" button in the compose dialog`. Default.
@@ -248,7 +278,7 @@ apart.
 ## 6. Starting the daemon
 
 You do not have to. The broker starts itself on your first `desktop_*` call —
-roughly 50ms — and exits after five idle minutes. Nothing runs at logon.
+13ms, measured — and exits after five idle minutes. Nothing runs at logon.
 
 If a call fails with something about the broker not starting, it is an
 installation problem, not something to retry:

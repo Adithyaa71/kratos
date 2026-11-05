@@ -1,0 +1,16 @@
+[package]
+name = "kratos-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Measures the parts of kratos that sit between an agent and the screen."
+
+[dependencies]
+kratos-protocol = { workspace = true }
+kratos-ipc = { workspace = true }
+kratos-gate = { workspace = true }
+kratos-decide = { workspace = true }
+kratos-shot = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

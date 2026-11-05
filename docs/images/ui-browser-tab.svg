@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 440" width="940" height="440" font-family="ui-sans-serif,-apple-system,'Segoe UI',Inter,Roboto,sans-serif">
+  <rect width="940" height="440" rx="12" fill="#1b1b1f" stroke="#2d2d33" stroke-width="2"/>
+
+  <!-- title bar -->
+  <rect x="2" y="2" width="936" height="40" rx="11" fill="#141417"/>
+  <rect x="2" y="30" width="936" height="12" fill="#141417"/>
+  <text x="22" y="28" fill="#c9d1d9" font-size="15" font-weight="600">kratos</text>
+  <circle cx="872" cy="22" r="5" fill="#3a3a42"/>
+  <circle cx="894" cy="22" r="5" fill="#3a3a42"/>
+  <circle cx="916" cy="22" r="5" fill="#3a3a42"/>
+
+  <!-- tab strip -->
+  <text x="22" y="74" fill="#e6edf3" font-size="19" font-weight="700">kratos</text>
+  <g font-size="14">
+    <text x="118" y="74" fill="#8b949e">Status</text>
+    <rect x="168" y="56" width="74" height="26" rx="6" fill="#263447"/>
+    <text x="180" y="74" fill="#79c0ff" font-weight="600">Browser</text>
+    <text x="256" y="74" fill="#8b949e">Kill switch</text>
+    <text x="340" y="74" fill="#8b949e">Decision model</text>
+    <text x="452" y="74" fill="#8b949e">Confidence</text>
+    <text x="542" y="74" fill="#8b949e">Gate</text>
+    <text x="588" y="74" fill="#8b949e">Log</text>
+  </g>
+  <line x1="22" y1="94" x2="918" y2="94" stroke="#2d2d33" stroke-width="1.5"/>
+
+  <!-- blurb -->
+  <text x="22" y="122" fill="#c9d1d9" font-size="13.5">The browser extension is what makes a page readable as a document rather than as pixels: real roles, real</text>
+  <text x="22" y="142" fill="#c9d1d9" font-size="13.5">labels, real CSS selectors, and inside iframes and shadow roots.</text>
+  <text x="22" y="168" fill="#6e7681" font-size="13">brave://extensions &#8594; Developer mode &#8594; Load unpacked &#8594; pick the `extension` folder &#8594; copy the Extension ID</text>
+
+  <!-- form -->
+  <text x="22" y="212" fill="#e6edf3" font-size="14" font-weight="700">Extension ID</text>
+  <rect x="190" y="194" width="420" height="26" rx="5" fill="#101013" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="200" y="212" fill="#c9d1d9" font-size="13.5" font-family="ui-monospace,Consolas,monospace">ldgfddpecnjhdahallkmdlpiglnflige</text>
+  <text x="624" y="212" fill="#56d364" font-size="13" font-weight="600">registered</text>
+
+  <text x="22" y="254" fill="#e6edf3" font-size="14" font-weight="700">Browsers</text>
+  <g>
+    <rect x="190" y="242" width="15" height="15" rx="3" fill="#2f81f7"/>
+    <path d="M193,249 l3,3 l6,-6" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round"/>
+    <text x="212" y="255" fill="#c9d1d9" font-size="13.5">brave</text>
+    <rect x="276" y="242" width="15" height="15" rx="3" fill="#101013" stroke="#3a3a42"/>
+    <text x="298" y="255" fill="#c9d1d9" font-size="13.5">chrome</text>
+    <rect x="372" y="242" width="15" height="15" rx="3" fill="#101013" stroke="#3a3a42"/>
+    <text x="394" y="255" fill="#c9d1d9" font-size="13.5">edge</text>
+  </g>
+
+  <text x="22" y="292" fill="#e6edf3" font-size="14" font-weight="700">Host</text>
+  <text x="190" y="292" fill="#8b949e" font-size="13" font-family="ui-monospace,Consolas,monospace">D:\Kratos\target\release\kratos-host.exe</text>
+
+  <text x="22" y="318" fill="#e6edf3" font-size="14" font-weight="700">Manifest</text>
+  <text x="190" y="318" fill="#8b949e" font-size="13" font-family="ui-monospace,Consolas,monospace">%LOCALAPPDATA%\kratos\native-host.json</text>
+
+  <!-- buttons -->
+  <rect x="22" y="344" width="88" height="30" rx="6" fill="#2f81f7"/>
+  <text x="66" y="364" text-anchor="middle" fill="#fff" font-size="14" font-weight="600">Register</text>
+  <rect x="120" y="344" width="80" height="30" rx="6" fill="#26262c" stroke="#3a3a42"/>
+  <text x="160" y="364" text-anchor="middle" fill="#c9d1d9" font-size="14">Remove</text>
+
+  <!-- result -->
+  <text x="22" y="400" fill="#56d364" font-size="13" font-family="ui-monospace,Consolas,monospace">manifest written: C:\Users\you\AppData\Local\kratos\native-host.json</text>
+  <text x="22" y="420" fill="#56d364" font-size="13" font-family="ui-monospace,Consolas,monospace">brave: HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\ai.kratos.bridge</text>
+</svg>

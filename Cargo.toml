@@ -10,6 +10,7 @@ members = [
     "crates/kratos-mcp",
     "crates/kratos-host",
     "crates/kratos-ui",
+    "crates/kratos-bench",
 ]
 
 [workspace.package]

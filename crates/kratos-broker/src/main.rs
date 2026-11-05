@@ -47,7 +47,7 @@ fn real_main() -> Result<(), String> {
 
 async fn run() -> Result<(), String> {
     let config_path = kratos_protocol::paths::config_path();
-    let config = match Config::load_or_default(&config_path) {
+    let mut config = match Config::load_or_default(&config_path) {
         Ok(c) => c,
         Err(LoadError::Parse(m)) => {
             // Refusing beats overwriting someone's hand-edited gate policy.
@@ -65,6 +65,21 @@ async fn run() -> Result<(), String> {
     if !config_path.exists() {
         let _ = kratos_protocol::paths::ensure_state_dir();
         let _ = config.save_to(&config_path);
+    }
+
+    // One override, for the case of watching a broker by hand: `start-daemon.cmd`
+    // sets this to 0 so the window does not close out from under you mid-task.
+    // The config file stays the source of truth for everything else -- this is
+    // not a general escape hatch, and in particular no gate or kill setting can
+    // be changed from the environment.
+    if let Some(raw) = std::env::var_os("KRATOS_IDLE_EXIT_MS") {
+        match raw.to_string_lossy().trim().parse::<u64>() {
+            Ok(ms) => config.idle_exit_ms = ms,
+            Err(_) => eprintln!(
+                "kratos-broker: KRATOS_IDLE_EXIT_MS is not a number, keeping {}",
+                config.idle_exit_ms
+            ),
+        }
     }
 
     let pipe_base = std::env::var("KRATOS_PIPE").unwrap_or_else(|_| config.pipe_name.clone());
