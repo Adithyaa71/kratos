@@ -13,9 +13,13 @@ const HOST = "ai.kratos.bridge";
 
 /// Chromium stops a service worker after 30s idle. A native port resets that
 /// timer on each message, but a quiet period with no actions would still end
-/// it and drop the broker connection, so a short alarm keeps it warm while
+/// it and drop the broker connection, so an alarm keeps it warm while
 /// connected. Nothing runs on the alarm itself.
-const KEEPALIVE_MINUTES = 0.4;
+///
+/// 0.5 is Chromium's documented floor. The old 0.4 was accepted by the API and
+/// then clamped, which is the worst way to be wrong: the alarm existed, read
+/// back at the value asked for, and did not fire when expected.
+const KEEPALIVE_MINUTES = 0.5;
 
 let port = null;
 let brand = "chrome";
@@ -311,6 +315,30 @@ chrome.alarms.onAlarm.addListener(() => {
   // port died while we were asleep, this is also where it comes back.
   if (!port) connect();
 });
+
+/// Reconnect on browsing, not only on a timer.
+///
+/// A worker that is asleep when the broker appears has no way back if an alarm
+/// is its only retry: the alarm fires in the worker that is not running. These
+/// events wake it as a matter of course, and every one of them is a moment
+/// when the bridge is about to be wanted anyway.
+///
+/// The guard matters as much as the listeners. `connect()` returns immediately
+/// when a port exists, so a busy browsing session costs one comparison per
+/// event and opens nothing.
+function reviveOnActivity() {
+  const revive = () => {
+    if (!port) connect();
+  };
+  try {
+    chrome.tabs.onUpdated.addListener(revive);
+    chrome.tabs.onActivated.addListener(revive);
+    chrome.windows.onFocusChanged.addListener(revive);
+  } catch (e) {
+    console.warn("[kratos] could not listen for activity", e);
+  }
+}
+reviveOnActivity();
 
 // The popup asks for this; nothing else may. It reports state only -- there is
 // no message here that drives a page, because the broker is the only thing
