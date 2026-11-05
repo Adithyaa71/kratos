@@ -402,6 +402,24 @@ Everything else is unaffected by which model answers. The gate, the kill
 switch, the lease, the journal and the evidence rules do not know and do not
 ask.
 
+## Credit where it is due
+
+Three of the ideas in **The wait is earned** came from reading
+**agent-desktop**, a Rust desktop-automation project with a different shape to
+this one — your agent holds the loop, there is no model inside it — and a
+better answer than mine on these points:
+
+| taken from them | what it replaced here |
+|---|---|
+| an actionability check with auto-wait, returning as soon as the UI is ready | a fixed 350ms settle, paid in full every action |
+| never downgrading silently from semantic to physical input | a UI Automation fallback that clicked a coordinate and said nothing |
+| errors that state whether input may already have been delivered | a cruder read-only/not-read-only split |
+
+The implementations here are mine and the design differs — their auto-wait
+polls control state, this one polls the target's pixels against measured drift,
+because this broker has to work on windows that expose no state to poll. The
+diagnosis was theirs.
+
 ## Safety, stated plainly
 
 - **No TCP.** One named pipe, DACL admitting a single SID. Loopback is
