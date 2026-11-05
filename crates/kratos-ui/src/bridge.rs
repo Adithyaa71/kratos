@@ -16,14 +16,34 @@ use std::path::{Path, PathBuf};
 /// Must match `name` in the manifest and `HOST` in extension/background.js.
 pub const HOST_NAME: &str = "ai.kratos.bridge";
 
-/// The brands that read a per-hive NativeMessagingHosts key.
+/// The hives each brand might read, under HKCU.
 ///
-/// Vivaldi and Opera are Chromium too, but they read Chrome's hive, so
-/// registering `chrome` already covers them.
-pub const BRANDS: [(&str, &str); 3] = [
-    ("brave", r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts"),
-    ("chrome", r"Software\Google\Chrome\NativeMessagingHosts"),
-    ("edge", r"Software\Microsoft\Edge\NativeMessagingHosts"),
+/// More than one per brand on purpose. A release Brave reads its own name, but
+/// the beta and nightly channels read theirs, a plain Chromium build reads
+/// `Software\Chromium`, and Vivaldi and Opera read Chrome's. Writing only the
+/// obvious one produces the worst kind of failure: a registration that works
+/// in the browser you tested and silently does not exist in the next one, with
+/// nothing to see but "Specified native messaging host not found".
+///
+/// Writing a key that no browser ever reads costs nothing.
+pub const BRANDS: [(&str, &[&str]); 3] = [
+    (
+        "brave",
+        &[
+            r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts",
+            r"Software\BraveSoftware\Brave-Browser-Beta\NativeMessagingHosts",
+            r"Software\BraveSoftware\Brave-Browser-Nightly\NativeMessagingHosts",
+            r"Software\BraveSoftware\Brave-Browser-Dev\NativeMessagingHosts",
+        ],
+    ),
+    (
+        "chrome",
+        &[
+            r"Software\Google\Chrome\NativeMessagingHosts",
+            r"Software\Chromium\NativeMessagingHosts",
+        ],
+    ),
+    ("edge", &[r"Software\Microsoft\Edge\NativeMessagingHosts"]),
 ];
 
 /// What a registration attempt did, per brand, for display.
@@ -102,13 +122,29 @@ pub fn register(id: &str, brands: &[String]) -> Result<Report, String> {
         .map_err(|e| format!("{}: {e}", manifest.display()))?;
 
     let mut lines = Vec::new();
+    let target = manifest.display().to_string();
     for brand in brands {
-        let Some((_, subkey)) = BRANDS.iter().find(|(b, _)| b == brand) else {
+        let Some((_, subkeys)) = BRANDS.iter().find(|(b, _)| b == brand) else {
             continue;
         };
-        let key = format!(r"{subkey}\{HOST_NAME}");
-        let result = set_default_value(&key, &manifest.display().to_string())
-            .map(|()| format!(r"HKCU\{key}"));
+        let mut written = 0usize;
+        let mut failure = None;
+        for subkey in *subkeys {
+            let key = format!(r"{subkey}\{HOST_NAME}");
+            // Read back rather than trust the write: a registry call that
+            // returns success and leaves nothing behind is exactly the bug
+            // this is here to catch.
+            match set_default_value(&key, &target).and_then(|()| read_default_value(&key)) {
+                Ok(back) if back == target => written += 1,
+                Ok(back) => failure = Some(format!("{key}: wrote the value and read back {back:?}")),
+                Err(e) => failure = Some(format!("{key}: {e}")),
+            }
+        }
+        let result = if written > 0 {
+            Ok(format!("{written} of {} hives", subkeys.len()))
+        } else {
+            Err(failure.unwrap_or_else(|| "no hive could be written".to_string()))
+        };
         lines.push((brand.clone(), result));
     }
 
@@ -120,9 +156,15 @@ pub fn unregister(brands: &[String]) -> Vec<(String, Result<(), String>)> {
     brands
         .iter()
         .filter_map(|brand| {
-            let (_, subkey) = BRANDS.iter().find(|(b, _)| b == brand)?;
-            let key = format!(r"{subkey}\{HOST_NAME}");
-            Some((brand.clone(), delete_key(&key)))
+            let (_, subkeys) = BRANDS.iter().find(|(b, _)| b == brand)?;
+            let mut outcome = Ok(());
+            for subkey in *subkeys {
+                let key = format!(r"{subkey}\{HOST_NAME}");
+                if let Err(e) = delete_key(&key) {
+                    outcome = Err(e);
+                }
+            }
+            Some((brand.clone(), outcome))
         })
         .collect()
 }
@@ -177,6 +219,35 @@ fn set_default_value(subkey: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read `HKCU\<subkey>`'s default value back.
+fn read_default_value(subkey: &str) -> Result<String, String> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ,
+    };
+
+    let path = wide(subkey);
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    // SAFETY: path is NUL-terminated; buf and len describe one buffer, and
+    // len is updated to the bytes written.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            path.as_ptr(),
+            std::ptr::null(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("cannot read it back (error {rc})"));
+    }
+    let chars = (len as usize / 2).saturating_sub(1).min(buf.len());
+    Ok(String::from_utf16_lossy(&buf[..chars]))
+}
+
 fn delete_key(subkey: &str) -> Result<(), String> {
     use windows_sys::Win32::System::Registry::{RegDeleteKeyW, HKEY_CURRENT_USER};
 
@@ -228,6 +299,34 @@ mod tests {
         let (_, rest) = json.split_once("chrome-extension://").unwrap();
         let (id, _) = rest.split_once('/').unwrap();
         assert_eq!(id, "abcdefghijklmnopabcdefghijklmnop");
+    }
+
+    #[test]
+    fn every_brand_names_at_least_one_hive_and_none_repeat() {
+        let mut all: Vec<&str> = Vec::new();
+        for (brand, hives) in BRANDS {
+            assert!(!hives.is_empty(), "{brand} names no hive");
+            for h in hives {
+                assert!(h.ends_with("NativeMessagingHosts"), "{h} is not a host hive");
+                all.push(h);
+            }
+        }
+        let before = all.len();
+        all.sort_unstable();
+        all.dedup();
+        // A hive written twice would report two successes for one key.
+        assert_eq!(all.len(), before, "a hive is listed under two brands");
+    }
+
+    #[test]
+    fn brave_covers_its_other_channels() {
+        let (_, hives) = BRANDS.iter().find(|(b, _)| *b == "brave").unwrap();
+        // A beta or nightly Brave reads its own name, and the symptom of
+        // missing it is indistinguishable from no registration at all.
+        assert!(hives.iter().any(|h| h.contains("Brave-Browser-Beta")));
+        assert!(hives.iter().any(|h| h.contains("Brave-Browser-Nightly")));
+        let (_, chrome) = BRANDS.iter().find(|(b, _)| *b == "chrome").unwrap();
+        assert!(chrome.iter().any(|h| h.contains(r"Software\Chromium")));
     }
 
     #[test]

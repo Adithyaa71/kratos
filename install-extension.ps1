@@ -77,24 +77,46 @@ Write-Host "  origin: chrome-extension://$ExtensionId/"
 Write-Host ""
 
 # Each Chromium brand reads its own registry hive. Same manifest for all.
+# More than one hive per brand on purpose: the beta and nightly channels read
+# their own names, a plain Chromium build reads Software\Chromium, and Vivaldi
+# and Opera read Chrome's. Writing only the obvious one gives the worst kind of
+# failure -- a registration that works in the browser you tested and silently
+# does not exist in the next, with nothing to see but "Specified native
+# messaging host not found". A key no browser reads costs nothing.
 $hives = @{
-    brave  = 'HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\ai.kratos.bridge'
-    chrome = 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\ai.kratos.bridge'
-    edge   = 'HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\ai.kratos.bridge'
+    brave  = @(
+        'HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\ai.kratos.bridge',
+        'HKCU:\Software\BraveSoftware\Brave-Browser-Beta\NativeMessagingHosts\ai.kratos.bridge',
+        'HKCU:\Software\BraveSoftware\Brave-Browser-Nightly\NativeMessagingHosts\ai.kratos.bridge',
+        'HKCU:\Software\BraveSoftware\Brave-Browser-Dev\NativeMessagingHosts\ai.kratos.bridge'
+    )
+    chrome = @(
+        'HKCU:\Software\Google\Chrome\NativeMessagingHosts\ai.kratos.bridge',
+        'HKCU:\Software\Chromium\NativeMessagingHosts\ai.kratos.bridge'
+    )
+    edge   = @('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\ai.kratos.bridge')
 }
 
 foreach ($browser in $Browsers) {
-    $key = $hives[$browser]
-    try {
-        if (-not (Test-Path $key)) {
-            New-Item -Path $key -Force | Out-Null
+    foreach ($key in $hives[$browser]) {
+        try {
+            New-Item -Path $key -Force -ErrorAction Stop | Out-Null
+            # The default (unnamed) value holds the manifest path.
+            New-ItemProperty -Path $key -Name '(default)' -Value $manifestPath `
+                -PropertyType String -Force -ErrorAction Stop | Out-Null
+            # Read it back. A registry write that reports success and leaves
+            # nothing behind is exactly the failure this is here to catch.
+            $back = (Get-ItemProperty -Path $key -ErrorAction Stop).'(default)'
+            if ($back -eq $manifestPath) {
+                Write-Host ("registered: {0,-7} {1}" -f $browser, $key) -ForegroundColor Green
+            }
+            else {
+                Write-Host ("WRONG:      {0,-7} {1} holds {2}" -f $browser, $key, $back) -ForegroundColor Red
+            }
         }
-        # The default (unnamed) value holds the manifest path.
-        Set-ItemProperty -Path $key -Name '(default)' -Value $manifestPath
-        Write-Host ("registered: {0,-7} {1}" -f $browser, $key) -ForegroundColor Green
-    }
-    catch {
-        Write-Host ("failed:     {0,-7} {1}" -f $browser, $_.Exception.Message) -ForegroundColor Red
+        catch {
+            Write-Host ("failed:     {0,-7} {1}" -f $browser, $_.Exception.Message) -ForegroundColor Red
+        }
     }
 }
 
@@ -110,5 +132,7 @@ Write-Host "     a broker is running."
 Write-Host ""
 Write-Host "To undo:" -ForegroundColor DarkGray
 foreach ($browser in $Browsers) {
-    Write-Host "  Remove-Item '$($hives[$browser])' -Force" -ForegroundColor DarkGray
+    foreach ($key in $hives[$browser]) {
+        Write-Host "  Remove-Item '$key' -Force" -ForegroundColor DarkGray
+    }
 }
