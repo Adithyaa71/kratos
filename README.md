@@ -149,7 +149,7 @@ reconnects on its own, so the order you start things in does not matter.
 **3 · Give it a decision model.**
 
 ```bash
-./target/release/kratos-ui.exe
+start-ui.cmd               # or: ./target/release/kratos-ui.exe
 ```
 
 Paste a key under **Decision model**. It is sealed with Windows DPAPI for your
@@ -208,10 +208,14 @@ gate rule, keeping one session alive — there are three ways, and none of them
 changes behaviour:
 
 ```bash
-./target/release/kratos-ui.exe     # Status → Start broker
+start-ui.cmd                       # the settings window → Status → Start broker
 start-daemon.cmd                   # foreground, log on your console
 start-daemon.cmd kratos.agent-a    # a broker of its own, for one agent
 ```
+
+`start-ui.cmd` is double-clickable, and the **Status** tab has **Start broker**
+and **Stop broker** on it. Everything else — the key, the gate, the kill
+switch, the extension id, the log — is in that window too.
 
 An agent connecting afterwards finds the running one. The pipe name is the only
 thing that has to match.

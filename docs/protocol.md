@@ -360,9 +360,17 @@ that can clear its own kill switch does not have a kill switch.
   "kill_engaged":[],
   "decider":{"provider":"jev","model":"jev-latest","key_present":true},
   "counters":{"act":42,"executed":31,"no_effect":2,"refused":5,
-              "needs_confirmation":3,"blocked":1,"killed":0}
+              "needs_confirmation":3,"blocked":1,"killed":0},
+  "journal":"C:\Users\you\AppData\Local\kratos\actions.jsonl",
+  "config":"C:\Users\you\AppData\Local\kratos\config.json"
 }}
 ```
+
+`config` and `journal` are the files **this** broker read and is writing. They
+are reported because a broker started by hand, from a shell with
+`KRATOS_CONFIG` set, is running a different policy than the settings window is
+editing -- and the first symptom of that is a key that appears to have
+vanished.
 
 ### 4.8 `log.tail`
 

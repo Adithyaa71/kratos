@@ -179,7 +179,7 @@ there are three ways, in order of convenience:
 broker** and **Reload settings** live.
 
 ```bash
-./target/release/kratos-ui.exe
+start-ui.cmd               # double-clickable; or: ./target/release/kratos-ui.exe
 ```
 
 **2. The script**, which keeps it in the foreground with its log on your

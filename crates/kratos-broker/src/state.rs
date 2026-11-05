@@ -536,6 +536,12 @@ impl Broker {
             },
             "counters": self.counters.snapshot(),
             "journal": self.journal.read().await.path().display().to_string(),
+            // Which config this broker actually read. A broker started by
+            // hand, from a shell with KRATOS_CONFIG set, is reading a
+            // different policy than the settings window is editing -- and the
+            // symptom of that is a key that appears to have vanished. Saying
+            // so costs one string.
+            "config": kratos_protocol::paths::config_path().display().to_string(),
         })
     }
 
