@@ -81,6 +81,20 @@ for Brave, Chrome and Edge.
 
 ### c. Restart the browser, reload your tabs
 
+> **Closing the windows is not quitting.**
+>
+> Brave, Chrome and Edge keep background processes alive after the last
+window closes -- a tray icon, or nothing visible at all. The browser has not
+exited, so the extension's worker keeps the host lookup it already failed,
+and it will keep failing for as long as that process lives. Closing every
+window is not enough; neither is reloading the extension.
+>
+> To be certain it has gone:
+>
+>     powershell -Command "Get-Process brave,chrome,msedge -ErrorAction SilentlyContinue | Stop-Process -Force"
+>
+> Then start the browser again.
+
 - **Fully quit and reopen the browser.** The native host is looked up when the
   extension starts; a reload of the extension is not enough.
 - **Reload any tab you want readable.** Content scripts are injected at page

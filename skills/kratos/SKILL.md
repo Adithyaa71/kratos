@@ -210,6 +210,13 @@ Stop acting on that target entirely. You can engage a kill switch and you can
 never clear one. Tell the operator; only they can resume.
 
 ### `no_backend` — the broker cannot see the screen
+
+If `desktop_status` shows no `dom-ext` backend but a browser is open with the
+extension installed, the browser almost certainly did not restart when someone
+thought it had. Closing every window leaves background processes running on
+Windows, the browser never exits, and the extension keeps the failed host
+lookup. Say so plainly: the operator has to end those processes, not close the
+windows.
 Not your fault and not fixable by you. Tell the operator:
 > The perception backend is not running. Start it with
 > `D:\Kratos\start-backend.cmd`

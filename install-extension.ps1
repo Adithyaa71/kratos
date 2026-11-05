@@ -122,8 +122,12 @@ foreach ($browser in $Browsers) {
 
 Write-Host ""
 Write-Host "Next:" -ForegroundColor Cyan
-Write-Host "  1. Fully quit and reopen the browser. The native host is only"
-Write-Host "     looked up at extension startup, so a reload is not enough."
+Write-Host "  1. Fully quit and reopen the browser -- and on Windows that is"
+Write-Host "     not what closing the windows does. Brave and Chrome keep"
+Write-Host "     background processes alive, the browser never exits, and the"
+Write-Host "     extension keeps the host lookup it already failed. Make sure:"
+Write-Host "       Get-Process brave,chrome,msedge -ErrorAction SilentlyContinue | Stop-Process -Force" -ForegroundColor DarkGray
+Write-Host "     Reloading the extension is not enough either."
 Write-Host "  2. Reload any tabs you want readable. Content scripts are"
 Write-Host "     injected at page load, so tabs open before the extension was"
 Write-Host "     installed report 'not readable here'."

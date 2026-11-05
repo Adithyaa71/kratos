@@ -73,7 +73,6 @@ function connect() {
     ready = false;
     schedule(why);
   });
-  reconnectDelay = 1000;
   lastReason = "waiting for the native host to answer";
   // Amber, not green: the host has not spoken yet.
   setBadge("...", "#8a6d3b");
@@ -137,6 +136,11 @@ async function onBrokerMessage(frame) {
     if (frame && frame.op === "connected") {
       ready = true;
       lastReason = "";
+      // Only a host that actually spoke earns the backoff reset. Resetting it
+      // when connectNative merely returned a port turned the retry into a
+      // flat one-second loop: 1231 identical warnings in twenty minutes,
+      // which is a way of saying nothing very loudly.
+      reconnectDelay = 1000;
       setBadge("on", "#3d8b4a");
     }
     if (frame && frame.op === "disconnected") {

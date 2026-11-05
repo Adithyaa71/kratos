@@ -488,9 +488,12 @@ impl App {
             }
             ui.add_space(8.0);
             ui.weak(
-                "Now quit the browser completely and reopen it. The host is looked up once when \
-                 the extension starts, so reloading the extension is not enough. Then reload any \
-                 tab you want readable -- content scripts are injected at page load.",
+                "Now quit the browser completely and reopen it -- and on Windows that is not what \
+                 closing the windows does. Brave and Chrome keep background processes alive, so the \
+                 browser never exits and the extension keeps the host lookup it already failed. End \
+                 them: Get-Process brave,chrome,msedge | Stop-Process -Force. Reloading the \
+                 extension is not enough either. Then reload any tab you want readable -- content \
+                 scripts are injected at page load.",
             );
         }
 
