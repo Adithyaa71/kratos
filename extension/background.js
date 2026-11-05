@@ -24,6 +24,11 @@ let reconnectDelay = 1000;
 /// console is asleep exactly when you want to read it, so this is kept here
 /// and shown in the popup, which is where someone looks first.
 let lastReason = "";
+/// connectNative returns a port synchronously even when there is no host to
+/// run -- the failure arrives later, on the disconnect listener. So a port is
+/// not evidence of anything; this flag is, and it is set only when the host
+/// itself says hello.
+let ready = false;
 
 // -- brand ------------------------------------------------------------------
 
@@ -61,11 +66,13 @@ function connect() {
   port.onDisconnect.addListener(() => {
     const why = chrome.runtime.lastError ? chrome.runtime.lastError.message : "closed";
     port = null;
-    schedule(`native host disconnected: ${why}`);
+    ready = false;
+    schedule(why);
   });
   reconnectDelay = 1000;
-  lastReason = "";
-  setBadge("on", "#3d8b4a");
+  lastReason = "waiting for the native host to answer";
+  // Amber, not green: the host has not spoken yet.
+  setBadge("...", "#8a6d3b");
 }
 
 function schedule(reason) {
@@ -123,8 +130,16 @@ function sendFrame(frame) {
 
 async function onBrokerMessage(frame) {
   if (!frame || frame.t === "evt") {
-    if (frame && frame.op === "connected") setBadge("on", "#3d8b4a");
-    if (frame && frame.op === "disconnected") setBadge("off", "#8b3d3d");
+    if (frame && frame.op === "connected") {
+      ready = true;
+      lastReason = "";
+      setBadge("on", "#3d8b4a");
+    }
+    if (frame && frame.op === "disconnected") {
+      ready = false;
+      lastReason = "the host lost the broker";
+      setBadge("off", "#8b3d3d");
+    }
     return;
   }
   if (frame.t !== "req") return;
@@ -307,7 +322,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
     reconnectDelay = 1000;
     if (!port) connect();
   }
-  reply({ connected: !!port, reason: lastReason, brand, host: HOST });
+  reply({ connected: ready, port: !!port, reason: lastReason, brand, host: HOST });
   return false;
 });
 
