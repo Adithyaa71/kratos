@@ -1,0 +1,13 @@
+[package]
+name = "kratos-shot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Screen and region fingerprints: mechanical evidence that an action changed something."
+
+[dependencies]
+
+[dependencies.windows-sys]
+workspace = true
+features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"]

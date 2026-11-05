@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>kratos</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1b1b1f;
+        --muted: #5f6368;
+        --bg: #ffffff;
+        --line: #e3e4e8;
+        --ok: #2e7d4f;
+        --off: #a33a3a;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e6e6ea;
+          --muted: #9aa0a6;
+          --bg: #202124;
+          --line: #35363a;
+          --ok: #7bc496;
+          --off: #e08a8a;
+        }
+      }
+      body {
+        font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 14px 16px;
+        width: 280px;
+        color: var(--fg);
+        background: var(--bg);
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        font-weight: 600;
+      }
+      .row {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 5px 0;
+        border-top: 1px solid var(--line);
+      }
+      .row:first-of-type {
+        border-top: 0;
+      }
+      .key {
+        color: var(--muted);
+        flex: 0 0 96px;
+      }
+      .val {
+        font-variant-numeric: tabular-nums;
+      }
+      .dot::before {
+        content: "\25CF";
+        margin-right: 5px;
+      }
+      .on {
+        color: var(--ok);
+      }
+      .off {
+        color: var(--off);
+      }
+      p {
+        color: var(--muted);
+        margin: 12px 0 0;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>kratos bridge</h1>
+    <div class="row">
+      <span class="key">Broker</span>
+      <span class="val dot off" id="state">checking</span>
+    </div>
+    <div class="row">
+      <span class="key">Browser</span>
+      <span class="val" id="brand">&mdash;</span>
+    </div>
+    <div class="row">
+      <span class="key">This tab</span>
+      <span class="val" id="elements">&mdash;</span>
+    </div>
+    <p id="note">
+      This bridge reports page structure to the broker when asked. It does
+      nothing on its own.
+    </p>
+    <script src="popup.js"></script>
+  </body>
+</html>

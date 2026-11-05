@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "kratos bridge",
+  "version": "0.1.0",
+  "description": "Reports the real DOM of pages in this browser to the kratos broker, and acts on elements by selector rather than by screen position.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "nativeMessaging",
+    "tabs",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "match_about_blank": false,
+      "run_at": "document_idle",
+      "js": ["content.js"]
+    }
+  ],
+  "action": {
+    "default_title": "kratos",
+    "default_popup": "popup.html"
+  }
+}

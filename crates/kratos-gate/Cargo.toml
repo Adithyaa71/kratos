@@ -1,0 +1,14 @@
+[package]
+name = "kratos-gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Safety gate, kill-switch scopes and the native approval dialog."
+
+[dependencies]
+kratos-protocol = { workspace = true }
+
+[dependencies.windows-sys]
+workspace = true
+features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"]

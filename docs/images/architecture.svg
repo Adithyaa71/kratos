@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 520" width="1180" height="520" font-family="ui-sans-serif,-apple-system,'Segoe UI',Inter,Roboto,sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#121926"/>
+    </linearGradient>
+    <filter id="glow" x="-70%" y="-70%" width="240%" height="240%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1180" height="520" rx="18" fill="url(#bg)"/>
+
+  <!-- ══ column headings ══ -->
+  <text x="150" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">DECIDES</text>
+  <text x="590" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">GOVERNS</text>
+  <text x="1010" y="56" text-anchor="middle" fill="#6e7681" font-size="14" font-weight="600" letter-spacing="3">TOUCHES</text>
+
+  <!-- ══ 1. the agent ══ -->
+  <rect x="40" y="84" width="220" height="130" rx="14" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="150" y="134" text-anchor="middle" fill="#e6edf3" font-size="24" font-weight="700">your agent</text>
+  <text x="150" y="164" text-anchor="middle" fill="#8b949e" font-size="15">says one sentence</text>
+  <text x="150" y="190" text-anchor="middle" fill="#58a6ff" font-size="14" font-style="italic">click the "Send" button</text>
+
+  <!-- ══ 2. the broker ══ -->
+  <rect x="360" y="84" width="460" height="300" rx="16" fill="#0f1620" stroke="#2f81f7" stroke-width="2"/>
+  <text x="590" y="130" text-anchor="middle" fill="#e6edf3" font-size="26" font-weight="700">kratos-broker</text>
+
+  <rect x="392" y="156" width="396" height="48" rx="10" fill="#1a2230"/>
+  <text x="414" y="186" fill="#d2a8ff" font-size="17" font-weight="600">decide</text>
+  <text x="766" y="186" text-anchor="end" fill="#8b949e" font-size="14">which action · which element</text>
+
+  <rect x="392" y="212" width="396" height="48" rx="10" fill="#1a2230"/>
+  <text x="414" y="242" fill="#f0883e" font-size="17" font-weight="600">gate</text>
+  <text x="766" y="242" text-anchor="end" fill="#8b949e" font-size="14">allow · review · block</text>
+
+  <rect x="392" y="268" width="396" height="48" rx="10" fill="#1a2230"/>
+  <text x="414" y="298" fill="#f85149" font-size="17" font-weight="600">kill switch</text>
+  <text x="766" y="298" text-anchor="end" fill="#8b949e" font-size="14">agents set it, never clear it</text>
+
+  <rect x="392" y="324" width="396" height="42" rx="10" fill="#1a2230"/>
+  <text x="414" y="351" fill="#8b949e" font-size="15">lease · journal · prove it changed</text>
+
+  <!-- ══ 3. the machine ══ -->
+  <rect x="890" y="84" width="250" height="122" rx="14" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+  <text x="1015" y="124" text-anchor="middle" fill="#3fb950" font-size="21" font-weight="700">browser</text>
+  <text x="1015" y="150" text-anchor="middle" fill="#8b949e" font-size="14">extension · real DOM</text>
+  <text x="1015" y="176" text-anchor="middle" fill="#6e7681" font-size="13">acts on selectors, not pixels</text>
+
+  <rect x="890" y="224" width="250" height="110" rx="14" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="1015" y="262" text-anchor="middle" fill="#e6edf3" font-size="21" font-weight="700">any window</text>
+  <text x="1015" y="288" text-anchor="middle" fill="#8b949e" font-size="14">UI Automation · OCR</text>
+  <text x="1015" y="312" text-anchor="middle" fill="#6e7681" font-size="13">mouse and keyboard</text>
+
+  <!-- ══ wires ══ -->
+  <line x1="260" y1="149" x2="360" y2="149" stroke="#30363d" stroke-width="2.5"/>
+  <line x1="820" y1="180" x2="890" y2="145" stroke="#30363d" stroke-width="2.5"/>
+  <line x1="820" y1="280" x2="890" y2="279" stroke="#30363d" stroke-width="2.5"/>
+
+  <text x="310" y="138" text-anchor="middle" fill="#2f81f7" font-size="12.5" font-weight="600">MCP</text>
+  <text x="310" y="176" text-anchor="middle" fill="#6e7681" font-size="12">named pipe</text>
+
+  <!-- one packet, there and back, so the direction reads at a glance -->
+  <circle r="6" fill="#2f81f7" filter="url(#glow)">
+    <animateMotion dur="3s" repeatCount="indefinite" calcMode="linear" path="M260,149 L360,149"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="6" fill="#3fb950" filter="url(#glow)">
+    <animateMotion dur="3s" begin="0.8s" repeatCount="indefinite" calcMode="linear" path="M820,180 L890,145"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" begin="0.8s" repeatCount="indefinite"/>
+  </circle>
+  <circle r="6" fill="#a371f7" filter="url(#glow)">
+    <animateMotion dur="3s" begin="1.9s" repeatCount="indefinite" calcMode="linear" path="M360,149 L260,149"/>
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;.15;.85;1" dur="3s" begin="1.9s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- the gate catches the eye on each pass -->
+  <rect x="392" y="212" width="396" height="48" rx="10" fill="none" stroke="#f0883e" stroke-width="2.5" opacity="0">
+    <animate attributeName="opacity" values="0;0.9;0" dur="3s" begin="1.2s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- ══ the one sentence that matters ══ -->
+  <line x1="40" y1="424" x2="1140" y2="424" stroke="#21262d" stroke-width="1.5"/>
+  <text x="40" y="462" fill="#e6edf3" font-size="17" font-weight="600">The model picks the action and the element.</text>
+  <text x="40" y="488" fill="#8b949e" font-size="16">Every literal — the text, the keys, the URL — comes from your sentence. It generates nothing.</text>
+</svg>

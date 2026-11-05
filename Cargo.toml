@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kratos-protocol",
+    "crates/kratos-ipc",
+    "crates/kratos-gate",
+    "crates/kratos-decide",
+    "crates/kratos-shot",
+    "crates/kratos-broker",
+    "crates/kratos-mcp",
+    "crates/kratos-host",
+    "crates/kratos-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+kratos-protocol = { path = "crates/kratos-protocol" }
+kratos-ipc = { path = "crates/kratos-ipc" }
+kratos-gate = { path = "crates/kratos-gate" }
+kratos-decide = { path = "crates/kratos-decide" }
+kratos-shot = { path = "crates/kratos-shot" }
+
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", default-features = false, features = [
+    "rt", "rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "macros", "process", "fs",
+] }
+ureq = { version = "3.4", default-features = false, features = ["rustls", "json"] }
+windows-sys = "0.61"
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts"] }
+
+# Release is what ships. Startup time is a stated requirement and the broker is
+# spawned lazily on a user-visible path, so: fat LTO and one codegen unit to
+# keep the image small (fewer pages faulted in before main), stripped symbols.
+#
+# opt-level is 3, not "z", because the screen fingerprint walks a full-screen
+# BGRA buffer on every action and that loop is the one piece of real compute
+# here -- trading it for a few KB of image would be the wrong way round.
+#
+# panic is deliberately NOT "abort": each connection is handled inside a
+# catch_unwind so one agent's malformed request cannot take down a broker that
+# other agents -- and the kill switch -- depend on.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

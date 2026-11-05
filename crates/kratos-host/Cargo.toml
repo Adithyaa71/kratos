@@ -1,0 +1,13 @@
+[package]
+name = "kratos-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browser native-messaging host: relays the MV3 extension onto the broker pipe."
+
+[dependencies]
+kratos-protocol = { workspace = true }
+kratos-ipc = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

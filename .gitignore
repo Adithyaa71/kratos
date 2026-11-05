@@ -1,0 +1,34 @@
+# Build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# The older Python build this project grew out of. Kept on disk because
+# it is real work, out of the repo because it no longer runs -- its `jev`
+# package was removed, and everything Kratos needs from it now lives in
+# backends/.
+/_legacy/
+
+# Local state never belongs in the tree.
+#
+# The sealed API key and the action log live in %LOCALAPPDATA%\kratos,
+# not here, so these are a guard rather than a necessity -- but a DPAPI
+# blob is still a credential, and an action log still records what was
+# typed into real windows.
+config.json
+native-host.json
+*.jsonl
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/
+.idea/
+*.swp

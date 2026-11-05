@@ -1,0 +1,13 @@
+[package]
+name = "kratos-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP stdio shim for kratos. Holds no policy: it is a translator."
+
+[dependencies]
+kratos-protocol = { workspace = true }
+kratos-ipc = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
