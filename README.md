@@ -165,6 +165,26 @@ keys for you, and shows you where it put them.
 
 <img src="docs/images/ui-browser-tab.svg" alt="The Browser tab: paste the extension id and press Register" width="760">
 
+Then start your browser with the bridge loaded, which is the part that
+matters:
+
+```bash
+start-my-brave.cmd          # your profile, your logins, your tabs
+```
+
+**Why a flag instead of installing it from the extensions page.** An unpacked
+extension installed through `brave://extensions` is recorded in the profile's
+Secure Preferences, and that record can end up damaged -- on one machine here
+it did, with an empty `state` field. The browser still runs the extension, so
+the popup opens and content scripts work, and it still refuses to resolve a
+native messaging host for it. The symptom is `Specified native messaging host
+not found` against a registration that is provably correct, forever, with
+nothing to see in any log. `--load-extension` keeps no such record, and the id
+is derived from the path, so it does not change.
+
+Remove the installed copy from the extensions page first, or the browser will
+hold two entries claiming the same id.
+
 Or from a shell, if you prefer:
 
 ```bash
