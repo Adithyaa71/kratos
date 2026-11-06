@@ -5,6 +5,148 @@ Newest phase first.
 
 ---
 
+## P2 — identity, sessions, lanes, resolution, approval
+
+### Done
+
+* **Identity in the handshake.** `Hello` gains optional `harness`, `agent` and
+  `session`. The shim learns `harness` from the MCP client's own
+  `clientInfo.name` in `initialize` — which every MCP client already sends, so
+  connecting a harness really is pasting one snippet — takes `agent` from
+  `--agent <name>` or `KRATOS_AGENT`, and mints a `session` per process.
+* **Lane resolution** (`crates/kratos-broker/src/lane.rs`): browser from
+  `harnesses[h].browser`, else `defaults.browser`, else the OS default, else
+  the first installed Chromium; profile from `agents[a].profile_dir` when that
+  profile is listed in the browser's own `Local State`, else `defaults.profile`,
+  else `profile.last_used`. A missing profile falls back **and says so** in
+  `lane.warning`.
+* **Machine discovery** (`browsers.rs`): per-brand exe and `User Data` paths,
+  profiles and names from `Local State`'s `info_cache`, `profile.last_used`,
+  and the OS default browser from `UserChoice\ProgId` (prefix-matched, because
+  a second channel installed adds a per-install suffix).
+* **Lane state**: `ready` only when an attached instance is *paired* with this
+  browser and profile; `degraded` when it is attached but unpaired, with the
+  reason in the warning; `unavailable` when the browser is not installed.
+* **Harness approval.** An unknown harness is written into the config
+  unassigned and unapproved, and may call `status` and `whoami` and nothing
+  else. A native dialog asks allow-always / allow-once / deny, and the agent
+  cannot answer it.
+* **New ops**: `whoami` (agent), and `lane.list`, `harness.list`, `agent.list`,
+  `instance.bind` (ui only). New codes `lane_unavailable` and `not_approved`.
+  New MCP tool `desktop_whoami`.
+* **Config** gains `harnesses[]`, `agents[]`, `instances[]`, `defaults{}`, and
+  the broker now picks up an external edit to `config.json` within one idle
+  tick — §9 has always said the file is hot-reloaded and it was not.
+* `docs/protocol.md`: §3.0 identity, §3.0.1 the lane object, §4.7b `whoami`,
+  §4.10 the four UI ops, both new error codes, and the new config sections.
+
+### Evidence
+
+```text
+cargo test --workspace
+   337 passed; 0 failed; 3 ignored
+cargo clippy --workspace --all-targets
+   0 warnings
+
+cargo test -p kratos-broker --test multi_harness_audit
+   9 passed; 3 ignored
+     two_browser_instances_both_stay_registered              (P1)
+     the_same_instance_reconnecting_supersedes_itself        (P1)
+     the_hello_reply_carries_the_lane_and_the_approved_flag
+     whoami_answers_with_the_lane_and_follows_the_users_allocation
+     an_unapproved_harness_may_only_ask_who_it_is
+     a_new_session_resolves_again_from_the_config
+     an_agents_profile_is_used_and_a_missing_one_warns
+     pairing_an_instance_with_a_profile_makes_the_lane_ready
+     an_agent_cannot_allocate_or_approve_itself
+```
+
+Live, through the real shim and a broker on a scratch config:
+
+```text
+initialize clientInfo.name = "claude-code", --agent agent-a
+desktop_whoami ->
+  harness=claude-code  agent=agent-a  session=s-24992-…  approved=true
+  lane: browser=vivaldi  profile_dir=Default  profile_name="Work"  state=degraded
+
+initialize clientInfo.name = "some-other-ide"   (not in the config)
+desktop_observe -> not_approved in 95ms, dialog raised
+desktop_whoami  -> approved=false, lane browser=brave (the OS default), "Work"
+config.json     -> harnesses += {id: "some-other-ide", browser: "", approved: false}
+journal         -> {"op":"harness.approval","answer":"timed_out",…}
+```
+
+`profile_name: "Work"` and `browser: brave` are read off this machine — Brave
+is its default browser and `Work` is what its `Local State` calls the profile —
+so the discovery path is exercised against real files, not fixtures.
+
+### Decisions
+
+* **The approval dialog does not block the request.** Spec §3 requires a native
+  dialog the agent cannot answer; it does not require the op to wait on one,
+  and waiting is the mistake the gate was built around (241 of 272 seconds,
+  once). So the dialog is raised, the op is refused `not_approved` with
+  `retry_safe: true`, and the retry succeeds the moment somebody clicks.
+  Measured at 95ms rather than 120 seconds. One dialog per harness at a time,
+  so an agent in a retry loop raises one window.
+* **A timeout is not a decision.** The claim is released, so the question is
+  asked again next time: a user who was away from the machine has refused
+  nothing. A deny, by contrast, is remembered for the broker's lifetime.
+* **`whoami` re-resolves.** The handshake's answer was true when it was given;
+  `whoami` is asked later, and the user may have reallocated since. The stored
+  lane is updated to match, so the next action uses what was just reported.
+* **An unknown harness is written to the config file on sight.** A harness that
+  existed only in memory would vanish when the broker idled out, leaving the
+  user nothing to allocate a browser to.
+* **`browsers.rs` lives in the broker, not in the UI and not in
+  `kratos-protocol`.** The protocol crate has no I/O by design; a second reader
+  of `Local State` in the settings window would be a second thing to keep in
+  step, and it would be reading whatever machine the window runs on. The UI
+  gets these facts from `lane.list`.
+* **Tests approve their own harnesses in config.** The integration suites list
+  the client names they connect under. An approval a test could grant itself
+  would not be an approval, and the dialog cannot be clicked by a test.
+* **`defaults.browser = "os-default"` resolves through `UserChoice`**, not
+  through "whatever is installed first": it is the value Windows itself honours
+  when a link is opened, so it matches what the user would see. A default that
+  is not a Chromium browser (Firefox) falls through to the first installed
+  Chromium rather than failing, because a machine whose default is Firefox
+  usually still has one to drive.
+
+### Known gaps
+
+* **Nothing uses the lane for targeting yet.** `observe` and `act` still
+  resolve `window:null` to the OS foreground, so the P0 reproduction (b) is
+  down to **one** gap — "a session in the Vivaldi lane read the Brave lane's
+  window" — and that is P3.
+* `lane_unavailable` is defined and documented but never returned yet: the
+  ensure-lane ladder that would return it is P5. Reproduction (c) still names
+  it.
+* `gate_overrides` on a harness and an agent is parsed and stored and **nothing
+  reads it**. It is in the spec's config shape; per-harness gate rules are not
+  in any phase's acceptance list.
+* `LaneState::Launching` is never set; P5 sets it.
+* A lane is `ready` only once a human pairs the instance (`instance.bind`).
+  Auto-binding on launch is P5, and the UI that makes pairing pleasant is P6,
+  so on this machine every lane reads `degraded` until then. The extension
+  genuinely cannot report its profile directory — no API gives it — so the
+  alternatives are a human, a launch that knows what it opened, or reading the
+  browser process's open handles, which is P5's problem.
+* The approval dialog's three answers ride on `MessageBoxW`'s Yes/No/Cancel
+  with the meanings spelled out in the text, because a `TaskDialog` needs
+  version-6 common controls and an application manifest, and a dialog that
+  fails to appear is an approval that can never be given.
+
+### Next
+
+**P3 — scoped targeting, tab ownership, one broker, a machine-wide lease,
+user-activity pause.** Acceptance: two fake agents on two lanes act in
+parallel; a cross-lane observe gives `no_target`; one lease; paused on real
+input and not on injected input. That un-ignores reproductions (b) and (d), and
+(c)'s remaining three gaps.
+
+---
+
 ## P1 — instance-keyed backend registration
 
 ### Done

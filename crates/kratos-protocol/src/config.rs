@@ -34,6 +34,113 @@ pub struct Config {
     pub gate: GateConfig,
     pub backends: Backends,
     pub log: LogConfig,
+    /// Which browser each harness drives. Appended to, never guessed at: a
+    /// harness this broker has not seen before is added unassigned and
+    /// unapproved, so the settings window can list it and the user can decide.
+    pub harnesses: Vec<HarnessConfig>,
+    /// Which profile each agent drives.
+    pub agents: Vec<AgentConfig>,
+    /// Which browser profile a backend instance token belongs to.
+    ///
+    /// The extension cannot report this -- no API gives a profile directory
+    /// name -- so the pairing is made by the user in the settings window or by
+    /// the launch that opened the profile.
+    pub instances: Vec<InstanceConfig>,
+    pub defaults: Defaults,
+}
+
+/// One MCP client, identified by its `clientInfo.name`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessConfig {
+    pub id: String,
+    /// What to call it in the settings window. Empty means use `id`.
+    pub label: String,
+    /// Brand: `brave`, `chrome`, `edge`, `vivaldi`, `opera`. Empty means the
+    /// OS default browser.
+    pub browser: String,
+    /// Whether the user has allowed this harness to drive the machine.
+    ///
+    /// Defaults to **false** for a harness that appears in the file, because
+    /// the only way a harness gets into the file is by connecting, and a
+    /// client that has just introduced itself has not been approved by
+    /// anybody. An agent cannot set this: `config.set` is a `ui` op.
+    pub approved: bool,
+    /// Gate rules that apply only to this harness, merged over the global
+    /// ones. Reserved: nothing reads it yet.
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    pub gate_overrides: serde_json::Value,
+}
+
+/// One agent, named by the operator in that client's own MCP snippet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub id: String,
+    pub label: String,
+    /// A profile *directory* name as the browser writes it: `Default`,
+    /// `Profile 2`. Empty means the browser's last-used profile.
+    pub profile_dir: String,
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    pub gate_overrides: serde_json::Value,
+}
+
+/// A backend instance token, paired to the browser profile it runs in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstanceConfig {
+    pub token: String,
+    pub brand: String,
+    pub profile_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Defaults {
+    /// `os-default`, or a brand name to pin every unassigned harness to one
+    /// browser.
+    pub browser: String,
+    /// `last-used`, or a profile directory name.
+    pub profile: String,
+    /// `direct` opens a profile by launching the browser exe with
+    /// `--profile-directory`; `ui` drives the browser's own interface with the
+    /// decision model instead.
+    pub open_method: String,
+    /// Whether real keyboard and mouse input from the user pauses the agent.
+    pub pause_on_user_input: bool,
+    /// How recently the user must have typed or moved the mouse for an action
+    /// needing OS input to wait.
+    pub user_idle_ms: u64,
+    /// How long such an action waits before returning `paused`.
+    pub pause_max_ms: u64,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Defaults {
+            browser: "os-default".into(),
+            profile: "last-used".into(),
+            open_method: "direct".into(),
+            pause_on_user_input: true,
+            user_idle_ms: 1_500,
+            pause_max_ms: 30_000,
+        }
+    }
+}
+
+impl Config {
+    pub fn harness(&self, id: &str) -> Option<&HarnessConfig> {
+        self.harnesses.iter().find(|h| h.id.eq_ignore_ascii_case(id))
+    }
+
+    pub fn agent(&self, id: &str) -> Option<&AgentConfig> {
+        self.agents.iter().find(|a| a.id.eq_ignore_ascii_case(id))
+    }
+
+    /// Which `(brand, profile_dir)` an instance token is paired with.
+    pub fn instance(&self, token: &str) -> Option<&InstanceConfig> {
+        self.instances.iter().find(|i| i.token == token)
+    }
 }
 
 impl Default for Config {
@@ -49,6 +156,10 @@ impl Default for Config {
             gate: GateConfig::default(),
             backends: Backends::default(),
             log: LogConfig::default(),
+            harnesses: Vec::new(),
+            agents: Vec::new(),
+            instances: Vec::new(),
+            defaults: Defaults::default(),
         }
     }
 }

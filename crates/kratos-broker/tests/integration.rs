@@ -76,10 +76,43 @@ impl Drop for Harness {
     }
 }
 
+/// Every client name this suite connects under.
+///
+/// A harness the user has not approved may call `status` and `whoami` and
+/// nothing else, and the approval is a native dialog that no test can click.
+/// So the tests state their own names here and the config approves them --
+/// which is also the only honest way to test the rest of the broker: an
+/// approval that a test could grant itself would not be an approval.
+const TEST_HARNESSES: [&str; 13] = [
+    "t",
+    "one",
+    "two",
+    "agent-one",
+    "agent-two",
+    "agent-alpha",
+    "agent-beta",
+    "holder",
+    "next",
+    "lazy",
+    "presser",
+    "watcher",
+    "claude-code",
+];
+
+fn approved_harnesses() -> Value {
+    Value::Array(
+        TEST_HARNESSES
+            .iter()
+            .map(|id| json!({"id": id, "label": "", "browser": "", "approved": true}))
+            .collect(),
+    )
+}
+
 fn base_config(idle_exit_ms: u64) -> Value {
     json!({
         "idle_exit_ms": idle_exit_ms,
         "decider": {"provider": "mock", "model": "test"},
+        "harnesses": approved_harnesses(),
         "kill": {"hotkey": "ctrl+alt+shift+f23", "hotkey_scope": "global"},
         "gate": {
             "block_keywords": ["format c:"],
@@ -88,7 +121,8 @@ fn base_config(idle_exit_ms: u64) -> Value {
             "review_domains": [],
             "rate_limit_per_minute": 100,
             "require_os_dialog_for": [],
-            "confirm_ttl_ms": 60000
+            "confirm_ttl_ms": 60000,
+            "review_dialog_timeout_s": 5
         },
         "thresholds": {"default": 0.0, "click": 0.0, "type": 0.0, "key": 0.0,
                        "scroll": 0.0, "select": 0.0, "navigate": 0.0, "open": 0.0, "focus": 0.0}

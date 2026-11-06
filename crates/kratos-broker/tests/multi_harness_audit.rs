@@ -22,11 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kratos_ipc::{FrameReader, FrameWriter};
-use kratos_protocol::{codes, ops, Frame, Role};
+use kratos_protocol::{codes, ops, Role};
 use serde_json::{json, Value};
-use tokio::io::{ReadHalf, WriteHalf};
-use tokio::net::windows::named_pipe::NamedPipeClient;
 
 const BUILD: &str = "p0-audit";
 
@@ -56,11 +53,23 @@ impl Harness {
         let config = json!({
             "idle_exit_ms": 0,
             "decider": {"provider": "mock", "model": "test"},
+            // Approved up front: an unapproved harness may call status and
+            // whoami and nothing else, and the approval is a dialog no test
+            // can click. Harness approval has its own test below, which uses
+            // a name that is deliberately absent from this list.
+            "harnesses": [
+                {"id": "auditor", "approved": true},
+                {"id": "claude", "approved": true},
+                {"id": "bluee", "approved": true},
+                {"id": "harness-one", "approved": true},
+                {"id": "harness-two", "approved": true},
+            ],
             "kill": {"hotkey": "ctrl+alt+shift+f23", "hotkey_scope": "global"},
             "gate": {
                 "block_keywords": [], "review_keywords": [], "review_apps": [],
                 "review_domains": [], "rate_limit_per_minute": 100,
-                "require_os_dialog_for": [], "confirm_ttl_ms": 60000
+                "require_os_dialog_for": [], "confirm_ttl_ms": 60000,
+                "review_dialog_timeout_s": 5
             },
             "thresholds": {"default": 0.0, "click": 0.0, "type": 0.0, "key": 0.0,
                            "scroll": 0.0, "select": 0.0, "navigate": 0.0,
@@ -112,70 +121,27 @@ async fn agent(pipe: &str, name: &str) -> kratos_ipc::PipePeer {
 }
 
 // ---------------------------------------------------------------------------
-// A raw peer, so a hello can carry fields this build does not know about
+// Sessions
 // ---------------------------------------------------------------------------
 
-/// `PipePeer::handshake` builds the hello payload itself, so it cannot send
-/// `harness`, `agent`, `session` or `instance`. This sends the frame directly.
-/// Protocol rule 3 says unknown fields must be ignored, so the shape being
-/// accepted proves nothing by itself -- what matters is what comes back.
-struct RawPeer {
-    reader: FrameReader<ReadHalf<NamedPipeClient>>,
-    writer: FrameWriter<WriteHalf<NamedPipeClient>>,
-    seq: u64,
-    pub ack: Value,
+/// Attach as one session of one harness.
+///
+/// The hello is the shared one: `Hello::agent(..).with_identity(..)` is exactly
+/// what `kratos-mcp` sends, so these tests exercise the handshake the real
+/// shim uses rather than a hand-rolled copy of it.
+async fn session(
+    pipe: &str,
+    harness: &str,
+    agent: Option<&str>,
+    session: &str,
+) -> kratos_ipc::PipePeer {
+    let hello = kratos_protocol::Hello::agent(harness, BUILD)
+        .with_identity(Some(harness), agent, Some(session));
+    kratos_ipc::PipePeer::attach_as(pipe, hello).await.expect("session attach")
 }
 
-impl RawPeer {
-    async fn hello(pipe: &str, mut payload: Value) -> RawPeer {
-        let conn = kratos_ipc::connect(pipe).await.expect("connect");
-        let (reader, writer) = kratos_ipc::split(conn);
-        let mut p = RawPeer { reader, writer, seq: 0, ack: Value::Null };
-        payload["build"] = json!(BUILD);
-        payload["v_min"] = json!(kratos_protocol::V);
-        payload["v_max"] = json!(kratos_protocol::V);
-        p.ack = p.call(ops::HELLO, payload).await.expect("hello");
-        p
-    }
-
-    async fn agent(pipe: &str, harness: &str, agent: &str, session: &str) -> RawPeer {
-        RawPeer::hello(
-            pipe,
-            json!({
-                "role": "agent",
-                "name": harness,
-                "harness": harness,
-                "agent": agent,
-                "session": session,
-            }),
-        )
-        .await
-    }
-
-    async fn call(&mut self, op: &str, payload: Value) -> Result<Value, kratos_protocol::WireError> {
-        self.seq += 1;
-        let id = format!("r{}", self.seq);
-        self.writer.send(&Frame::req(&id, op, payload)).await.expect("send");
-        loop {
-            let frame = match self.reader.next().await {
-                Ok(Some(f)) => f,
-                Ok(None) => panic!("broker closed the connection"),
-                Err(e) if e.is_fatal() => panic!("connection lost: {e}"),
-                Err(_) => continue,
-            };
-            if matches!(frame.body, kratos_protocol::Body::Evt { .. }) {
-                continue;
-            }
-            if frame.id() != Some(id.as_str()) {
-                continue;
-            }
-            return if frame.is_ok() {
-                Ok(frame.payload().clone())
-            } else {
-                Err(frame.wire_error().cloned().expect("error body"))
-            };
-        }
-    }
+async fn settings(pipe: &str) -> kratos_ipc::PipePeer {
+    kratos_ipc::PipePeer::attach(pipe, Role::Ui, "settings", BUILD).await.expect("ui attach")
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +438,8 @@ async fn a_session_observes_its_own_lane_not_another_agents_window() {
     let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
     tokio::time::sleep(SETTLE).await;
 
-    let mut one = RawPeer::agent(&h.pipe, "claude", "agent-a", "s-1").await;
-    let mut two = RawPeer::agent(&h.pipe, "bluee", "agent-b", "s-2").await;
+    let mut one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
+    let mut two = session(&h.pipe, "bluee", Some("agent-b"), "s-2").await;
 
     let mut gaps = Vec::new();
 
@@ -612,8 +578,8 @@ async fn only_one_input_lease_exists_for_one_os_user() {
     wait_for_pipe(&first.pipe).await;
     wait_for_pipe(&second.pipe).await;
 
-    let mut a = agent(&first.pipe, "harness-one").await;
-    let mut b = agent(&second.pipe, "harness-two").await;
+    let mut a = session(&first.pipe, "harness-one", None, "s-1").await;
+    let mut b = session(&second.pipe, "harness-two", None, "s-2").await;
 
     let want = json!({"scope": "input", "ttl_ms": 4000, "wait_ms": 0});
     let one = a.call(ops::LEASE_ACQUIRE, want.clone()).await;
@@ -639,4 +605,283 @@ async fn only_one_input_lease_exists_for_one_os_user() {
     }
 
     report("one machine-wide input lease", gaps);
+}
+
+// ---------------------------------------------------------------------------
+// P2 acceptance: identity, lanes, approval
+// ---------------------------------------------------------------------------
+
+/// Spec 3: the lane is in the hello reply, so a session knows where it is
+/// before it does anything.
+#[tokio::test]
+async fn the_hello_reply_carries_the_lane_and_the_approved_flag() {
+    let h = Harness::start("hellolane");
+    wait_for_pipe(&h.pipe).await;
+    let one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
+
+    let lane = one.ack.get("lane").expect("a lane in the hello reply");
+    assert_eq!(one.ack["approved"], json!(true), "the config approves this harness");
+    assert_eq!(lane["assigned"]["harness"], json!("claude"));
+    assert_eq!(lane["assigned"]["agent"], json!("agent-a"));
+    assert!(lane["browser"].is_string(), "{lane}");
+    assert!(lane["profile_dir"].is_string(), "{lane}");
+    assert!(
+        ["ready", "launching", "degraded", "unavailable"]
+            .contains(&lane["state"].as_str().unwrap_or("")),
+        "state must be one of the four: {lane}"
+    );
+
+    // A backend has no lane, and the settings window does not have one either:
+    // neither drives a browser on an agent's behalf.
+    let ui = settings(&h.pipe).await;
+    assert!(ui.ack.get("lane").is_none() || ui.ack["lane"].is_null(), "{}", ui.ack);
+    assert_eq!(ui.ack["approved"], json!(true), "the settings window is the user");
+}
+
+/// Spec 7: `whoami` is how an agent asks where it is -- and the answer is
+/// re-resolved, so a browser allocated mid-session is visible without
+/// reconnecting.
+#[tokio::test]
+async fn whoami_answers_with_the_lane_and_follows_the_users_allocation() {
+    let h = Harness::start("whoami");
+    wait_for_pipe(&h.pipe).await;
+    let mut one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
+
+    let me = one.call("whoami", json!({})).await.expect("whoami");
+    assert_eq!(me["harness"], json!("claude"));
+    assert_eq!(me["agent"], json!("agent-a"));
+    assert_eq!(me["session"], json!("s-1"));
+    assert_eq!(me["approved"], json!(true));
+    let before = me["lane"]["browser"].as_str().unwrap_or_default().to_string();
+
+    // The user picks a different browser for this harness.
+    let other = ["chrome", "edge", "vivaldi", "brave"]
+        .into_iter()
+        .find(|b| *b != before)
+        .expect("something to switch to");
+    let mut ui = settings(&h.pipe).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {"harnesses": [{"id": "claude", "browser": other, "approved": true}]}}),
+    )
+    .await
+    .expect("config.set");
+
+    let after = one.call("whoami", json!({})).await.expect("whoami again");
+    assert_eq!(
+        after["lane"]["browser"], json!(other),
+        "whoami must answer from the config as it is now, not from the handshake"
+    );
+}
+
+/// Spec 3: an unknown harness is listed for the user and refused everything
+/// but asking who it is. The dialog is raised; nothing waits on it.
+#[tokio::test]
+async fn an_unapproved_harness_may_only_ask_who_it_is() {
+    let h = Harness::start("unapproved");
+    wait_for_pipe(&h.pipe).await;
+    // A name deliberately absent from this suite's approved list.
+    let mut stranger = session(&h.pipe, "some-other-client", None, "s-9").await;
+    assert_eq!(stranger.ack["approved"], json!(false));
+
+    // Two ops are allowed, because a client that cannot ask why it is refused
+    // leaves its operator with nothing to go on.
+    assert!(stranger.call(ops::STATUS, json!({})).await.is_ok());
+    let me = stranger.call("whoami", json!({})).await.expect("whoami");
+    assert_eq!(me["approved"], json!(false));
+
+    // Everything else is refused, and quickly: a blocking approval once cost
+    // 241 of 272 seconds of a session.
+    let started = std::time::Instant::now();
+    let err = stranger.call(ops::OBSERVE, json!({})).await.unwrap_err();
+    assert_eq!(err.code, "not_approved");
+    assert!(err.retry_safe, "the retry is what succeeds once a human clicks");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "an unapproved op must not sit on the dialog: {:?}",
+        started.elapsed()
+    );
+    let err = stranger
+        .call(ops::ACT, json!({"instruction": "click the \"Send\" button"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, "not_approved");
+
+    // And the user can find it in the settings window to approve it.
+    let mut ui = settings(&h.pipe).await;
+    let listed = ui.call("harness.list", json!({})).await.expect("harness.list");
+    let found = listed["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == json!("some-other-client"))
+        .expect("an unknown harness must be listed, or there is nothing to approve");
+    assert_eq!(found["approved"], json!(false));
+    assert_eq!(found["browser"], json!(""), "unassigned until the user says");
+}
+
+/// Spec 3: "every new session re-resolves; nothing persists per session".
+#[tokio::test]
+async fn a_new_session_resolves_again_from_the_config() {
+    let h = Harness::start("resolveagain");
+    wait_for_pipe(&h.pipe).await;
+
+    let first = session(&h.pipe, "claude", None, "s-1").await;
+    let before = first.ack["lane"]["browser"].as_str().unwrap_or_default().to_string();
+
+    let other = ["chrome", "edge", "vivaldi", "brave"]
+        .into_iter()
+        .find(|b| *b != before)
+        .expect("something to switch to");
+    let mut ui = settings(&h.pipe).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {"harnesses": [{"id": "claude", "browser": other, "approved": true}]}}),
+    )
+    .await
+    .expect("config.set");
+
+    let second = session(&h.pipe, "claude", None, "s-2").await;
+    assert_eq!(second.ack["lane"]["browser"], json!(other));
+    // The first session's handshake answer is not retroactively rewritten --
+    // it said what was true when it connected.
+    assert_eq!(first.ack["lane"]["browser"], json!(before));
+}
+
+/// Spec 3: an agent's assigned profile is used when it exists, and a missing
+/// one falls back with a warning rather than opening a profile with none of
+/// the user's logins in it.
+#[tokio::test]
+async fn an_agents_profile_is_used_and_a_missing_one_warns() {
+    let h = Harness::start("profiles");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+
+    // Which browsers and profiles this machine actually has -- the same answer
+    // the settings window's dropdown is filled from.
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let browsers = lanes["browsers"].as_array().cloned().unwrap_or_default();
+    let Some(browser) = browsers.iter().find(|b| b["installed"] == json!(true)) else {
+        eprintln!("no Chromium browser on this machine; profile resolution untested");
+        return;
+    };
+    let brand = browser["brand"].as_str().unwrap().to_string();
+    let profiles = browser["profiles"].as_array().cloned().unwrap_or_default();
+
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": brand, "approved": true}],
+            "agents": [{"id": "agent-a", "profile_dir": "Profile does not exist 42"}],
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
+    let lane = &one.ack["lane"];
+    if profiles.is_empty() {
+        eprintln!("{brand} lists no profiles here; nothing to contradict");
+        return;
+    }
+    assert_eq!(
+        lane["profile_dir"], browser["last_used"],
+        "a profile that is not there must fall back to the last-used one: {lane}"
+    );
+    let warning = lane["warning"].as_str().expect("a fallback must be said out loud");
+    assert!(warning.contains("Profile does not exist 42"), "{warning}");
+
+    // And a profile that does exist is used as given.
+    let real = profiles[profiles.len() - 1]["dir"].as_str().unwrap().to_string();
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {"agents": [{"id": "agent-a", "profile_dir": real}]}}),
+    )
+    .await
+    .expect("config.set");
+    let two = session(&h.pipe, "claude", Some("agent-a"), "s-2").await;
+    assert_eq!(two.ack["lane"]["profile_dir"], json!(real));
+    assert!(two.ack["lane"]["warning"].is_null(), "{}", two.ack["lane"]);
+}
+
+/// Spec 7 and 8: the settings window pairs an instance token with a profile,
+/// and that is what turns a lane from degraded into ready.
+#[tokio::test]
+async fn pairing_an_instance_with_a_profile_makes_the_lane_ready() {
+    let h = Harness::start("pairing");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let Some(browser) = lanes["browsers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["installed"] == json!(true)))
+        .cloned()
+    else {
+        eprintln!("no Chromium browser on this machine; pairing untested");
+        return;
+    };
+    let brand = browser["brand"].as_str().unwrap().to_string();
+    let profile = browser["last_used"].as_str().unwrap().to_string();
+
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {"harnesses": [{"id": "claude", "browser": brand, "approved": true}]}}),
+    )
+    .await
+    .expect("config.set");
+
+    let instance = FakeInstance::dom_ext("brave", "tok-pair").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+
+    // Attached but unpaired: the extension cannot report a profile directory,
+    // so until somebody says which profile it is, the lane is degraded.
+    let before = session(&h.pipe, "claude", None, "s-1").await;
+    assert_eq!(before.ack["lane"]["state"], json!("degraded"));
+
+    // The instance is listed for pairing, unbound.
+    let listed = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let found = listed["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["token"] == json!("tok-pair"))
+        .expect("an attached instance must be listed");
+    assert!(found["bound_to"].is_null());
+
+    ui.call(
+        "instance.bind",
+        json!({"token": "tok-pair", "brand": brand, "profile_dir": profile}),
+    )
+    .await
+    .expect("instance.bind");
+
+    let after = session(&h.pipe, "claude", None, "s-2").await;
+    assert_eq!(
+        after.ack["lane"]["state"], json!("ready"),
+        "a paired instance for this browser and profile is the definition of ready: {}",
+        after.ack["lane"]
+    );
+
+    // Unpairing is the same op with nothing to pair to.
+    ui.call("instance.bind", json!({"token": "tok-pair"})).await.expect("unbind");
+    let undone = session(&h.pipe, "claude", None, "s-3").await;
+    assert_eq!(undone.ack["lane"]["state"], json!("degraded"));
+
+    instance.task.abort();
+}
+
+/// An agent cannot allocate itself anything, whatever it claims.
+#[tokio::test]
+async fn an_agent_cannot_allocate_or_approve_itself() {
+    let h = Harness::start("noselfserve");
+    wait_for_pipe(&h.pipe).await;
+    let mut one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
+
+    // The ops that would let it: all of them are `ui` only.
+    for op in ["config.set", "config.get", "instance.bind", "lane.list", "harness.list",
+               "agent.list", "kill.reset", "shutdown"] {
+        let err = one.call(op, json!({"patch": {}})).await.unwrap_err();
+        assert_eq!(err.code, codes::UNAUTHORIZED, "an agent must not be able to call {op}");
+    }
 }

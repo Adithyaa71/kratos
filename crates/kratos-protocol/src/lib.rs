@@ -213,6 +213,14 @@ pub mod codes {
     pub const LEASE_INVALID: &str = "lease_invalid";
     pub const DECIDER_ERROR: &str = "decider_error";
     pub const DECIDER_UNCONFIGURED: &str = "decider_unconfigured";
+    /// The session's browser and profile could not be reached, and opening
+    /// them did not work either. Distinct from `no_backend`, which says
+    /// nothing is connected at all: this says the thing that is connected is
+    /// not *this* lane's.
+    pub const LANE_UNAVAILABLE: &str = "lane_unavailable";
+    /// The user has not allowed this harness to drive the machine. Only a
+    /// human can change that, and not over this protocol.
+    pub const NOT_APPROVED: &str = "not_approved";
     pub const INTERNAL: &str = "internal";
 }
 
@@ -240,10 +248,16 @@ pub mod ops {
     pub const KILL_RESET: &str = "kill.reset";
     pub const KILL_STATUS: &str = "kill.status";
     pub const STATUS: &str = "status";
+    pub const WHOAMI: &str = "whoami";
     pub const LOG_TAIL: &str = "log.tail";
     pub const CONFIG_GET: &str = "config.get";
     pub const CONFIG_SET: &str = "config.set";
     pub const SHUTDOWN: &str = "shutdown";
+
+    pub const LANE_LIST: &str = "lane.list";
+    pub const HARNESS_LIST: &str = "harness.list";
+    pub const AGENT_LIST: &str = "agent.list";
+    pub const INSTANCE_BIND: &str = "instance.bind";
 
     pub const BACKEND_OBSERVE: &str = "backend.observe";
     pub const BACKEND_ACT: &str = "backend.act";
@@ -284,13 +298,14 @@ impl Role {
             Role::Agent => matches!(
                 op,
                 HELLO | OBSERVE | ACT | VERIFY | CONFIRM | LEASE_ACQUIRE | LEASE_RELEASE
-                    | KILL_ENGAGE | KILL_STATUS | STATUS | LOG_TAIL
+                    | KILL_ENGAGE | KILL_STATUS | STATUS | WHOAMI | LOG_TAIL
             ),
             Role::Backend => matches!(op, HELLO | STATUS),
             Role::Ui => matches!(
                 op,
-                HELLO | STATUS | LOG_TAIL | CONFIG_GET | CONFIG_SET | KILL_ENGAGE | KILL_RESET
-                    | KILL_STATUS | SHUTDOWN | OBSERVE
+                HELLO | STATUS | WHOAMI | LOG_TAIL | CONFIG_GET | CONFIG_SET | KILL_ENGAGE
+                    | KILL_RESET | KILL_STATUS | SHUTDOWN | OBSERVE | LANE_LIST | HARNESS_LIST
+                    | AGENT_LIST | INSTANCE_BIND
             ),
         }
     }
@@ -422,6 +437,20 @@ pub struct Hello {
     /// and is still correct for `uia`, `ocr` and `pixel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<Instance>,
+    /// Which MCP client this is, taken from its `clientInfo.name`. `agent` is
+    /// the optional name the operator put in that client's own snippet, and
+    /// `session` is one shim process.
+    ///
+    /// All three are optional and all three are *claims*. They decide which
+    /// lane a session resolves to, and nothing else: an agent cannot approve
+    /// itself, choose a browser or pick a profile by claiming a name, because
+    /// the allocation lives in the config file that only the user edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 fn one() -> u16 {
@@ -443,7 +472,28 @@ impl Hello {
             source: None,
             handles: None,
             instance: None,
+            harness: None,
+            agent: None,
+            session: None,
         }
+    }
+
+    /// Who is asking, for an `agent`. Empty and whitespace-only names are
+    /// dropped: an identity that is a blank string is not an identity, and
+    /// resolving a lane for one would give every nameless client the same one.
+    pub fn with_identity(
+        mut self,
+        harness: Option<&str>,
+        agent: Option<&str>,
+        session: Option<&str>,
+    ) -> Hello {
+        let clean = |s: Option<&str>| {
+            s.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string())
+        };
+        self.harness = clean(harness);
+        self.agent = clean(agent);
+        self.session = clean(session);
+        self
     }
 
     pub fn backend(
@@ -465,6 +515,67 @@ impl Hello {
     }
 }
 
+/// Where a session's work happens: one browser, one profile.
+///
+/// A lane is resolved per session and never stored against it — the next
+/// session of the same harness resolves again from the config as it is then,
+/// so changing an allocation in the settings window takes effect on the next
+/// connection rather than needing anything to be forgotten first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lane {
+    /// Chromium brand: `brave`, `chrome`, `edge`, `vivaldi`, `opera`.
+    pub browser: String,
+    /// The profile directory *name* under the browser's User Data, e.g.
+    /// `Default` or `Profile 2`. Not a path: the path is the browser's
+    /// business and differs per brand.
+    pub profile_dir: String,
+    /// What the browser calls that profile, from its `Local State`. `None`
+    /// when the profile is not listed there yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_name: Option<String>,
+    pub assigned: LaneAssignment,
+    pub state: LaneState,
+    /// Why the lane is not what was asked for. Shown in the settings window;
+    /// an agent reads it to know it is not where it expected to be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneAssignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// A closed set, and a default branch is required of every consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaneState {
+    /// A backend instance is attached and bound to this browser and profile.
+    Ready,
+    /// Something is opening it.
+    Launching,
+    /// The window can be driven, but not through the extension — UIA and OCR
+    /// only, with no container or selector. Said out loud because the agent's
+    /// results get worse and it deserves to know why.
+    Degraded,
+    /// There is no such browser on this machine, or it cannot be opened.
+    Unavailable,
+}
+
+impl LaneState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaneState::Ready => "ready",
+            LaneState::Launching => "launching",
+            LaneState::Degraded => "degraded",
+            LaneState::Unavailable => "unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloAck {
     pub v: u16,
@@ -473,6 +584,18 @@ pub struct HelloAck {
     pub decider: String,
     pub kill_engaged: Vec<String>,
     pub backends: Vec<BackendInfo>,
+    /// The lane this session resolved to. `None` for a `backend` or `ui` peer,
+    /// which do not have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
+    /// Whether the user has allowed this harness to drive the machine.
+    ///
+    /// Always `true` for `ui` and `backend`: the settings window is the user,
+    /// and a backend asks for nothing. For an `agent` it is the answer to
+    /// "may this client act at all", and `false` means every op but `status`
+    /// and `whoami` is refused `not_approved` until a human says otherwise.
+    #[serde(default = "yes")]
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

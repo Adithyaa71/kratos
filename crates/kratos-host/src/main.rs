@@ -59,6 +59,17 @@ fn main() {
         }
     };
     runtime.block_on(relay());
+
+    // Exit rather than fall off the end of main.
+    //
+    // `tokio::io::stdin()` reads on a blocking thread, and dropping the
+    // runtime waits for blocking threads to finish -- so a host that has
+    // decided to stop while its stdin is still open hangs in runtime shutdown
+    // forever. Measured: the process logged "superseded ... exiting" and was
+    // still alive five seconds later, and on a live machine eleven minutes
+    // later. Nothing needs flushing here: every write to the extension is
+    // awaited, and the pipe is the OS's to clean up.
+    std::process::exit(0);
 }
 
 async fn relay() {

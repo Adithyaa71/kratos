@@ -100,7 +100,10 @@ other op first gets `unauthorized` and is closed.
   "v_min":1,
   "v_max":1,
   "source":null,
-  "handles":null
+  "handles":null,
+  "harness":"claude-code",
+  "agent":"agent-a",
+  "session":"s-21884-1762502400123"
 }}
 ```
 
@@ -113,15 +116,82 @@ other op first gets `unauthorized` and is closed.
   "decider":"jev/jev-latest",
   "kill_engaged":[],
   "backends":[{"source":"uia","handles":["native","browser"]},
-              {"source":"dom-ext","handles":["browser"]}]
+              {"source":"dom-ext","handles":["browser"]}],
+  "approved":true,
+  "lane":{"browser":"brave","profile_dir":"Default","profile_name":"Work",
+          "assigned":{"harness":"claude-code","agent":"agent-a"},
+          "state":"ready"}
 }}
 ```
 
 | `role` | who | may call |
 |---|---|---|
-| `agent` | MCP shim | `observe` `act` `verify` `confirm` `lease.*` `kill.engage` `kill.status` `status` `log.tail` |
+| `agent` | MCP shim | `observe` `act` `verify` `confirm` `lease.*` `kill.engage` `kill.status` `status` `whoami` `log.tail` |
 | `backend` | Python backend, native host | `status`; **receives** `backend.*` requests from the broker |
-| `ui` | config and log window | `status` `log.tail` `config.get` `config.set` `kill.*` `shutdown` |
+| `ui` | config and log window | `status` `whoami` `log.tail` `config.get` `config.set` `kill.*` `shutdown` `lane.list` `harness.list` `agent.list` `instance.bind` |
+
+### 3.0 Identity: `harness`, `agent`, `session`
+
+Three optional strings on an `agent` hello, and all three are **claims**. They
+decide which lane the session resolves to and nothing else — an agent cannot
+approve itself, choose a browser or pick a profile by claiming a name, because
+every allocation lives in a config file that only the `ui` role can write.
+
+| field | where it comes from | what it decides |
+|---|---|---|
+| `harness` | the MCP client's own `clientInfo.name`, which every MCP client already sends | which browser, via `harnesses[]` |
+| `agent` | `--agent <name>` or `KRATOS_AGENT` in that client's snippet. The only setting an agent has | which profile, via `agents[]` |
+| `session` | one shim process | nothing. It lets the broker tell two sessions of one harness apart in the log |
+
+A harness the broker has not seen before is **written into the config
+unassigned and unapproved**, which is the only thing an unapproved client's
+connection achieves, and is what gives the settings window something to list.
+Until a human approves it, every op but `status` and `whoami` is refused
+`not_approved`.
+
+**The approval dialog does not block the request.** Spec §3 of the
+multi-harness design requires a native dialog the agent cannot answer; it does
+not require the request to wait on it, and waiting is the mistake this gate was
+built to avoid — a blocking approval once cost 241 of 272 seconds of a session.
+So the dialog is raised, the op is refused `not_approved` with
+`retry_safe:true`, and the retry succeeds the moment somebody clicks. One
+dialog per harness at a time: an agent in a retry loop raises one window, not
+one per request.
+
+### 3.0.1 `lane` — one browser, one profile
+
+```json
+{"browser":"brave","profile_dir":"Default","profile_name":"Work",
+ "assigned":{"harness":"claude-code","agent":"agent-a"},
+ "state":"ready","warning":null}
+```
+
+* `browser` — `harnesses[harness].browser`, else `defaults.browser`, else the
+  OS default browser (`UserChoice\ProgId`), else the first Chromium brand
+  installed.
+* `profile_dir` — `agents[agent].profile_dir` when that profile is listed in
+  that browser's `Local State`, else `defaults.profile`, else the brand's
+  `profile.last_used`. A directory name, never a path.
+* `profile_name` — what the browser calls it, from `Local State`'s
+  `info_cache`. `null` when it is not listed there.
+* `state` — a closed set:
+
+| `state` | meaning |
+|---|---|
+| `ready` | a backend instance is attached **and paired** with this browser and profile |
+| `launching` | something is opening it |
+| `degraded` | drivable, but not through the extension: UIA and OCR only, with no `container` and no `selector` |
+| `unavailable` | no such browser on this machine, or it cannot be opened |
+
+* `warning` — why the lane is not what was asked for: a profile that is not
+  there, a brand nobody has heard of, an attached extension that has not been
+  paired with a profile yet. Shown in the settings window; an agent reads it to
+  learn it is not where it expected to be.
+
+**A lane is resolved per connection and never stored against a session.** There
+is nothing to invalidate: an allocation changed in the settings window takes
+effect on the next connection, and `whoami` re-resolves so a change mid-session
+is visible without reconnecting.
 
 `peer_id` is assigned by the broker, appears in every journal line, and is the
 agent identity in the action log. A peer does not choose its own id: `name` is
@@ -467,6 +537,31 @@ that has to be waited out before `no_effect` can honestly be claimed.
 `settled: false` beside `executed` means the pixels never moved and the
 structure or a read-back carried the proof.
 
+### 4.7b `whoami`
+
+```json
+{"op":"whoami","payload":{}}
+```
+```json
+{"ok":true,"payload":{
+  "peer_id":"a-3","role":"agent","name":"claude-code",
+  "harness":"claude-code","agent":"agent-a","session":"s-21884-1762502400123",
+  "approved":true,
+  "lane":{"browser":"brave","profile_dir":"Default","profile_name":"Work",
+          "assigned":{"harness":"claude-code","agent":"agent-a"},
+          "state":"ready"}
+}}
+```
+
+Where this session is, who it is accounted as, and whether the user has allowed
+it. Allowed before approval, along with `status`, because a client that cannot
+ask why it is being refused leaves its operator with nothing to go on.
+
+The lane is **re-resolved** on every call rather than repeated from the
+handshake: the user may have allocated a different browser since, and the answer
+to "where am I" should be the current one. The session's stored lane is updated
+to match, so the next action uses what was just reported.
+
 ### 4.8 `log.tail`
 
 ```json
@@ -484,6 +579,43 @@ role.
 config plus `{"restart_required":false}`. Changes to `idle_exit_ms`, gate
 rules, kill scopes, decider model and API key take effect immediately. Changing
 `pipe_name` requires a restart and is reported as such.
+
+An edit made to the file by something other than the settings window is picked
+up within one idle tick (five seconds). A file that will not parse is reported
+once and then left alone until it changes again — it is not retried every tick,
+and it never replaces the running policy with defaults.
+
+### 4.10 `lane.list`, `harness.list`, `agent.list`, `instance.bind` — `ui` only
+
+All four exist so the settings window can allocate browsers and profiles
+without reading the machine itself. A second reader of `Local State` in the UI
+process would be a second thing to keep in step, and it would be reading
+whatever machine the window happens to run on rather than the broker's.
+
+`lane.list` returns `{"sessions":[...], "browsers":[...], "os_default":"brave",
+"instances":[...]}`:
+
+* `sessions` — every connected agent, with the lane it resolves to now.
+* `browsers` — per brand: `installed`, `exe`, `user_data`, `last_used`, and
+  `profiles[{dir,name}]` read from that brand's `Local State`. This is what
+  fills the profile dropdown.
+* `instances` — attached backend instances and what each is paired with.
+
+`harness.list` returns the configured harnesses with `approved`, the browser
+each is allocated, whether it is connected, and `session_approval` — what was
+decided since this broker started, which is how "allow just for now" is
+visible at all.
+
+`agent.list` returns the configured agents and, additionally, any agent name
+that has connected but is not in the file yet: the user cannot allocate a
+profile to a name they cannot see.
+
+`instance.bind` takes `{"token":"…","brand":"brave","profile_dir":"Default"}`
+and pairs an attached extension instance with the profile it is running in.
+The extension cannot report this itself — no extension API gives a profile
+directory name — so the pairing is a human's or a launch's. Sending neither
+`brand` nor `profile_dir` **unpairs**, which is how a wrong pairing is undone
+without hand-editing the file.
 
 ---
 
@@ -735,6 +867,8 @@ is the narrower question of whether repeating is *safe*.
 | `lease_invalid` | token unknown or expired | re-acquire |
 | `decider_error` | provider unreachable or malformed reply | yes |
 | `decider_unconfigured` | no API key | after config |
+| `lane_unavailable` | this session's browser and profile could not be reached or opened | after the lane is open |
+| `not_approved` | the user has not allowed this harness to drive the machine | after a human approves it |
 | `internal` | bug | no |
 
 `refused`, `no_effect` and `needs_confirmation` are **not** errors. They are
@@ -796,9 +930,31 @@ settings UI is the intended editor; the file is the source of truth.
            "allow_recipients":[],"rate_limit_per_minute":30,
            "require_os_dialog_for":["review_domain"]},
   "backends": {"enabled":["dom-ext","uia","pixel","ocr"]},
-  "log": {"path":null,"max_bytes":16777216,"keep":5}
+  "log": {"path":null,"max_bytes":16777216,"keep":5},
+
+  "harnesses": [{"id":"claude-code","label":"","browser":"brave","approved":true}],
+  "agents": [{"id":"agent-a","label":"","profile_dir":"Profile 2"}],
+  "instances": [{"token":"9f2c…","brand":"brave","profile_dir":"Default"}],
+  "defaults": {"browser":"os-default","profile":"last-used","open_method":"direct",
+               "pause_on_user_input":true,"user_idle_ms":1500,"pause_max_ms":30000}
 }
 ```
+
+**`harnesses`, `agents` and `instances` are the allocation, and the settings
+window is the only thing that writes them.** An `agent` peer cannot:
+`config.set` is a `ui` op, and so are `instance.bind` and every listing.
+
+* `harnesses[].id` is an MCP client's `clientInfo.name`. `browser` empty means
+  `defaults.browser`. `approved` defaults to **false**, because the only way a
+  harness gets into this file is by connecting, and a client that has just
+  introduced itself has not been approved by anybody.
+* `agents[].id` is the name in that client's snippet (`--agent`). `profile_dir`
+  empty means `defaults.profile`.
+* `instances[]` pairs an extension instance token with the profile it runs in.
+  Written by `instance.bind`.
+* `defaults.open_method`, `pause_on_user_input`, `user_idle_ms` and
+  `pause_max_ms` are read by the ensure-lane ladder and the user-activity
+  pause.
 
 The API key is encrypted at rest with Windows DPAPI scoped to the current user,
 so the config file is not a plaintext credential and a copy of it is useless on

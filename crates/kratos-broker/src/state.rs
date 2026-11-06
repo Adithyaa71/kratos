@@ -19,6 +19,10 @@ use crate::journal::Journal;
 
 pub const BROKER_NAME: &str = concat!("kratos-broker ", env!("CARGO_PKG_VERSION"));
 
+fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(kratos_protocol::paths::config_path()).ok()?.modified().ok()
+}
+
 // ---------------------------------------------------------------------------
 // Peers
 // ---------------------------------------------------------------------------
@@ -48,6 +52,16 @@ pub struct PeerHandle {
     pub source: Option<Source>,
     /// Which instance of `source` this is, when it said.
     pub instance: Option<kratos_protocol::Instance>,
+    /// Who this peer says it is: harness, agent, session. Claims, all three.
+    pub identity: crate::lane::Identity,
+    /// The harness name this peer is accounted under, which is its claimed
+    /// harness or, failing that, the name it introduced itself with. Stored
+    /// rather than recomputed so approval and the journal agree.
+    pub harness_id: String,
+    /// The lane resolved at handshake. Re-resolved by `whoami`, because the
+    /// user may have changed the allocation since and the answer to "where am
+    /// I" should be the current one.
+    pub lane: Mutex<Option<kratos_protocol::Lane>>,
     pub handles: Vec<String>,
     /// Outbound queue. A task drains this into the socket, so no caller ever
     /// holds a writer lock and a slow peer cannot stall the broker.
@@ -202,8 +216,35 @@ impl Counters {
 // Broker
 // ---------------------------------------------------------------------------
 
+/// Whether a harness may drive the machine, as decided for this broker's
+/// lifetime.
+///
+/// The config file holds the durable answer (`harnesses[].approved`); this
+/// holds what was decided since, which is how "allow just for now" exists at
+/// all. A deny is kept here too: asking again on the agent's next request
+/// would turn a refusal into a dialog every few seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Allowed,
+    Denied,
+    /// A dialog is on screen and nobody has answered yet. Held so an agent in
+    /// a retry loop raises one dialog rather than one per request.
+    Asking,
+}
+
 pub struct Broker {
     pub config: RwLock<Config>,
+    /// Per-harness decisions made since this broker started.
+    pub approvals: Mutex<HashMap<String, Approval>>,
+    /// The modification time of the config file as this broker last saw it,
+    /// so a reload fires on somebody else's edit and not on its own write.
+    config_seen: Mutex<Option<std::time::SystemTime>>,
+    /// One approval dialog at a time, machine-wide.
+    ///
+    /// Two clients connecting at once would otherwise stack two system-modal
+    /// dialogs on top of each other, and the user would answer whichever
+    /// landed on top for whichever client they thought they were answering.
+    pub approval_gate: Mutex<()>,
     pub gate: Mutex<kratos_gate::SafetyGate>,
     pub decider: RwLock<Arc<dyn kratos_decide::DecisionProvider>>,
     pub journal: RwLock<Journal>,
@@ -230,6 +271,9 @@ impl Broker {
         let journal = Journal::from_config(&config.log);
         Arc::new(Broker {
             config: RwLock::new(config),
+            approvals: Mutex::new(HashMap::new()),
+            config_seen: Mutex::new(config_mtime()),
+            approval_gate: Mutex::new(()),
             gate: Mutex::new(gate),
             decider: RwLock::new(decider),
             journal: RwLock::new(journal),
@@ -532,6 +576,154 @@ impl Broker {
         Ok(p)
     }
 
+    // -- hot reload ---------------------------------------------------------
+
+    /// Pick up an edit somebody else made to the config file.
+    ///
+    /// Section 9 says the file is hot-reloaded and the settings window is the
+    /// intended editor, but the file is the source of truth -- and until this
+    /// existed, an edit made with a text editor was read only if the broker
+    /// happened to restart afterwards. Polled rather than watched: this runs
+    /// on the idle tick, which is already there, and a file watcher would be a
+    /// thread and an API for a question asked every five seconds.
+    ///
+    /// The kill switch is untouched, as with any other config change.
+    /// Returns whether anything was reloaded.
+    pub async fn reload_if_changed(&self) -> bool {
+        let path = kratos_protocol::paths::config_path();
+        let now = config_mtime();
+        {
+            let mut seen = self.config_seen.lock().await;
+            if *seen == now {
+                return false;
+            }
+            // Recorded before the load, so a file that fails to parse is not
+            // retried every tick -- it is reported once and left alone until
+            // it changes again.
+            *seen = now;
+        }
+
+        let fresh = match Config::load_from(&path) {
+            Ok(c) => c,
+            Err(kratos_protocol::config::LoadError::Missing) => return false,
+            Err(e) => {
+                eprintln!("kratos-broker: {} changed and will not parse: {e}", path.display());
+                return false;
+            }
+        };
+        let key = crate::seal::read_key(&fresh.decider.api_key_enc);
+        let decider = kratos_decide::build(&fresh.decider, key);
+        let journal = Journal::from_config(&fresh.log);
+        self.gate.lock().await.reconfigure(fresh.gate.clone());
+        *self.decider.write().await = decider;
+        *self.journal.write().await = journal;
+        *self.config.write().await = fresh;
+        eprintln!("kratos-broker: reloaded {}", path.display());
+        true
+    }
+
+    // -- harnesses and approval --------------------------------------------
+
+    /// Record a harness the broker has not seen before, unassigned and
+    /// unapproved, so the settings window can list it.
+    ///
+    /// Writing to the config file on sight is deliberate: a harness that only
+    /// existed in memory would vanish from the UI the moment the broker idled
+    /// out, and the user would have nothing to allocate a browser to. It is
+    /// also the only thing an unapproved client's connection achieves.
+    pub async fn remember_harness(&self, id: &str) -> bool {
+        if id.trim().is_empty() {
+            return false;
+        }
+        if self.config.read().await.harness(id).is_some() {
+            return false;
+        }
+        let patch = {
+            let cfg = self.config.read().await;
+            let mut list = cfg.harnesses.clone();
+            list.push(kratos_protocol::config::HarnessConfig {
+                id: id.to_string(),
+                label: String::new(),
+                browser: String::new(),
+                approved: false,
+                gate_overrides: Value::Null,
+            });
+            json!({"harnesses": list})
+        };
+        if let Err(e) = self.apply_config(&patch, None).await {
+            eprintln!("kratos-broker: could not record harness {id:?}: {}", e.message);
+            return false;
+        }
+        true
+    }
+
+    /// Whether this harness is allowed to drive the machine right now.
+    ///
+    /// The config's `approved` wins when it is set, because that is the user's
+    /// standing decision; otherwise whatever was decided since this broker
+    /// started; otherwise nothing is decided yet and the caller has to ask.
+    pub async fn approval(&self, harness: &str) -> Option<Approval> {
+        if self.config.read().await.harness(harness).is_some_and(|h| h.approved) {
+            return Some(Approval::Allowed);
+        }
+        self.approvals.lock().await.get(harness).copied()
+    }
+
+    /// Claim the right to ask about this harness. `false` means somebody else
+    /// already has a dialog up for it.
+    pub async fn begin_asking(&self, harness: &str) -> bool {
+        let mut map = self.approvals.lock().await;
+        match map.get(harness) {
+            Some(_) => false,
+            None => {
+                map.insert(harness.to_string(), Approval::Asking);
+                true
+            }
+        }
+    }
+
+    /// Remember a decision for this broker's lifetime, and durably when the
+    /// user said "always".
+    pub async fn record_approval(&self, harness: &str, answer: kratos_gate::dialog::Approval) {
+        use kratos_gate::dialog::Approval as A;
+        let decided = match answer {
+            A::Always | A::Once => Approval::Allowed,
+            A::Deny => Approval::Denied,
+            // Not a decision. The claim is released so the question can be
+            // asked again, because a user who was not at the machine has not
+            // refused anything.
+            A::TimedOut => {
+                self.approvals.lock().await.remove(harness);
+                return;
+            }
+        };
+        self.approvals.lock().await.insert(harness.to_string(), decided);
+
+        if answer == A::Always {
+            let patch = {
+                let cfg = self.config.read().await;
+                let mut list = cfg.harnesses.clone();
+                match list.iter_mut().find(|h| h.id.eq_ignore_ascii_case(harness)) {
+                    Some(h) => h.approved = true,
+                    None => list.push(kratos_protocol::config::HarnessConfig {
+                        id: harness.to_string(),
+                        label: String::new(),
+                        browser: String::new(),
+                        approved: true,
+                        gate_overrides: Value::Null,
+                    }),
+                }
+                json!({"harnesses": list})
+            };
+            if let Err(e) = self.apply_config(&patch, None).await {
+                eprintln!(
+                    "kratos-broker: approved {harness:?} for this session but could not save it: {}",
+                    e.message
+                );
+            }
+        }
+    }
+
     // -- config -------------------------------------------------------------
 
     /// Apply a config patch and rebuild whatever it affects.
@@ -566,6 +758,9 @@ impl Broker {
         }
         let redacted = merged.redacted();
         *self.config.write().await = merged;
+        // Our own write must not look like somebody else's edit, or the next
+        // idle tick reloads what we just applied.
+        *self.config_seen.lock().await = config_mtime();
         Ok(redacted)
     }
 
@@ -655,6 +850,9 @@ mod tests {
             name: id.into(),
             source,
             instance: token.map(kratos_protocol::Instance::new),
+            identity: crate::lane::Identity::default(),
+            harness_id: id.into(),
+            lane: Mutex::new(None),
             handles: vec!["browser".into(), "native".into()],
             out: tx,
             pending: Mutex::new(HashMap::new()),

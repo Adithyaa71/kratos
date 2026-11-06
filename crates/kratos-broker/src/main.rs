@@ -7,10 +7,12 @@
 //! driven has no process for this at all.
 
 mod act;
+mod browsers;
 mod classify;
 mod diff;
 mod hotkey;
 mod journal;
+mod lane;
 mod peer;
 mod seal;
 mod state;
@@ -148,6 +150,12 @@ async fn run() -> Result<(), String> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(IDLE_TICK).await;
+                // Section 9 of the protocol says the config file is hot
+                // reloaded, and the file is the source of truth even when the
+                // settings window is the intended editor. This is that reload:
+                // the tick is already here, and a file watcher would be a
+                // thread and an API for a question asked every five seconds.
+                broker.reload_if_changed().await;
                 let limit = broker.config.read().await.idle_exit_ms;
                 if limit == 0 {
                     continue; // 0 disables the timer entirely

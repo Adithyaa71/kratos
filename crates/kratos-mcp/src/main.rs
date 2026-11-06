@@ -44,12 +44,90 @@ fn clean(line: &str) -> &str {
     line.trim_start_matches('\u{feff}').trim()
 }
 
+/// Who this shim is, and the one connection it holds.
+///
+/// The harness name is *learned*, not configured: it is the `clientInfo.name`
+/// the MCP client sends in `initialize`, which arrives before any tool call
+/// and therefore before the broker connection is made. That is the whole of
+/// "connecting a harness is pasting one snippet" -- nothing in the snippet
+/// says who it is.
+struct Shim {
+    pipe_base: String,
+    /// `clientInfo.name`, when the client sent one.
+    harness: Option<String>,
+    /// The operator's optional name for this agent: `--agent <name>` or
+    /// `KRATOS_AGENT`. The only setting an agent has.
+    agent: Option<String>,
+    /// One shim process. Nothing persists against it; it exists so the broker
+    /// can tell two sessions of one harness apart.
+    session: String,
+    /// The label that goes in the journal when the client names itself
+    /// nothing.
+    name: String,
+    broker: Option<PipePeer>,
+}
+
+impl Shim {
+    fn new() -> Shim {
+        Shim {
+            pipe_base: std::env::var("KRATOS_PIPE").unwrap_or_else(|_| "kratos.v1".to_string()),
+            harness: None,
+            agent: agent_from_args_or_env(),
+            session: format!("s-{}-{}", std::process::id(), now_ms()),
+            name: std::env::var("KRATOS_AGENT_NAME").unwrap_or_else(|_| "mcp-client".to_string()),
+            broker: None,
+        }
+    }
+
+    /// What to call this client: what it calls itself, falling back to
+    /// whatever the operator put in the environment.
+    fn label(&self) -> String {
+        match &self.harness {
+            Some(h) => h.clone(),
+            None => self.name.clone(),
+        }
+    }
+
+    fn hello(&self) -> kratos_protocol::Hello {
+        kratos_protocol::Hello::agent(self.label(), BUILD).with_identity(
+            self.harness.as_deref(),
+            self.agent.as_deref(),
+            Some(&self.session),
+        )
+    }
+}
+
+/// `--agent <name>`, `--agent=<name>`, or `KRATOS_AGENT`.
+///
+/// A flag as well as an environment variable because a snippet is easier to
+/// paste than an env block, and some MCP clients make setting one awkward.
+/// The last one on the command line wins, as with any flag.
+fn agent_from_args_or_env() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut found: Option<String> = None;
+    for (i, a) in args.iter().enumerate() {
+        if let Some(rest) = a.strip_prefix("--agent=") {
+            found = Some(rest.to_string());
+        } else if a == "--agent" {
+            found = args.get(i + 1).cloned();
+        }
+    }
+    found
+        .or_else(|| std::env::var("KRATOS_AGENT").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 async fn serve() {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut broker: Option<PipePeer> = None;
-    let pipe_base =
-        std::env::var("KRATOS_PIPE").unwrap_or_else(|_| "kratos.v1".to_string());
-    let agent_name = std::env::var("KRATOS_AGENT_NAME").unwrap_or_else(|_| "mcp-client".to_string());
+    let mut shim = Shim::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = clean(&line);
@@ -76,7 +154,7 @@ async fn serve() {
         // A notification has no id and must never be answered.
         let is_notification = id.is_none();
 
-        let outcome = handle(&method, params, &mut broker, &pipe_base, &agent_name).await;
+        let outcome = handle(&method, params, &mut shim).await;
 
         if is_notification {
             continue;
@@ -102,17 +180,28 @@ fn emit(value: &Value) {
 async fn handle(
     method: &str,
     params: Value,
-    broker: &mut Option<PipePeer>,
-    pipe_base: &str,
-    agent_name: &str,
+    shim: &mut Shim,
 ) -> Result<Value, (i64, String)> {
     match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": MCP_PROTOCOL,
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-            "instructions": INSTRUCTIONS,
-        })),
+        "initialize" => {
+            // The one piece of identity that needs no setup. A client that
+            // sends no `clientInfo.name` is not refused: it is simply
+            // unassigned until the operator names it in the settings window.
+            if let Some(n) = params
+                .pointer("/clientInfo/name")
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            {
+                shim.harness = Some(n.to_string());
+            }
+            Ok(json!({
+                "protocolVersion": MCP_PROTOCOL,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
+                "instructions": INSTRUCTIONS,
+            }))
+        }
 
         "notifications/initialized" | "initialized" => Ok(json!({})),
 
@@ -123,7 +212,7 @@ async fn handle(
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            call_tool(name, args, broker, pipe_base, agent_name).await
+            call_tool(name, args, shim).await
         }
 
         "resources/list" => Ok(json!({"resources": []})),
@@ -168,6 +257,7 @@ fn translate(name: &str, args: Value) -> Option<(&'static str, Value)> {
             json!({"token": args.get("token").and_then(|v| v.as_str()).unwrap_or("")}),
         ),
         "desktop_status" => (ops::STATUS, json!({})),
+        "desktop_whoami" => (ops::WHOAMI, json!({})),
         "desktop_kill" => (
             ops::KILL_ENGAGE,
             json!({
@@ -187,25 +277,16 @@ fn translate(name: &str, args: Value) -> Option<(&'static str, Value)> {
 async fn call_tool(
     name: &str,
     args: Value,
-    broker: &mut Option<PipePeer>,
-    pipe_base: &str,
-    agent_name: &str,
+    shim: &mut Shim,
 ) -> Result<Value, (i64, String)> {
     let Some((op, payload)) = translate(name, args) else {
         return Err((-32602, format!("unknown tool: {name}")));
     };
 
     // Connect here, not at startup: this is the lazy start.
-    if broker.is_none() {
-        match PipePeer::connect_or_start(
-            pipe_base,
-            kratos_protocol::Role::Agent,
-            agent_name,
-            BUILD,
-        )
-        .await
-        {
-            Ok(c) => *broker = Some(c),
+    if shim.broker.is_none() {
+        match connect(shim).await {
+            Ok(c) => shim.broker = Some(c),
             Err(e) => {
                 return Ok(tool_error(format!(
                     "the kratos broker could not be started or reached: {e}\n\nCheck that \
@@ -215,7 +296,7 @@ async fn call_tool(
         }
     }
 
-    let client = broker.as_mut().expect("connected above");
+    let client = shim.broker.as_mut().expect("connected above");
     match client.call(op, payload.clone()).await {
         Ok(result) => Ok(tool_ok(&result)),
         Err(e) => {
@@ -229,18 +310,11 @@ async fn call_tool(
             // retried -- the same asymmetry the broker applies to a backend
             // timeout.
             if e.code == kratos_protocol::codes::INTERNAL && is_read_only(op) {
-                *broker = None;
-                match PipePeer::connect_or_start(
-            pipe_base,
-            kratos_protocol::Role::Agent,
-            agent_name,
-            BUILD,
-        )
-        .await
-        {
+                shim.broker = None;
+                match connect(shim).await {
                     Ok(mut fresh) => {
                         let retried = fresh.call(op, payload).await;
-                        *broker = Some(fresh);
+                        shim.broker = Some(fresh);
                         match retried {
                             Ok(result) => return Ok(tool_ok(&result)),
                             Err(again) => {
@@ -261,6 +335,18 @@ async fn call_tool(
             Ok(tool_error(format!("{}: {}", e.code, e.message)))
         }
     }
+}
+
+/// Open the connection, starting the broker if nothing is listening.
+///
+/// The hello carries this session's identity, which is what the broker
+/// resolves a lane from. Every reconnection re-resolves, so a browser
+/// allocated in the settings window mid-session is picked up without the
+/// client doing anything.
+async fn connect(shim: &Shim) -> std::io::Result<PipePeer> {
+    let exe = kratos_ipc::broker_exe()?;
+    let conn = kratos_ipc::connect_or_start(&shim.pipe_base, &exe).await?;
+    PipePeer::handshake(conn, shim.hello()).await
 }
 
 /// Whether an op can be safely repeated after a dropped connection.
@@ -369,6 +455,11 @@ fn tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {}}
         }),
         json!({
+            "name": "desktop_whoami",
+            "description": "Which browser and profile this session drives, who it is accounted                             as, and whether the operator has approved it. Call it when a window                             you expected is not there: the answer says which lane you are in and                             why, including a warning when the lane is not the one that was                             allocated.",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
             "name": "desktop_kill",
             "description": "Engage the kill switch and stop further actions. Scope it to \
                             everything (global), one browser (browser:brave), or one application \
@@ -396,6 +487,56 @@ fn tools() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A shim pointed at a pipe name nothing is listening on.
+    fn test_shim(pipe: &str) -> super::Shim {
+        let mut s = super::Shim::new();
+        s.pipe_base = pipe.to_string();
+        s.name = "t".into();
+        s
+    }
+
+    #[tokio::test]
+    async fn initialize_learns_the_harness_name_from_the_client() {
+        // This is the whole of "no required config": the harness identifies
+        // itself in the handshake every MCP client already sends.
+        let mut shim = test_shim("kratos-test-never");
+        assert!(shim.harness.is_none());
+        let _ = handle(
+            "initialize",
+            json!({"clientInfo": {"name": "  claude-code  ", "version": "1"}}),
+            &mut shim,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shim.harness.as_deref(), Some("claude-code"));
+        assert_eq!(shim.label(), "claude-code");
+
+        let hello = shim.hello();
+        assert_eq!(hello.harness.as_deref(), Some("claude-code"));
+        assert!(hello.session.as_deref().is_some_and(|s| s.starts_with("s-")));
+        assert_eq!(hello.role, kratos_protocol::Role::Agent);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_names_itself_nothing_falls_back_to_the_env_label() {
+        let mut shim = test_shim("kratos-test-never");
+        let _ = handle("initialize", json!({"clientInfo": {"name": "   "}}), &mut shim)
+            .await
+            .unwrap();
+        assert!(shim.harness.is_none(), "whitespace is not a name");
+        assert_eq!(shim.label(), "t");
+        // And it still gets a session, so two nameless clients are two
+        // sessions rather than one.
+        assert!(shim.hello().session.is_some());
+    }
+
+    #[test]
+    fn two_shims_are_two_sessions() {
+        let a = super::Shim::new();
+        let b = super::Shim::new();
+        assert_ne!(a.session, b.session, "a session is one shim process");
+    }
 
     #[test]
     fn a_byte_order_mark_does_not_break_the_handshake() {
@@ -462,41 +603,35 @@ mod tests {
     async fn listing_tools_does_not_touch_the_pipe() {
         // The lazy-start contract: a harness enumerating capabilities must not
         // cause a background process to appear.
-        let mut broker = None;
-        let result = handle("tools/list", json!({}), &mut broker, "kratos-test-never", "t")
-            .await
-            .unwrap();
-        assert_eq!(result["tools"].as_array().unwrap().len(), 7);
-        assert!(broker.is_none(), "tools/list must not connect");
+        let mut shim = test_shim("kratos-test-never");
+        let result = handle("tools/list", json!({}), &mut shim).await.unwrap();
+        assert_eq!(result["tools"].as_array().unwrap().len(), 8);
+        assert!(shim.broker.is_none(), "tools/list must not connect");
     }
 
     #[tokio::test]
     async fn initialize_reports_the_protocol_and_instructions_without_connecting() {
-        let mut broker = None;
-        let r = handle("initialize", json!({}), &mut broker, "kratos-test-never", "t").await.unwrap();
+        let mut shim = test_shim("kratos-test-never");
+        let r = handle("initialize", json!({}), &mut shim).await.unwrap();
         assert_eq!(r["protocolVersion"], json!(MCP_PROTOCOL));
         assert_eq!(r["serverInfo"]["name"], json!(SERVER_NAME));
         assert!(r["instructions"].as_str().unwrap().contains("quotes"));
-        assert!(broker.is_none());
+        assert!(shim.broker.is_none());
     }
 
     #[tokio::test]
     async fn an_unknown_method_is_a_jsonrpc_error_not_a_panic() {
-        let mut broker = None;
-        let err = handle("tools/explode", json!({}), &mut broker, "kratos-test-never", "t")
-            .await
-            .unwrap_err();
+        let mut shim = test_shim("kratos-test-never");
+        let err = handle("tools/explode", json!({}), &mut shim).await.unwrap_err();
         assert_eq!(err.0, -32601);
     }
 
     #[tokio::test]
     async fn an_unknown_tool_is_rejected_before_any_connection_attempt() {
-        let mut broker = None;
-        let err = call_tool("desktop_nope", json!({}), &mut broker, "kratos-test-never", "t")
-            .await
-            .unwrap_err();
+        let mut shim = test_shim("kratos-test-never");
+        let err = call_tool("desktop_nope", json!({}), &mut shim).await.unwrap_err();
         assert_eq!(err.0, -32602);
-        assert!(broker.is_none());
+        assert!(shim.broker.is_none());
     }
 
     #[tokio::test]
@@ -504,10 +639,8 @@ mod tests {
         // KRATOS_BROKER_EXE points at nothing, so the spawn fails and the shim must
         // still answer the harness.
         std::env::set_var("KRATOS_BROKER_EXE", "Z:\\no-such-broker.exe");
-        let mut broker = None;
-        let r = call_tool("desktop_status", json!({}), &mut broker, "kratos-test-absent-q7", "t")
-            .await
-            .unwrap();
+        let mut shim = test_shim("kratos-test-absent-q7");
+        let r = call_tool("desktop_status", json!({}), &mut shim).await.unwrap();
         assert_eq!(r["isError"], json!(true));
         assert!(r["content"][0]["text"].as_str().unwrap().contains("could not be started"));
         std::env::remove_var("KRATOS_BROKER_EXE");

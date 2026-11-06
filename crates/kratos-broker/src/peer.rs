@@ -196,12 +196,43 @@ where
         _ => None,
     };
 
+    // Identity is for agents. A backend has no lane and the settings window is
+    // the user, so neither resolves one -- and neither can claim a harness
+    // name to borrow an allocation with.
+    let identity = match hello.role {
+        Role::Agent => crate::lane::Identity::from_hello(&hello),
+        _ => crate::lane::Identity::default(),
+    };
+    let harness_id = identity.harness_id(&hello.name);
+
+    // A harness nobody has seen before is written down before it is answered,
+    // so the settings window can list it and the user has something to
+    // allocate a browser to. This is the only thing an unapproved client's
+    // connection achieves.
+    let (lane, approved) = if hello.role == Role::Agent {
+        broker.remember_harness(&harness_id).await;
+        let attached = crate::lane::attached_instances(broker).await;
+        let config = broker.config.read().await;
+        let lane = crate::lane::resolve(&config, &identity, &attached);
+        let approved = config.harness(&harness_id).is_some_and(|h| h.approved)
+            || matches!(
+                broker.approvals.lock().await.get(&harness_id),
+                Some(crate::state::Approval::Allowed)
+            );
+        (Some(lane), approved)
+    } else {
+        (None, true)
+    };
+
     let peer = Arc::new(PeerHandle {
         peer_id: broker.next_peer_id(hello.role),
         role: hello.role,
         name: hello.name.clone(),
         source,
         instance,
+        identity,
+        harness_id,
+        lane: Mutex::new(lane.clone()),
         handles: hello.handles.clone().unwrap_or_else(|| vec!["native".into(), "browser".into()]),
         out: out.clone(),
         pending: Mutex::new(HashMap::new()),
@@ -229,6 +260,8 @@ where
         decider: broker.decider.read().await.name(),
         kill_engaged: broker.gate.lock().await.kill.engaged(),
         backends: broker.backend_infos().await,
+        lane,
+        approved,
     };
     let _ = out.send(Frame::ok(&id, serde_json::to_value(ack).unwrap_or_default())).await;
     Some(peer)
@@ -258,10 +291,28 @@ async fn dispatch(
         );
     }
 
+    // A client the user has not allowed gets `status` and `whoami` and nothing
+    // else. Those two are what tells it, and the person reading its output,
+    // *why* -- a refusal with no way to ask what is wrong is how an hour goes
+    // into a working setup that was simply never approved.
+    if let Err(e) = require_approval(broker, peer, op).await {
+        return Frame::err(id, e);
+    }
+
     let result: Result<Value, WireError> = match op {
         ops::HELLO => Err(WireError::new(codes::BAD_REQUEST, "already introduced")),
 
         ops::STATUS => Ok(broker.status().await),
+
+        ops::WHOAMI => Ok(whoami(broker, peer).await),
+
+        ops::LANE_LIST => Ok(lane_list(broker).await),
+
+        ops::HARNESS_LIST => Ok(harness_list(broker).await),
+
+        ops::AGENT_LIST => Ok(agent_list(broker).await),
+
+        ops::INSTANCE_BIND => instance_bind(broker, payload).await,
 
         ops::OBSERVE => match serde_json::from_value(payload) {
             Ok(req) => {
@@ -418,12 +469,308 @@ fn to_value<T: serde::Serialize>(v: T) -> Result<Value, WireError> {
         .map_err(|e| WireError::new(codes::INTERNAL, format!("could not encode reply: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// Identity, lanes, approval
+// ---------------------------------------------------------------------------
+
+/// Which ops a client may call before the user has allowed it.
+fn allowed_unapproved(op: &str) -> bool {
+    matches!(op, ops::HELLO | ops::STATUS | ops::WHOAMI)
+}
+
+/// Refuse anything but `status` and `whoami` until the user has allowed this
+/// client, and put the question on screen.
+///
+/// The dialog is raised and **not waited for**. Spec §3 requires a native
+/// dialog that the agent cannot answer; it does not require the request to sit
+/// on it, and sitting on it would break the rule this whole gate was built
+/// around -- a blocking approval once cost 241 of 272 seconds of a session.
+/// So the op is refused `not_approved`, which is safe to retry, and the
+/// retry succeeds the moment a human clicks. An agent whose operator is
+/// asleep gets an immediate, explicable refusal rather than a two-minute hang.
+async fn require_approval(
+    broker: &Arc<Broker>,
+    peer: &Arc<PeerHandle>,
+    op: &str,
+) -> Result<(), WireError> {
+    if peer.role != Role::Agent || allowed_unapproved(op) {
+        return Ok(());
+    }
+    let harness = peer.harness_id.clone();
+    match broker.approval(&harness).await {
+        Some(crate::state::Approval::Allowed) => return Ok(()),
+        Some(crate::state::Approval::Denied) => return Err(not_approved(&harness, "declined")),
+        Some(crate::state::Approval::Asking) => return Err(not_approved(&harness, "asking")),
+        None => {}
+    }
+
+    // Claim the question before raising it, so an agent in a retry loop raises
+    // one dialog rather than one per request.
+    if !broker.begin_asking(&harness).await {
+        return Err(not_approved(&harness, "asking"));
+    }
+
+    let timeout =
+        Duration::from_secs(broker.config.read().await.gate.review_dialog_timeout_s.clamp(5, 600));
+    let detail = match peer.lane.lock().await.clone() {
+        Some(l) => format!(
+            "It would drive {} (profile {}). Every action it takes still goes through the gate.",
+            l.browser, l.profile_dir
+        ),
+        None => "Every action it takes still goes through the gate.".to_string(),
+    };
+
+    let broker = broker.clone();
+    let peer_id = peer.peer_id.clone();
+    let name = peer.name.clone();
+    let asking = harness.clone();
+    tokio::spawn(async move {
+        let harness = asking;
+        // One dialog at a time, machine-wide: two clients connecting together
+        // would otherwise stack two system-modal windows, and the user would
+        // answer whichever was on top for whichever client they thought they
+        // were answering.
+        let _one_at_a_time = broker.approval_gate.lock().await;
+        let label = harness.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            kratos_gate::dialog::ask_approval(&label, &detail, timeout)
+        })
+        .await
+        .unwrap_or(kratos_gate::dialog::Approval::TimedOut);
+
+        broker.record_approval(&harness, answer).await;
+        broker.journal.read().await.append(json!({
+            "op": "harness.approval", "peer_id": peer_id, "agent": name,
+            "harness": harness, "answer": answer.as_str(),
+        }));
+    });
+
+    Err(not_approved(&harness, "asking"))
+}
+
+fn not_approved(harness: &str, answer: &str) -> WireError {
+    let what = match answer {
+        "asking" => format!(
+            "A dialog is on screen now asking whether {harness:?} may drive this machine. Once \
+             somebody answers it, try again."
+        ),
+        _ => format!(
+            "{harness:?} has not been allowed to drive this machine. Only the person at the \
+             keyboard can allow it: open the kratos settings window, find {harness:?} under \
+             Harnesses, and approve it."
+        ),
+    };
+    WireError::with_detail(
+        codes::NOT_APPROVED,
+        what,
+        json!({"harness": harness, "answer": answer}),
+    )
+}
+
+/// Re-resolve and report this session's lane.
+///
+/// Re-resolved rather than repeated from the handshake, because the user may
+/// have allocated a different browser since this session connected and the
+/// answer to "where am I" should be the current one. The stored copy is
+/// updated to match, so the next action uses what was just reported.
+async fn whoami(broker: &Arc<Broker>, peer: &Arc<PeerHandle>) -> Value {
+    let lane = if peer.role == Role::Agent {
+        let attached = crate::lane::attached_instances(broker).await;
+        let config = broker.config.read().await;
+        let fresh = crate::lane::resolve(&config, &peer.identity, &attached);
+        *peer.lane.lock().await = Some(fresh.clone());
+        Some(fresh)
+    } else {
+        None
+    };
+    let approved = matches!(
+        broker.approval(&peer.harness_id).await,
+        Some(crate::state::Approval::Allowed)
+    );
+    json!({
+        "peer_id": peer.peer_id,
+        "role": peer.role.as_str(),
+        "name": peer.name,
+        "harness": peer.harness_id,
+        "agent": peer.identity.agent,
+        "session": peer.identity.session,
+        "approved": approved,
+        "lane": lane,
+    })
+}
+
+/// Every session's lane, plus what this machine has to offer -- the settings
+/// window's dropdowns are filled from this rather than from a second reader of
+/// `Local State` in the UI process.
+async fn lane_list(broker: &Arc<Broker>) -> Value {
+    let attached = crate::lane::attached_instances(broker).await;
+    let sessions: Vec<Value> = {
+        let config = broker.config.read().await;
+        let peers: Vec<Arc<PeerHandle>> =
+            broker.peers.read().await.values().cloned().collect();
+        peers
+            .iter()
+            .filter(|p| p.role == Role::Agent)
+            .map(|p| {
+                let lane = crate::lane::resolve(&config, &p.identity, &attached);
+                json!({
+                    "peer_id": p.peer_id,
+                    "harness": p.harness_id,
+                    "agent": p.identity.agent,
+                    "session": p.identity.session,
+                    "lane": lane,
+                })
+            })
+            .collect()
+    };
+
+    let browsers: Vec<Value> = crate::browsers::BRANDS
+        .iter()
+        .filter_map(|b| crate::browsers::locate(b))
+        .map(|b| {
+            json!({
+                "brand": b.brand,
+                "installed": b.installed(),
+                "exe": b.exe.as_ref().map(|p| p.display().to_string()),
+                "user_data": b.user_data.as_ref().map(|p| p.display().to_string()),
+                "last_used": crate::browsers::last_used(b.brand),
+                "profiles": crate::browsers::profiles(b.brand)
+                    .into_iter()
+                    .map(|p| json!({"dir": p.dir, "name": p.name}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    json!({
+        "sessions": sessions,
+        "browsers": browsers,
+        "os_default": crate::browsers::os_default_brand(),
+        "instances": attached
+            .iter()
+            .map(|i| json!({
+                "token": i.token,
+                "brand": i.brand,
+                "bound_to": i.bound_to.as_ref().map(|(b, p)| json!({"brand": b, "profile_dir": p})),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn harness_list(broker: &Arc<Broker>) -> Value {
+    let config = broker.config.read().await;
+    let connected: Vec<String> = broker
+        .peers
+        .read()
+        .await
+        .values()
+        .filter(|p| p.role == Role::Agent)
+        .map(|p| p.harness_id.clone())
+        .collect();
+    let approvals = broker.approvals.lock().await.clone();
+    json!({
+        "harnesses": config
+            .harnesses
+            .iter()
+            .map(|h| json!({
+                "id": h.id,
+                "label": h.label,
+                "browser": h.browser,
+                "approved": h.approved,
+                // What was decided since this broker started, which is how
+                // "allow just for now" is visible at all.
+                "session_approval": approvals.get(&h.id).map(|a| match a {
+                    crate::state::Approval::Allowed => "allowed",
+                    crate::state::Approval::Denied => "denied",
+                    crate::state::Approval::Asking => "asking",
+                }),
+                "connected": connected.iter().any(|c| c.eq_ignore_ascii_case(&h.id)),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn agent_list(broker: &Arc<Broker>) -> Value {
+    let config = broker.config.read().await;
+    let live: Vec<String> = broker
+        .peers
+        .read()
+        .await
+        .values()
+        .filter_map(|p| p.identity.agent.clone())
+        .collect();
+    let configured: Vec<Value> = config
+        .agents
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "label": a.label,
+                "profile_dir": a.profile_dir,
+                "connected": live.iter().any(|l| l.eq_ignore_ascii_case(&a.id)),
+            })
+        })
+        .collect();
+    // An agent name that has connected but is not in the file yet is listed
+    // too, unassigned: the user cannot allocate a profile to a name they
+    // cannot see.
+    let unknown: Vec<Value> = live
+        .iter()
+        .filter(|l| config.agent(l).is_none())
+        .map(|l| json!({"id": l, "label": "", "profile_dir": "", "connected": true}))
+        .collect();
+    let all: Vec<Value> = configured.into_iter().chain(unknown).collect();
+    json!({"agents": all})
+}
+
+/// Pair an instance token with the browser profile it runs in.
+async fn instance_bind(broker: &Arc<Broker>, payload: Value) -> Result<Value, WireError> {
+    let token = payload.get("token").and_then(|t| t.as_str()).unwrap_or_default().trim();
+    if token.is_empty() {
+        return Err(WireError::new(codes::BAD_REQUEST, "instance.bind needs a token"));
+    }
+    let brand_in = payload.get("brand").and_then(|b| b.as_str()).unwrap_or_default();
+    let profile_dir =
+        payload.get("profile_dir").and_then(|p| p.as_str()).unwrap_or_default().trim().to_string();
+
+    // An empty brand or profile unpairs, which is how a mistaken pairing is
+    // undone without hand-editing the file.
+    let unpair = brand_in.trim().is_empty() && profile_dir.is_empty();
+    let brand = match (unpair, crate::browsers::normalise(brand_in)) {
+        (true, _) => String::new(),
+        (false, Some(b)) => b.to_string(),
+        (false, None) => {
+            return Err(WireError::new(
+                codes::BAD_REQUEST,
+                format!("{brand_in:?} is not a browser this build knows"),
+            ))
+        }
+    };
+
+    let patch = {
+        let config = broker.config.read().await;
+        let mut list = config.instances.clone();
+        list.retain(|i| i.token != token);
+        if !unpair {
+            list.push(kratos_protocol::config::InstanceConfig {
+                token: token.to_string(),
+                brand: brand.clone(),
+                profile_dir: profile_dir.clone(),
+            });
+        }
+        json!({"instances": list})
+    };
+    broker.apply_config(&patch, None).await?;
+    Ok(json!({"token": token, "brand": brand, "profile_dir": profile_dir, "paired": !unpair}))
+}
+
 /// Every op this build implements, whatever the role.
 fn known_op(op: &str) -> bool {
     matches!(
         op,
         ops::HELLO
             | ops::STATUS
+            | ops::WHOAMI
             | ops::OBSERVE
             | ops::ACT
             | ops::VERIFY
@@ -437,6 +784,10 @@ fn known_op(op: &str) -> bool {
             | ops::CONFIG_GET
             | ops::CONFIG_SET
             | ops::SHUTDOWN
+            | ops::LANE_LIST
+            | ops::HARNESS_LIST
+            | ops::AGENT_LIST
+            | ops::INSTANCE_BIND
     )
 }
 
