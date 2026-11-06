@@ -1132,6 +1132,7 @@ dependencies = [
  "kratos-protocol",
  "serde_json",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

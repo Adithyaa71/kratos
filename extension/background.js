@@ -24,6 +24,16 @@ const KEEPALIVE_MINUTES = 0.5;
 let port = null;
 let brand = "chrome";
 let reconnectDelay = 1000;
+/// This profile's identity, generated once and kept in profile storage.
+///
+/// One browser can have several profiles open at once, each running its own
+/// copy of this extension, and a tab in one cannot be reached through another.
+/// Without a per-profile token they all register with the broker as "the
+/// dom-ext backend" and the newest evicts the rest, so one agent's browser
+/// opening unplugs another's. The token is stored, not derived: it has to
+/// survive a reload, a restart and an upgrade, and nothing else about a
+/// profile is both visible from here and stable.
+let instanceToken = null;
 /// Why the port is not open, in Chromium's own words. The service worker's
 /// console is asleep exactly when you want to read it, so this is kept here
 /// and shown in the popup, which is where someone looks first.
@@ -53,10 +63,85 @@ async function detectBrand() {
   return "chrome";
 }
 
+// -- instance identity ------------------------------------------------------
+
+/// In flight, so two callers share one answer.
+///
+/// The promise is memoised, not the value. Memoising the value leaves a window
+/// between the first `await` and the token existing, and every caller that
+/// arrives inside it mints a token of its own: measured live, one browser
+/// registered **five different tokens** for one profile because five wakeups
+/// raced through that window. A profile has one identity, so there is one
+/// promise.
+let instancePromise = null;
+
+function ensureInstance() {
+  if (instanceToken) return Promise.resolve(instanceToken);
+  if (!instancePromise) {
+    instancePromise = mintOrLoadInstance().finally(() => {
+      instancePromise = null;
+    });
+  }
+  return instancePromise;
+}
+
+/// The token for this profile, read from storage or minted on first run.
+///
+/// `crypto.randomUUID` rather than a counter or a hash of anything visible: two
+/// profiles of the same browser look identical from in here, so the only way
+/// to be sure two tokens differ is for neither to be derived from the profile
+/// at all.
+async function mintOrLoadInstance() {
+  if (instanceToken) return instanceToken;
+  try {
+    const stored = await chrome.storage.local.get("instanceToken");
+    if (stored && typeof stored.instanceToken === "string" && stored.instanceToken) {
+      instanceToken = stored.instanceToken;
+      return instanceToken;
+    }
+  } catch (e) {
+    console.warn("[kratos] could not read the instance token", e);
+  }
+  const minted = crypto.randomUUID();
+  try {
+    await chrome.storage.local.set({ instanceToken: minted });
+  } catch (e) {
+    // A token that cannot be stored still works for this session; it just
+    // looks like a new profile after a restart, which is visible in the
+    // settings window rather than silent.
+    console.warn("[kratos] could not store the instance token", e);
+  }
+  instanceToken = minted;
+  return instanceToken;
+}
+
 // -- native port ------------------------------------------------------------
 
-function connect() {
-  if (port) return;
+/// True from the moment a connect starts until the port exists or fails.
+///
+/// `if (port) return` stopped being a guard the moment this function gained an
+/// `await`: every caller that arrives before the port is assigned walks
+/// straight past it. Each one then opened its own native port, so one browser
+/// ran three to five hosts at once -- and `reviveOnActivity` calls this on
+/// every tab update, so "before the port exists" is a busy window.
+let connecting = false;
+
+async function connect() {
+  if (port || connecting) return;
+  connecting = true;
+  try {
+    // Both of these before the port opens, because the instance message is the
+    // first thing sent on it and the host waits a short while for it.
+    await ensureInstance();
+    if (!brand || brand === "chrome") brand = await detectBrand();
+    if (port) return; // settled while we were awaiting
+    openPort();
+  } finally {
+    connecting = false;
+  }
+}
+
+function openPort() {
   try {
     port = chrome.runtime.connectNative(HOST);
   } catch (e) {
@@ -65,6 +150,17 @@ function connect() {
   }
   // connectNative resolves lazily: a bad id or a missing registration shows up
   // on the disconnect listener below, not here.
+
+  // Who we are, before anything else. The host cannot ask -- it has no way to
+  // address the extension -- so this is unsolicited by design, and it is
+  // re-sent on every reconnect because the host it reaches may be a new
+  // process that has never heard it.
+  send({
+    v: 1,
+    t: "evt",
+    op: "instance",
+    payload: { token: instanceToken, brand },
+  });
 
   port.onMessage.addListener(onBrokerMessage);
   port.onDisconnect.addListener(() => {

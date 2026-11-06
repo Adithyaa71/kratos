@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use kratos_protocol::{codes, ops, Frame, Role, WireError};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::windows::named_pipe::NamedPipeClient;
 
@@ -28,6 +28,13 @@ pub struct Peer<S> {
     pub broker: String,
     pub decider: String,
     pub kill_engaged: Vec<String>,
+    /// The whole hello reply, kept verbatim.
+    ///
+    /// The named fields above are the ones every caller needs; this is for the
+    /// ones a later protocol addition brings -- the `lane` object, say -- so a
+    /// new reply field is readable without widening this struct and every
+    /// caller with it.
+    pub ack: Value,
 }
 
 /// The common case: a peer on a real named pipe.
@@ -42,14 +49,7 @@ where
     /// Generic over the stream so a test can drive a peer over an in-memory
     /// duplex without a pipe, and so the same code path is exercised either
     /// way.
-    pub async fn handshake(
-        stream: S,
-        role: Role,
-        name: &str,
-        build: &str,
-        source: Option<&str>,
-        handles: Option<Vec<String>>,
-    ) -> io::Result<Self> {
+    pub async fn handshake(stream: S, hello: kratos_protocol::Hello) -> io::Result<Self> {
         let (reader, writer) = crate::split(stream);
         let mut peer = Peer {
             reader,
@@ -59,16 +59,14 @@ where
             broker: String::new(),
             decider: String::new(),
             kill_engaged: Vec::new(),
+            ack: Value::Null,
         };
-        let payload = json!({
-            "role": role,
-            "name": name,
-            "build": build,
-            "v_min": kratos_protocol::V,
-            "v_max": kratos_protocol::V,
-            "source": source,
-            "handles": handles,
-        });
+        // Serialised from the typed `Hello` rather than assembled by hand, so
+        // a field added to the struct reaches the wire without a second place
+        // to remember to change. The hand-built object silently omitted
+        // `instance` for exactly that reason.
+        let payload = serde_json::to_value(&hello)
+            .map_err(|e| io::Error::other(format!("unserialisable hello: {e}")))?;
         let ack = peer
             .call(ops::HELLO, payload)
             .await
@@ -77,6 +75,7 @@ where
         peer.broker = ack["broker"].as_str().unwrap_or_default().to_string();
         peer.decider = ack["decider"].as_str().unwrap_or_default().to_string();
         peer.kill_engaged = string_list(&ack["kill_engaged"]);
+        peer.ack = ack;
         Ok(peer)
     }
 
@@ -154,13 +153,23 @@ impl Peer<NamedPipeClient> {
     pub async fn connect_or_start(base: &str, role: Role, name: &str, build: &str) -> io::Result<Self> {
         let exe = crate::broker_exe()?;
         let conn = crate::connect_or_start(base, &exe).await?;
-        Peer::handshake(conn, role, name, build, None, None).await
+        Peer::handshake(conn, kratos_protocol::Hello::new(role, name, build)).await
     }
 
     /// Connect to an already-running broker, never starting one.
     pub async fn attach(base: &str, role: Role, name: &str, build: &str) -> io::Result<Self> {
         let conn = crate::connect(base).await?;
-        Peer::handshake(conn, role, name, build, None, None).await
+        Peer::handshake(conn, kratos_protocol::Hello::new(role, name, build)).await
+    }
+
+    /// Connect with a hello of the caller's own making.
+    ///
+    /// The route for anything the convenience constructors do not cover: a
+    /// backend that is one instance among several, or an agent that knows its
+    /// harness and agent names.
+    pub async fn attach_as(base: &str, hello: kratos_protocol::Hello) -> io::Result<Self> {
+        let conn = crate::connect(base).await?;
+        Peer::handshake(conn, hello).await
     }
 
     /// Connect as a perception/actuation backend.
@@ -172,7 +181,26 @@ impl Peer<NamedPipeClient> {
         handles: Vec<String>,
     ) -> io::Result<Self> {
         let conn = crate::connect(base).await?;
-        Peer::handshake(conn, Role::Backend, name, build, Some(source), Some(handles)).await
+        Peer::handshake(conn, kratos_protocol::Hello::backend(name, build, source, handles)).await
+    }
+
+    /// Connect as one instance of a backend source.
+    ///
+    /// `instance` of `None` is identical to [`attach_backend`]: a source with
+    /// no instance is the only instance of itself, which is what `uia`, `ocr`
+    /// and `pixel` are.
+    pub async fn attach_backend_instance(
+        base: &str,
+        name: &str,
+        build: &str,
+        source: &str,
+        handles: Vec<String>,
+        instance: Option<kratos_protocol::Instance>,
+    ) -> io::Result<Self> {
+        let conn = crate::connect(base).await?;
+        let hello =
+            kratos_protocol::Hello::backend(name, build, source, handles).with_instance(instance);
+        Peer::handshake(conn, hello).await
     }
 }
 

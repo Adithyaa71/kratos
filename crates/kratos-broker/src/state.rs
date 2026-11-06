@@ -23,11 +23,31 @@ pub const BROKER_NAME: &str = concat!("kratos-broker ", env!("CARGO_PKG_VERSION"
 // Peers
 // ---------------------------------------------------------------------------
 
+/// What the backend registry is keyed on.
+///
+/// `source` alone was the key until a second browser profile attached and
+/// evicted the first. One `dom-ext` source has as many instances as there are
+/// browser profiles open, and a tab in one cannot be reached through another,
+/// so they are different peers for the same source rather than one peer
+/// replacing another.
+///
+/// `None` for the instance means "the only instance of this source". That is
+/// not a placeholder: `uia`, `ocr` and `pixel` really are one per machine, and
+/// a restarted one still supersedes itself, which is the self-healing the
+/// protocol has always promised.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegistryKey {
+    pub source: Source,
+    pub instance: Option<String>,
+}
+
 pub struct PeerHandle {
     pub peer_id: String,
     pub role: kratos_protocol::Role,
     pub name: String,
     pub source: Option<Source>,
+    /// Which instance of `source` this is, when it said.
+    pub instance: Option<kratos_protocol::Instance>,
     pub handles: Vec<String>,
     /// Outbound queue. A task drains this into the socket, so no caller ever
     /// holds a writer lock and a slow peer cannot stall the broker.
@@ -44,11 +64,24 @@ impl PeerHandle {
         self.last_seen.store(now_ms, Ordering::Relaxed);
     }
 
+    /// The slot this peer occupies in the backend registry, if it is a backend.
+    pub fn registry_key(&self) -> Option<RegistryKey> {
+        self.source.map(|source| RegistryKey {
+            source,
+            instance: self
+                .instance
+                .as_ref()
+                .filter(|i| i.usable())
+                .map(|i| i.token.clone()),
+        })
+    }
+
     pub fn info(&self, now_ms: u64) -> kratos_protocol::BackendInfo {
         kratos_protocol::BackendInfo {
             source: self.source.map(|s| s.as_str().to_string()).unwrap_or_default(),
             handles: self.handles.clone(),
             last_seen_ms: Some(now_ms.saturating_sub(self.last_seen.load(Ordering::Relaxed))),
+            instance: self.instance.clone(),
         }
     }
 }
@@ -248,13 +281,21 @@ impl Broker {
 
     pub async fn add_peer(&self, peer: Arc<PeerHandle>) -> Option<Arc<PeerHandle>> {
         let mut peers = self.peers.write().await;
-        // A backend re-registering its source supersedes the old one, so a
-        // crashed-and-restarted Python backend heals itself instead of
-        // leaving a dead entry that routing would keep choosing.
-        let superseded = peer.source.and_then(|src| {
+        // A backend re-registering **the same instance of** its source
+        // supersedes the old one, so a crashed-and-restarted backend heals
+        // itself instead of leaving a dead entry that routing would keep
+        // choosing.
+        //
+        // Only the same key. Keying this on `source` alone meant a second
+        // browser profile attaching evicted the first, so one harness opening
+        // its browser silently unplugged another harness's -- with the
+        // displaced one told `evt superseded`, which read like a restart and
+        // was not one.
+        let key = peer.registry_key();
+        let superseded = key.and_then(|key| {
             peers
                 .values()
-                .find(|p| p.source == Some(src) && p.peer_id != peer.peer_id)
+                .find(|p| p.registry_key().as_ref() == Some(&key) && p.peer_id != peer.peer_id)
                 .cloned()
         });
         if let Some(old) = &superseded {
@@ -275,8 +316,27 @@ impl Broker {
         }
     }
 
+    /// Every live instance of a source, newest connection first.
+    ///
+    /// The order is the tie-break, not a preference: lanes decide which
+    /// instance a session reaches (P3), and until they do, "newest" is the
+    /// only answer that preserves what this broker did before instances
+    /// existed, when the newest had evicted every older one.
+    pub async fn backends_for(&self, source: Source) -> Vec<Arc<PeerHandle>> {
+        let mut found: Vec<Arc<PeerHandle>> = self
+            .peers
+            .read()
+            .await
+            .values()
+            .filter(|p| p.source == Some(source))
+            .cloned()
+            .collect();
+        found.sort_by_key(|p| std::cmp::Reverse(p.connected_at));
+        found
+    }
+
     pub async fn backend_for(&self, source: Source) -> Option<Arc<PeerHandle>> {
-        self.peers.read().await.values().find(|p| p.source == Some(source)).cloned()
+        self.backends_for(source).await.into_iter().next()
     }
 
     pub async fn has_ui(&self) -> bool {
@@ -293,7 +353,15 @@ impl Broker {
             .filter(|p| p.source.is_some())
             .map(|p| p.info(now))
             .collect();
-        v.sort_by(|a, b| a.source.cmp(&b.source));
+        // By source, then by instance token: with two instances of one source
+        // the order has to be stable or a status read looks different each
+        // time for no reason.
+        v.sort_by(|a, b| {
+            let token = |i: &Option<kratos_protocol::Instance>| {
+                i.as_ref().map(|x| x.token.clone()).unwrap_or_default()
+            };
+            a.source.cmp(&b.source).then_with(|| token(&a.instance).cmp(&token(&b.instance)))
+        });
         v
     }
 
@@ -512,6 +580,7 @@ impl Broker {
             .map(|p| {
                 json!({"peer_id": p.peer_id, "role": p.role.as_str(), "name": p.name,
                        "source": p.source.map(|s| s.as_str()),
+                       "instance": p.instance.as_ref().map(|i| i.token.clone()),
                        "connected_ms": p.connected_at.elapsed().as_millis() as u64})
             })
             .collect();
@@ -567,6 +636,16 @@ mod tests {
     }
 
     fn peer(id: &str, role: Role, source: Option<Source>) -> Arc<PeerHandle> {
+        instanced(id, role, source, None)
+    }
+
+    /// A peer that is one named instance of its source.
+    fn instanced(
+        id: &str,
+        role: Role,
+        source: Option<Source>,
+        token: Option<&str>,
+    ) -> Arc<PeerHandle> {
         let (tx, rx) = mpsc::channel(8);
         // Keep the receiver alive for the life of the handle so try_send works.
         Box::leak(Box::new(rx));
@@ -575,6 +654,7 @@ mod tests {
             role,
             name: id.into(),
             source,
+            instance: token.map(kratos_protocol::Instance::new),
             handles: vec!["browser".into(), "native".into()],
             out: tx,
             pending: Mutex::new(HashMap::new()),
@@ -592,6 +672,103 @@ mod tests {
         // Exactly one uia backend remains, and it is the new one.
         assert_eq!(b.backend_for(Source::Uia).await.unwrap().peer_id, "b-2");
         assert_eq!(b.peers.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_instances_of_one_source_coexist() {
+        let b = broker();
+        b.add_peer(instanced("b-1", Role::Backend, Some(Source::DomExt), Some("brave-tok")))
+            .await;
+        let superseded = b
+            .add_peer(instanced("b-2", Role::Backend, Some(Source::DomExt), Some("vivaldi-tok")))
+            .await;
+        // Two browser profiles are two instances, not one replacing the other.
+        assert!(superseded.is_none(), "a different instance must not be evicted");
+        assert_eq!(b.backends_for(Source::DomExt).await.len(), 2);
+        assert_eq!(b.peers.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_same_instance_reconnecting_replaces_itself() {
+        let b = broker();
+        b.add_peer(instanced("b-1", Role::Backend, Some(Source::DomExt), Some("brave-tok")))
+            .await;
+        let superseded = b
+            .add_peer(instanced("b-2", Role::Backend, Some(Source::DomExt), Some("brave-tok")))
+            .await;
+        assert_eq!(superseded.map(|p| p.peer_id.clone()), Some("b-1".to_string()));
+        assert_eq!(b.backends_for(Source::DomExt).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_instance_never_supersedes_a_different_source() {
+        let b = broker();
+        b.add_peer(instanced("b-1", Role::Backend, Some(Source::Uia), Some("same-tok"))).await;
+        let superseded = b
+            .add_peer(instanced("b-2", Role::Backend, Some(Source::DomExt), Some("same-tok")))
+            .await;
+        // The key is the pair. A token colliding across sources is not a
+        // reconnection of anything.
+        assert!(superseded.is_none());
+        assert_eq!(b.peers.read().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn backend_for_picks_the_newest_instance() {
+        let b = broker();
+        b.add_peer(instanced("b-1", Role::Backend, Some(Source::DomExt), Some("older"))).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        b.add_peer(instanced("b-2", Role::Backend, Some(Source::DomExt), Some("newer"))).await;
+        // Until lanes choose (P3), the newest instance is the one that answers:
+        // that is what this broker did before instances existed, when the
+        // newest had evicted every older one.
+        assert_eq!(b.backend_for(Source::DomExt).await.unwrap().peer_id, "b-2");
+        let order: Vec<String> = b
+            .backends_for(Source::DomExt)
+            .await
+            .iter()
+            .map(|p| p.peer_id.clone())
+            .collect();
+        assert_eq!(order, vec!["b-2".to_string(), "b-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_source_with_no_instance_is_still_one_per_source() {
+        let b = broker();
+        b.add_peer(peer("b-1", Role::Backend, Some(Source::Uia))).await;
+        let superseded = b.add_peer(peer("b-2", Role::Backend, Some(Source::Uia))).await;
+        assert_eq!(superseded.map(|p| p.peer_id.clone()), Some("b-1".to_string()));
+        assert_eq!(b.backends_for(Source::Uia).await.len(), 1);
+    }
+
+    #[test]
+    fn a_blank_token_is_no_instance_at_all() {
+        // Otherwise two peers would both key on the empty string and evict one
+        // another, which is the defect wearing a different hat.
+        assert!(!kratos_protocol::Instance::new("   ").usable());
+        let p = instanced("b-1", Role::Backend, Some(Source::DomExt), Some("  "));
+        assert_eq!(
+            p.registry_key(),
+            Some(RegistryKey { source: Source::DomExt, instance: None })
+        );
+    }
+
+    #[tokio::test]
+    async fn status_names_the_instance_behind_each_backend() {
+        let b = broker();
+        b.add_peer(instanced("b-1", Role::Backend, Some(Source::DomExt), Some("brave-tok")))
+            .await;
+        b.add_peer(instanced("b-2", Role::Backend, Some(Source::DomExt), Some("alpha-tok")))
+            .await;
+        let s = b.status().await;
+        let tokens: Vec<&str> = s["backends"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["instance"]["token"].as_str().unwrap())
+            .collect();
+        // Sorted, so a status read does not reshuffle between calls.
+        assert_eq!(tokens, vec!["alpha-tok", "brave-tok"]);
     }
 
     #[tokio::test]

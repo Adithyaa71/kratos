@@ -11,3 +11,13 @@ kratos-protocol = { workspace = true }
 kratos-ipc = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+
+# Toolhelp only, and only to learn which process started this host: that pid is
+# the browser, and it is the one thing that links an extension instance to the
+# windows on screen.
+[target.'cfg(windows)'.dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+]

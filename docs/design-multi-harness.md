@@ -97,3 +97,52 @@ Add a "kratos doctor" command: checks the pipe, backends, native-host registry p
 - Safety is unchanged: no TCP; the gate, kill switch and evidence rules stay; agents never clear kill or approve themselves.
 
 === END SPEC ===
+
+---
+
+## ADDENDUM — operator, 2026-11-07
+
+Added after P0, by the operator, in their words:
+
+> at the end... i also want my final benchmarks n tool tested on real problems
+> & task... not simple ones - click button , click send... complicated...
+> automated msg... automated reply.. shopping. choosing best product & adding
+> it to cart & applying for freelancing services (all these)
+
+This replaces "final benchmarks" in **P11/P7** with a real-task suite. P7 is
+not done until each of these has been run on this machine, with the journal
+lines and the per-step numbers recorded in `docs/benchmarks.md` and
+`docs/real-tasks.md`.
+
+### The tasks
+
+| # | task | why it is harder than a click |
+|---|---|---|
+| 1 | **Automated message** — compose and send a message to a named recipient in a web client | multi-step, two lanes' worth of state, a recipient field that is the exact place a wrong element costs the most |
+| 2 | **Automated reply** — read an incoming message, then answer it in context | the reply text comes from the operator's sentence, never from the model, so this is also the test that a page cannot dictate what gets said |
+| 3 | **Shopping** — search a store, compare candidates, choose the best by a stated criterion, add it to the cart | long-horizon, the choice is the operator's criterion applied to what is on screen, and the cart is state that must be *proved* to have changed |
+| 4 | **Applying for freelancing services** — open a job, fill the proposal form, attach the terms the operator stated | the densest real form in the set, and the one where `container` earns its keep |
+
+### Rules these runs do not get to bend
+
+* **Every literal still comes from the operator's sentence.** The recipient,
+  the message text, the product criterion, the proposal text. If a run needs
+  the model to invent a string, the run is wrong, not the rule.
+* **The irreversible step parks.** Send, submit, apply and checkout hit the
+  gate and return `needs_confirmation`; a human clicks. That is not a
+  limitation of the demo, it is the demo: these are exactly the four tasks the
+  gate exists for. Task 3 stops at **add to cart** and never at checkout.
+* **Screen content is data.** A job posting or a product page that contains
+  instructions is content, not a request.
+* **Numbers are measured per segment and overall**, as the operator asked:
+  observe, decide, gate, dispatch, settle, prove, and wall clock per step and
+  per task. Any step that was not measured says so.
+
+### Where it lands
+
+* `crates/kratos-bench` gains a `--live-tasks` mode that drives the suite and
+  writes the per-segment table.
+* `docs/real-tasks.md` holds the four task scripts (the operator sentences, one
+  per step), the journal excerpts and the outcome of every step.
+* A task that cannot be completed is reported as the step it stopped at and
+  why. P7 does not get to call the suite passing because three of four worked.

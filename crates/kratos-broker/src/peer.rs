@@ -188,11 +188,20 @@ where
         _ => None,
     };
 
+    // An instance is meaningful only for a backend, and only when it carries a
+    // token: keying the registry on an empty string would merge two instances
+    // into one slot, which is the defect this field exists to remove.
+    let instance = match hello.role {
+        Role::Backend => hello.instance.clone().filter(|i| i.usable()),
+        _ => None,
+    };
+
     let peer = Arc::new(PeerHandle {
         peer_id: broker.next_peer_id(hello.role),
         role: hello.role,
         name: hello.name.clone(),
         source,
+        instance,
         handles: hello.handles.clone().unwrap_or_else(|| vec!["native".into(), "browser".into()]),
         out: out.clone(),
         pending: Mutex::new(HashMap::new()),
@@ -201,12 +210,16 @@ where
     });
 
     if let Some(old) = broker.add_peer(peer.clone()).await {
-        let _ = old
-            .out
-            .try_send(Frame::evt(
-                ops::EVT_SUPERSEDED,
-                json!({"reason": "another backend registered the same source"}),
-            ));
+        // Said precisely, because "the same source" used to be a lie: a second
+        // browser profile was told this when nothing about it had restarted.
+        let reason = match &peer.instance {
+            Some(i) => format!("this instance ({}) reconnected", i.token),
+            None => "another backend registered the same source".to_string(),
+        };
+        let _ = old.out.try_send(Frame::evt(
+            ops::EVT_SUPERSEDED,
+            json!({"reason": reason, "source": peer.source.map(|s| s.as_str())}),
+        ));
     }
 
     let ack = kratos_protocol::HelloAck {

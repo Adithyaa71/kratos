@@ -1,8 +1,15 @@
 # kratos wire protocol — v1
 
-**Status: LOCKED.** The v1 message shapes below do not change. Additive fields
-are allowed only as optional with a documented default; anything that would
-change the meaning of an existing field ships as v2 alongside v1.
+**Status: evolving, additive-only until first working release.** The v1 message
+shapes below do not change *meaning*: new fields are optional with a documented
+default, new ops and new members of a closed set are additive, and anything
+that would change the meaning of an existing field ships as v2 alongside v1.
+The wire version stays `1` throughout.
+
+Locked was the right word while nothing had been built on it. Multi-harness
+work ([design-multi-harness.md](design-multi-harness.md)) adds fields to the
+handshake and ops to the agent and UI roles, and calling that v2 would mean two
+protocols to support for a build that has not shipped once.
 
 Everything in this repo speaks this protocol: the MCP shim, the browser native
 host, the Python perception/actuation backends, and the configuration UI. There
@@ -134,9 +141,60 @@ A `backend` must set `source` and `handles`:
 | `ocr` | Python, Tesseract | `["native","browser"]` |
 | `pixel` | Python, detector plus OCR | `["native","browser"]` |
 
-Two backends may register the same `source`; the newest wins and the older is
-sent `evt superseded` and closed. A crashed-and-restarted Python backend is
-therefore self-healing rather than a duplicate.
+### 3.1 `instance` — which one of a source
+
+A `backend` may also send `instance`, and `dom-ext` does:
+
+```json
+{"v":1,"t":"req","id":"1","op":"hello","payload":{
+  "role":"backend","name":"browser-extension","build":"kratos-host 0.1.0",
+  "source":"dom-ext","handles":["browser"],
+  "instance":{"token":"9f2c…","brand":"brave","pid":21884}
+}}
+```
+
+| field | who fills it | meaning |
+|---|---|---|
+| `token` | the extension, once per profile, stored in that profile | the only stable identity. Survives a reload, a restart and an upgrade. Required; a blank one is treated as no `instance` at all. |
+| `brand` | the extension | `brave`, `chrome`, `edge`, `vivaldi`, `opera`. A hint for narrowing, not an identity. |
+| `pid` | `kratos-host`, as its own parent process | the browser process, which is what links an instance to windows on screen. Absent if the lookup failed; a wrong pid would be worse than none. |
+| `parent_hwnd` | nobody, today | reserved. `kratos-host` has no window of its own, so the broker resolves windows from `pid` rather than trusting a guess. |
+
+`profile_dir` is deliberately **not** sent: no extension API reports the
+profile directory name. A token is paired with a profile by the user in the
+settings window, or by the launch that opened it.
+
+**The registry key is `(source, instance.token)`.** A backend re-registering
+the same key supersedes the older peer, which is sent `evt superseded` and
+**dropped from the registry** — a crashed-and-restarted backend is
+self-healing rather than a duplicate. A
+backend with a *different* instance of the same source is a **second
+registration**, not a replacement: one `dom-ext` source has as many instances
+as there are browser profiles open, and a tab in one cannot be reached through
+another.
+
+No `instance` means "the only instance of this source", which is what `uia`,
+`ocr` and `pixel` are, and is exactly the behaviour every backend had before
+this field existed.
+
+> Keying on `source` alone meant a second browser profile attaching **evicted
+> the first**, so one harness opening its browser silently unplugged another's
+> — and the displaced peer was told `evt superseded`, which reads like a
+> restart and was not one.
+
+`status` and the hello reply report `instance` per backend entry, so two
+entries with the same `source` are two live instances rather than a duplicate
+to be cleaned up.
+
+**A superseded peer is expected to exit; the broker does not close it.** It
+would be tidier to close the connection, and this document used to say the
+broker did. It must not: every backend here reconnects on disconnect, so a
+forced close is answered by a reconnect that supersedes the peer that just
+replaced it, and two backends trade the registration forever. Dropping it from
+the registry is the whole of the broker's part. `kratos-host` exits on
+`evt superseded`, which is also how a host left behind by a service-worker
+restart is reaped — Chromium does not close such a host's stdin, so being
+superseded is the only notice it gets.
 
 ---
 
@@ -355,7 +413,10 @@ that can clear its own kill switch does not have a kill switch.
   "broker":"kratos-broker 0.1.0","v":1,"pid":21884,"uptime_ms":412903,
   "idle_ms":1203,"idle_exit_ms":300000,
   "peers":[{"peer_id":"a-3","role":"agent","name":"claude-code"}],
-  "backends":[{"source":"dom-ext","handles":["browser"],"last_seen_ms":90}],
+  "backends":[{"source":"dom-ext","handles":["browser"],"last_seen_ms":90,
+               "instance":{"token":"9f2c…","brand":"brave","pid":21884}},
+              {"source":"dom-ext","handles":["browser"],"last_seen_ms":12,
+               "instance":{"token":"41ab…","brand":"vivaldi","pid":9120}}],
   "lease":{"scope":"input","holder":"a-3","expires_in_ms":11300},
   "kill_engaged":[],
   "decider":{"provider":"jev","model":"jev-latest","key_present":true},

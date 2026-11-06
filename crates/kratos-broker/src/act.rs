@@ -1437,6 +1437,7 @@ mod tests {
                 role: kratos_protocol::Role::Backend,
                 name: "ext".into(),
                 source: Some(Source::DomExt),
+                instance: None,
                 handles: vec!["browser".into()],
                 out: tx,
                 pending: tokio::sync::Mutex::new(std::collections::HashMap::new()),

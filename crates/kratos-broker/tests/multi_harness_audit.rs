@@ -193,7 +193,6 @@ struct FakeInstance {
     brand: &'static str,
     /// The instance token the spec has the extension generate per profile.
     token: &'static str,
-    profile_dir: &'static str,
     window: String,
     url: String,
 }
@@ -207,14 +206,30 @@ struct Live {
 }
 
 impl FakeInstance {
-    fn dom_ext(brand: &'static str, token: &'static str, profile_dir: &'static str) -> Self {
+    fn dom_ext(brand: &'static str, token: &'static str) -> Self {
         FakeInstance {
             source: "dom-ext",
             brand,
             token,
-            profile_dir,
             window: format!("Inbox - Gmail - {brand}"),
             url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
+        }
+    }
+
+    /// A backend with **no** instance, which is what `uia`, `ocr` and `pixel`
+    /// are: one per machine.
+    ///
+    /// The empty token is the point. `Hello::with_instance` drops a token that
+    /// is only whitespace, so this also proves an empty one is treated as no
+    /// instance rather than as a shared registry slot that two peers could
+    /// both claim.
+    fn uia() -> Self {
+        FakeInstance {
+            source: "uia",
+            brand: "none",
+            token: "   ",
+            window: "Untitled - Notepad".to_string(),
+            url: String::new(),
         }
     }
 
@@ -229,34 +244,33 @@ impl FakeInstance {
         ]
     }
 
-    /// Attach with a hello that carries the instance object from section 7 of
-    /// the spec. This build ignores it; a later one keys the registry on it.
+    /// Attach through the shared handshake, carrying the instance object from
+    /// section 7 of the spec, and serve until the broker lets go.
     fn spawn(self, pipe: String) -> Live {
         let superseded = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let sup = superseded.clone();
         let cl = closed.clone();
         let task = tokio::spawn(async move {
-            let mut peer = RawPeer::hello(
+            let instance = kratos_protocol::Instance {
+                token: self.token.to_string(),
+                brand: Some(self.brand.to_string()),
+                pid: Some(4242),
+                parent_hwnd: None,
+            };
+            let mut peer = kratos_ipc::PipePeer::attach_backend_instance(
                 &pipe,
-                json!({
-                    "role": "backend",
-                    "name": format!("fake-{}-{}", self.source, self.brand),
-                    "source": self.source,
-                    "handles": ["browser"],
-                    "instance": {
-                        "token": self.token,
-                        "brand": self.brand,
-                        "profile_dir": self.profile_dir,
-                        "pid": 4242,
-                        "parent_hwnd": 0
-                    }
-                }),
+                &format!("fake-{}-{}", self.source, self.brand),
+                BUILD,
+                self.source,
+                vec!["browser".to_string(), "native".to_string()],
+                Some(instance),
             )
-            .await;
+            .await
+            .expect("backend attach");
 
             loop {
-                let frame = match peer.reader.next().await {
+                let frame = match peer.next_frame().await {
                     Ok(Some(f)) => f,
                     Ok(None) => {
                         cl.store(true, Ordering::SeqCst);
@@ -277,8 +291,7 @@ impl FakeInstance {
                 match op {
                     ops::BACKEND_OBSERVE => {
                         let _ = peer
-                            .writer
-                            .send(&Frame::ok(
+                            .reply(
                                 &id,
                                 json!({
                                     "window": self.window,
@@ -286,14 +299,12 @@ impl FakeInstance {
                                     "elements": self.elements(),
                                     "truncated": false
                                 }),
-                            ))
+                            )
                             .await;
                     }
                     ops::BACKEND_ACT => {
-                        let _ = peer
-                            .writer
-                            .send(&Frame::ok(&id, json!({"applied": true, "took_ms": 3})))
-                            .await;
+                        let _ =
+                            peer.reply(&id, json!({"applied": true, "took_ms": 3})).await;
                     }
                     _ => {}
                 }
@@ -340,19 +351,18 @@ fn report(what: &str, gaps: Vec<String>) {
 // (a) Two dom-ext instances: the older gets kicked
 // ---------------------------------------------------------------------------
 
-/// Spec 7: the backend registry key becomes `(source, instance.token)` and
-/// only the *same* key supersedes. Two browser profiles are two instances of
-/// one source, and today the second one evicts the first, so one harness
-/// opening its browser silently unplugs another's.
+/// Spec 7: the backend registry key is `(source, instance.token)` and only the
+/// *same* key supersedes. Two browser profiles are two instances of one source;
+/// before P1 the second evicted the first, so one harness opening its browser
+/// silently unplugged another's.
 #[tokio::test]
-#[ignore = "P0 reproduction: fixed in P1 (instance-keyed registration)"]
 async fn two_browser_instances_both_stay_registered() {
     let h = Harness::start("twoinstances");
     wait_for_pipe(&h.pipe).await;
 
-    let brave = FakeInstance::dom_ext("brave", "tok-brave", "Default").spawn(h.pipe.clone());
+    let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
     tokio::time::sleep(SETTLE).await;
-    let vivaldi = FakeInstance::dom_ext("vivaldi", "tok-vivaldi", "Profile 1").spawn(h.pipe.clone());
+    let vivaldi = FakeInstance::dom_ext("vivaldi", "tok-vivaldi").spawn(h.pipe.clone());
     tokio::time::sleep(SETTLE).await;
 
     let mut a = agent(&h.pipe, "auditor").await;
@@ -376,19 +386,70 @@ async fn two_browser_instances_both_stay_registered() {
     if brave.closed.load(Ordering::SeqCst) {
         gaps.push("the first instance's connection was dropped".to_string());
     }
-    // The lane the agent is in decides which instance answers, so an
-    // observation must be traceable to one instance. Today whichever peer the
-    // map kept answers for everyone.
-    if let Ok(obs) = a.call(ops::OBSERVE, json!({})).await {
-        let answered = obs["window"].as_str().unwrap_or_default().to_string();
-        if !answered.contains("brave") && !answered.contains("vivaldi") {
-            gaps.push(format!("observe was answered by neither instance: window {answered:?}"));
-        }
+    // Each entry names which instance it is, or the settings window has no way
+    // to show the operator two browsers rather than one mystery backend.
+    let tokens: Vec<String> = status["backends"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|b| b["source"] == json!("dom-ext"))
+                .map(|b| b["instance"]["token"].as_str().unwrap_or("<none>").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if tokens != vec!["tok-brave".to_string(), "tok-vivaldi".to_string()] {
+        gaps.push(format!(
+            "status should list both instance tokens in a stable order, got {tokens:?}"
+        ));
     }
 
     brave.task.abort();
     vivaldi.task.abort();
     report("two dom-ext instances", gaps);
+}
+
+/// The other half of P1's acceptance: the self-healing the protocol has always
+/// promised must survive being narrowed. One instance reconnecting -- a service
+/// worker restart, a browser relaunch into the same profile -- still replaces
+/// itself, so a dead entry is never left for routing to keep choosing.
+#[tokio::test]
+async fn the_same_instance_reconnecting_supersedes_itself() {
+    let h = Harness::start("samereconnect");
+    wait_for_pipe(&h.pipe).await;
+
+    let first = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+    let second = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+
+    let mut a = agent(&h.pipe, "auditor").await;
+    let status = a.call(ops::STATUS, json!({})).await.expect("status");
+
+    let mut gaps = Vec::new();
+    let count = backend_sources(&status, "dom-ext");
+    if count != 1 {
+        gaps.push(format!("one instance reconnecting left {count} entries, not 1"));
+    }
+    if !first.superseded.load(Ordering::SeqCst) {
+        gaps.push("the displaced connection was not told it had been superseded".to_string());
+    }
+
+    // And a source with no instance at all still behaves as it always did.
+    let _uia = FakeInstance::uia().spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+    let _uia2 = FakeInstance::uia().spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+    let status = a.call(ops::STATUS, json!({})).await.expect("status");
+    if backend_sources(&status, "uia") != 1 {
+        gaps.push(format!(
+            "a backend that sends no instance must stay one per source, got {}",
+            backend_sources(&status, "uia")
+        ));
+    }
+
+    first.task.abort();
+    second.task.abort();
+    report("same instance reconnecting", gaps);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +469,7 @@ async fn a_session_observes_its_own_lane_not_another_agents_window() {
 
     // One attached instance, standing in for the Brave lane of harness
     // "claude". Harness "bluee" is allocated Vivaldi and has no instance.
-    let brave = FakeInstance::dom_ext("brave", "tok-brave", "Default").spawn(h.pipe.clone());
+    let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
     tokio::time::sleep(SETTLE).await;
 
     let mut one = RawPeer::agent(&h.pipe, "claude", "agent-a", "s-1").await;
@@ -495,7 +556,7 @@ async fn a_harness_and_its_browser_cannot_be_split_across_two_brokers() {
 
     // The browser was launched with one KRATOS_PIPE; the harness runs with
     // another. This is exactly what start-browser.cmd pairs today.
-    let brave = FakeInstance::dom_ext("brave", "tok-brave", "Default").spawn(with_backend.pipe.clone());
+    let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(with_backend.pipe.clone());
     tokio::time::sleep(SETTLE).await;
 
     let mut stranded = agent(&without.pipe, "claude").await;
