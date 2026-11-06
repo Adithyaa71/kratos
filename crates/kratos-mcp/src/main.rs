@@ -31,6 +31,19 @@ fn main() {
     runtime.block_on(serve());
 }
 
+/// Trim a line from a client, tolerating a byte-order mark.
+///
+/// `str::trim` does not remove U+FEFF: a BOM is a format character, not
+/// whitespace. Several runtimes write one at the head of their first stdio
+/// write without being asked, and the result was that `initialize` -- always
+/// the first message, so always the one carrying it -- came back -32700 while
+/// every message after it parsed. A harness whose handshake is rejected
+/// concludes the server is broken, and that is a hard thing to attribute from
+/// the far end.
+fn clean(line: &str) -> &str {
+    line.trim_start_matches('\u{feff}').trim()
+}
+
 async fn serve() {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut broker: Option<PipePeer> = None;
@@ -39,7 +52,7 @@ async fn serve() {
     let agent_name = std::env::var("KRATOS_AGENT_NAME").unwrap_or_else(|_| "mcp-client".to_string());
 
     while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim();
+        let trimmed = clean(&line);
         if trimmed.is_empty() {
             continue;
         }
@@ -383,6 +396,28 @@ fn tools() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_byte_order_mark_does_not_break_the_handshake() {
+        // What a runtime that "helpfully" marks its first write sends.
+        let line = "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}";
+        assert!(serde_json::from_str::<Value>(line).is_err(), "precondition");
+        let v: Value = serde_json::from_str(clean(line)).expect("parses once cleaned");
+        assert_eq!(v["method"], "initialize");
+    }
+
+    #[test]
+    fn ordinary_lines_are_unchanged_and_blank_ones_stay_blank() {
+        assert_eq!(clean("  {\"a\":1}\r\n"), "{\"a\":1}");
+        assert_eq!(clean(""), "");
+        assert_eq!(clean("\u{feff}"), "");
+        assert_eq!(clean("   \t "), "");
+        // A mark inside a string is data, not framing: leave it alone.
+        assert_eq!(clean("{\"a\":\"x\u{feff}y\"}"), "{\"a\":\"x\u{feff}y\"}");
+        // Several can stack when writes are concatenated.
+        assert_eq!(clean("\u{feff}\u{feff}{}"), "{}");
+    }
+
     use super::*;
 
     #[test]
