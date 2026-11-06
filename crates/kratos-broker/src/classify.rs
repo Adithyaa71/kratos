@@ -184,7 +184,17 @@ pub fn foreground() -> Option<WindowRef> {
 
 struct Search {
     needle: String,
-    found: Option<isize>,
+    found: Vec<isize>,
+}
+
+/// What a `window` argument picked out.
+#[derive(Debug)]
+pub enum Resolution {
+    One(WindowRef),
+    /// The text matched windows belonging to more than one application. The
+    /// worst outcome here is not failing -- it is succeeding on the wrong one.
+    Ambiguous(Vec<WindowRef>),
+    NotFound,
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> Bool {
@@ -197,40 +207,113 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> Bool {
         return 1;
     }
     if title.to_lowercase().contains(&search.needle) {
-        search.found = Some(hwnd as isize);
-        return 0; // stop enumerating
+        // Collect them all. Stopping at the first is how a search for
+        // "Upwork" landed on an editor whose session was named after the job
+        // instead of on the browser showing the site.
+        search.found.push(hwnd as isize);
     }
     1
 }
 
-/// The first visible window whose title contains `needle`, case-insensitively.
-///
-/// Used only when a caller names a window explicitly. The foreground window is
-/// the default everywhere else, because "the window the operator is looking
-/// at" is almost always what an instruction means.
-pub fn find_by_title(needle: &str) -> Option<WindowRef> {
+/// Every visible window whose title contains `needle`, case-insensitively.
+pub fn find_all_by_title(needle: &str) -> Vec<WindowRef> {
     let n = needle.trim().to_lowercase();
     if n.is_empty() {
-        return foreground();
+        return foreground().into_iter().collect();
     }
-    let mut search = Search { needle: n, found: None };
+    let mut search = Search { needle: n, found: Vec::new() };
     unsafe {
         EnumWindows(Some(enum_proc), &mut search as *mut Search as LPARAM);
     }
-    let hwnd = search.found?;
-    describe(hwnd as *mut c_void as HWND)
+    search
+        .found
+        .into_iter()
+        .filter_map(|h| describe(h as *mut c_void as HWND))
+        .collect()
+}
+
+/// Decide between the windows a `window` argument matched.
+///
+/// Several windows of one application are not a problem: they are the same
+/// program, and the first is as good an answer as any. Windows of *different*
+/// applications are a different thing entirely -- the text was not specific
+/// enough to say which program was meant, and picking one silently is how an
+/// instruction aimed at a browser gets carried out in an editor that happened
+/// to be named after the same job.
+pub fn choose(matches: Vec<WindowRef>) -> Resolution {
+    if matches.is_empty() {
+        return Resolution::NotFound;
+    }
+    let first = matches[0].exe.to_ascii_lowercase();
+    if matches.iter().all(|w| w.exe.to_ascii_lowercase() == first) {
+        let mut matches = matches;
+        return Resolution::One(matches.remove(0));
+    }
+    Resolution::Ambiguous(matches)
 }
 
 /// Resolve the target window for a request.
-pub fn resolve(window: Option<&str>) -> Option<WindowRef> {
+pub fn resolve_window(window: Option<&str>) -> Resolution {
     match window {
-        Some(w) if !w.trim().is_empty() => find_by_title(w),
-        _ => foreground(),
+        Some(w) if !w.trim().is_empty() => choose(find_all_by_title(w)),
+        _ => match foreground() {
+            Some(w) => Resolution::One(w),
+            None => Resolution::NotFound,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn win(exe: &str, title: &str) -> WindowRef {
+        WindowRef { hwnd: 1, title: title.into(), exe: exe.into(), pid: 1, rect: None }
+    }
+
+    #[test]
+    fn several_windows_of_one_application_are_not_ambiguous() {
+        // Three Brave windows is just Brave. Any of them will do.
+        let m = vec![
+            win("brave.exe", "Upwork | Find Work"),
+            win("brave.exe", "Upwork | Messages"),
+            win("brave.exe", "Upwork | Reports"),
+        ];
+        match choose(m) {
+            Resolution::One(w) => assert_eq!(w.title, "Upwork | Find Work"),
+            other => panic!("expected one, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_title_matching_two_applications_is_refused_not_guessed() {
+        // The live failure: an editor session named after the job, and the
+        // browser actually showing the site. Picking the first silently
+        // carried a browser instruction into an editor.
+        let m = vec![
+            win("claude.exe", "Upwork profile optimization and lead generation"),
+            win("brave.exe", "Upwork | Find Work"),
+        ];
+        match choose(m) {
+            Resolution::Ambiguous(all) => {
+                assert_eq!(all.len(), 2);
+                assert!(all.iter().any(|w| w.exe == "brave.exe"));
+                assert!(all.iter().any(|w| w.exe == "claude.exe"));
+            }
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_executable_comparison_ignores_case() {
+        let m = vec![win("Brave.exe", "a"), win("brave.exe", "b")];
+        assert!(matches!(choose(m), Resolution::One(_)));
+    }
+
+    #[test]
+    fn nothing_matched_is_not_found_rather_than_an_empty_choice() {
+        assert!(matches!(choose(Vec::new()), Resolution::NotFound));
+    }
+
     use super::*;
 
     #[test]
@@ -313,12 +396,18 @@ mod tests {
 
     #[test]
     fn searching_for_a_title_that_cannot_exist_returns_none() {
-        assert!(find_by_title("zzz-no-such-window-zzz-9174").is_none());
+        assert!(matches!(
+            resolve_window(Some("zzz-no-such-window-zzz-9174")),
+            Resolution::NotFound
+        ));
     }
 
     #[test]
     fn an_empty_needle_falls_back_to_the_foreground() {
-        let a = resolve(Some("   ")).map(|w| w.hwnd);
+        let a = match resolve_window(Some("   ")) {
+            Resolution::One(w) => Some(w.hwnd),
+            _ => None,
+        };
         let b = foreground().map(|w| w.hwnd);
         assert_eq!(a, b);
     }

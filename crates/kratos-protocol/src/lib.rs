@@ -199,6 +199,9 @@ pub mod codes {
     pub const TOO_LARGE: &str = "too_large";
     pub const NO_BACKEND: &str = "no_backend";
     pub const NO_TARGET: &str = "no_target";
+    /// A `window` argument matched windows of more than one application.
+    /// Safe to retry with a more specific string; nothing was dispatched.
+    pub const AMBIGUOUS_WINDOW: &str = "ambiguous_window";
     pub const BACKEND_ERROR: &str = "backend_error";
     pub const BACKEND_TIMEOUT: &str = "backend_timeout";
     pub const STALE_ID: &str = "stale_id";

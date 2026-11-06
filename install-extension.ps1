@@ -33,8 +33,8 @@ param(
     [ValidatePattern('^[a-p]{32}$')]
     [string]$ExtensionId,
 
-    [ValidateSet('brave', 'chrome', 'edge')]
-    [string[]]$Browsers = @('brave', 'chrome', 'edge')
+    [ValidateSet('brave', 'chrome', 'edge', 'vivaldi')]
+    [string[]]$Browsers = @('brave', 'chrome', 'edge', 'vivaldi')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,6 +95,10 @@ $hives = @{
         'HKCU:\Software\Chromium\NativeMessagingHosts\ai.kratos.bridge'
     )
     edge   = @('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\ai.kratos.bridge')
+    vivaldi = @(
+        'HKCU:\Software\Vivaldi\NativeMessagingHosts\ai.kratos.bridge',
+        'HKCU:\Software\Chromium\NativeMessagingHosts\ai.kratos.bridge'
+    )
 }
 
 foreach ($browser in $Browsers) {

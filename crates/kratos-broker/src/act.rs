@@ -267,15 +267,7 @@ pub async fn observe(
     req: kratos_protocol::ObserveReq,
 ) -> Result<Observation, WireError> {
     let started = Instant::now();
-    let win = classify::resolve(req.window.as_deref()).ok_or_else(|| {
-        WireError::new(
-            codes::NO_TARGET,
-            match &req.window {
-                Some(w) => format!("no visible window matches {w:?}"),
-                None => "there is no foreground window".to_string(),
-            },
-        )
-    })?;
+    let win = target_window(req.window.as_deref())?;
     let class = win.class();
     let prefer = match req.prefer.as_deref() {
         None => None,
@@ -639,15 +631,7 @@ async fn act_inner(
     let elapsed = || started.elapsed().as_millis() as u64;
 
     // -- 1. what are we aiming at ------------------------------------------
-    let win = classify::resolve(req.window.as_deref()).ok_or_else(|| {
-        WireError::new(
-            codes::NO_TARGET,
-            match &req.window {
-                Some(w) => format!("no visible window matches {w:?}"),
-                None => "there is no foreground window".to_string(),
-            },
-        )
-    })?;
+    let win = target_window(req.window.as_deref())?;
     let class = win.class();
 
     // The kill switch is consulted before any work at all, and spends no rate
@@ -1042,6 +1026,48 @@ async fn act_inner(
     Ok(res)
 }
 
+/// The one window this request is about, or an error that says why not.
+///
+/// A `window` string that matches two different applications is refused rather
+/// than resolved. Several windows of one program are fine -- they are the same
+/// program. Windows of different programs mean the string did not say which
+/// was meant, and the failure that matters there is not "no match", it is
+/// acting on the wrong one: a search for "Upwork" once resolved to an editor
+/// whose session was named after the job rather than to the browser showing
+/// the site, and nothing in the result said so.
+fn target_window(window: Option<&str>) -> Result<WindowRef, WireError> {
+    match classify::resolve_window(window) {
+        classify::Resolution::One(w) => Ok(w),
+        classify::Resolution::Ambiguous(all) => {
+            let listed: Vec<String> =
+                all.iter().take(6).map(|w| format!("{:?} ({})", w.title, w.exe)).collect();
+            Err(WireError::with_detail(
+                codes::AMBIGUOUS_WINDOW,
+                format!(
+                    "{:?} matches windows of {} different applications, so it does not say \
+                     which one you mean: {}",
+                    window.unwrap_or(""),
+                    all.iter()
+                        .map(|w| w.exe.to_ascii_lowercase())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len(),
+                    listed.join("; ")
+                ),
+                json!({ "candidates": all.iter().map(|w| json!({
+                    "title": w.title, "exe": w.exe, "class": w.class().as_str()
+                })).collect::<Vec<_>>() }),
+            ))
+        }
+        classify::Resolution::NotFound => Err(WireError::new(
+            codes::NO_TARGET,
+            match window {
+                Some(w) => format!("no visible window matches {w:?}"),
+                None => "there is no foreground window".to_string(),
+            },
+        )),
+    }
+}
+
 /// Collect the evidence and name which sources agreed.
 fn assemble_effect(
     before: &BackendObservation,
@@ -1118,8 +1144,7 @@ pub async fn verify(broker: &Arc<Broker>, req: VerifyReq) -> Result<VerifyRes, W
     let started = Instant::now();
     broker.mark_agent_activity();
 
-    let win = classify::resolve(req.window.as_deref())
-        .ok_or_else(|| WireError::new(codes::NO_TARGET, "there is no window to look at"))?;
+    let win = target_window(req.window.as_deref())?;
     let class = win.class();
     let (_, obs) = observe_with_fallback(
         broker,

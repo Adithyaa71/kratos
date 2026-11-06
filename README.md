@@ -310,9 +310,21 @@ browser and leave everything else running.
 Each agent gets its own broker, browser profile and extension instance, paired
 by one environment variable:
 
+One browser per harness is the simplest split that works today:
+
 ```bash
-start-agent-browser.cmd agent-a "Profile 1"
-start-agent-browser.cmd agent-b "Profile 2"
+start-browser.cmd claude brave      # Brave   -> kratos.v1
+start-browser.cmd bluee  vivaldi    # Vivaldi -> kratos.bluee
+```
+
+Each browser inherits `KRATOS_PIPE`, and so does the native host it launches,
+so that browser's extension reaches that harness's broker and no other. Your
+own profile and logins are used, deliberately -- a browser with none of your
+accounts in it is not useful. For a throwaway profile per agent instead:
+
+```bash
+start-agent-browser.cmd agent-a
+start-agent-browser.cmd agent-b
 ```
 
 ```json

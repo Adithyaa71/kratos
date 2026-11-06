@@ -42,7 +42,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('brave', 'chrome', 'edge')]
+    [ValidateSet('brave', 'chrome', 'edge', 'vivaldi')]
     [string]$Browser = 'brave',
     [switch]$Undo
 )
@@ -66,6 +66,10 @@ $BRANDS = @{
                         "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe")
                 policy = 'Software\Policies\Microsoft\Edge'
                 hives = @('Software\Microsoft\Edge') }
+    vivaldi = @{ exe = @("$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe",
+                         "$env:ProgramFiles\Vivaldi\Application\vivaldi.exe")
+                 policy = 'Software\Policies\Vivaldi'
+                 hives = @('Software\Vivaldi', 'Software\Chromium') }
 }
 
 $brand = $BRANDS[$Browser]

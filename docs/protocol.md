@@ -662,6 +662,7 @@ is the narrower question of whether repeating is *safe*.
 | `too_large` | line over 8 MiB; connection closed | no |
 | `no_backend` | nothing registered that handles this class, or `prefer` absent | after a backend connects |
 | `no_target` | backend cannot see the requested window | no |
+| `ambiguous_window` | `window` matched windows of more than one application | yes, with a more specific string |
 | `backend_error` | backend failed | broker falls back |
 | `backend_timeout` | backend silent past `timeout_ms` | broker falls back |
 | `stale_id` | element id from a superseded `gen` | re-observe |

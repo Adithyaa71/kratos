@@ -19,14 +19,14 @@ pub const HOST_NAME: &str = "ai.kratos.bridge";
 /// The hives each brand might read, under HKCU.
 ///
 /// More than one per brand on purpose. A release Brave reads its own name, but
-/// the beta and nightly channels read theirs, a plain Chromium build reads
-/// `Software\Chromium`, and Vivaldi and Opera read Chrome's. Writing only the
-/// obvious one produces the worst kind of failure: a registration that works
-/// in the browser you tested and silently does not exist in the next one, with
-/// nothing to see but "Specified native messaging host not found".
+/// the beta and nightly channels read theirs, and a plain Chromium build reads
+/// `Software\Chromium`. Writing only the obvious one produces the worst kind
+/// of failure: a registration that works in the browser you tested and
+/// silently does not exist in the next one, with nothing to see but
+/// "Specified native messaging host not found".
 ///
 /// Writing a key that no browser ever reads costs nothing.
-pub const BRANDS: [(&str, &[&str]); 3] = [
+pub const BRANDS: [(&str, &[&str]); 4] = [
     (
         "brave",
         &[
@@ -44,6 +44,12 @@ pub const BRANDS: [(&str, &[&str]); 3] = [
         ],
     ),
     ("edge", &[r"Software\Microsoft\Edge\NativeMessagingHosts"]),
+    // Vivaldi is Chromium but keeps its own hive, which is easy to miss
+    // because so much else about it reads from Chrome's.
+    (
+        "vivaldi",
+        &[r"Software\Vivaldi\NativeMessagingHosts", r"Software\Chromium\NativeMessagingHosts"],
+    ),
 ];
 
 /// What a registration attempt did, per brand, for display.
@@ -311,11 +317,18 @@ mod tests {
                 all.push(h);
             }
         }
-        let before = all.len();
-        all.sort_unstable();
-        all.dedup();
-        // A hive written twice would report two successes for one key.
-        assert_eq!(all.len(), before, "a hive is listed under two brands");
+        // Overlap between brands is fine and deliberate: more than one build
+        // reads Software\Chromium, and whichever one you register covers the
+        // others. What must not happen is a hive repeated *within* a brand,
+        // because that would write one key twice and report two successes.
+        for (brand, hives) in BRANDS {
+            let mut own: Vec<&str> = hives.to_vec();
+            let before = own.len();
+            own.sort_unstable();
+            own.dedup();
+            assert_eq!(own.len(), before, "{brand} lists a hive twice");
+        }
+        assert!(all.len() >= BRANDS.len());
     }
 
     #[test]
@@ -327,6 +340,9 @@ mod tests {
         assert!(hives.iter().any(|h| h.contains("Brave-Browser-Nightly")));
         let (_, chrome) = BRANDS.iter().find(|(b, _)| *b == "chrome").unwrap();
         assert!(chrome.iter().any(|h| h.contains(r"Software\Chromium")));
+        // Vivaldi keeps its own, which is the one it actually reads.
+        let (_, vivaldi) = BRANDS.iter().find(|(b, _)| *b == "vivaldi").unwrap();
+        assert!(vivaldi.iter().any(|h| h.contains(r"Software\Vivaldi")));
     }
 
     #[test]
