@@ -172,6 +172,16 @@ matters:
 start-my-brave.cmd          # your profile, your logins, your tabs
 ```
 
+A launcher only helps the people who remember to use the launcher, so put the
+flag on the shortcuts you actually click -- Start Menu, taskbar, desktop --
+and opening the browser the normal way loads the bridge:
+
+```bash
+powershell -File install-browser-shortcut.ps1
+```
+
+Idempotent, and `-Undo` strips it back out.
+
 **Why a flag instead of installing it from the extensions page.** An unpacked
 extension installed through `brave://extensions` is recorded in the profile's
 Secure Preferences, and that record can end up damaged -- on one machine here
