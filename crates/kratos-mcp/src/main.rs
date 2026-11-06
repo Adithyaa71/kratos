@@ -73,7 +73,7 @@ impl Shim {
             pipe_base: std::env::var("KRATOS_PIPE").unwrap_or_else(|_| "kratos.v1".to_string()),
             harness: None,
             agent: agent_from_args_or_env(),
-            session: format!("s-{}-{}", std::process::id(), now_ms()),
+            session: next_session_id(),
             name: std::env::var("KRATOS_AGENT_NAME").unwrap_or_else(|_| "mcp-client".to_string()),
             broker: None,
         }
@@ -116,6 +116,23 @@ fn agent_from_args_or_env() -> Option<String> {
         .or_else(|| std::env::var("KRATOS_AGENT").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// A session id that is unique even for two shims in one process.
+///
+/// Process id and a millisecond are not enough: two `Shim::new()` calls in the
+/// same tick produced the same id, which a test caught. One process is one
+/// shim in practice, but an id whose uniqueness depends on that is an id that
+/// is wrong the first time it does not hold.
+fn next_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "s-{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn now_ms() -> u64 {
