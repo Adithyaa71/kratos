@@ -21,7 +21,7 @@ use windows::Storage::Streams::DataWriter;
 use crate::capture::Frame;
 
 /// One run of text, where it is, and how sure the engine was.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Line {
     pub text: String,
     /// `[x, y, w, h]` in physical screen pixels, already offset by the

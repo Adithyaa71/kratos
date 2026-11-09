@@ -10,18 +10,18 @@ Everything below is kratos' own overhead: the MCP shim, the named pipe, the brok
 
 | what | p50 ms | p95 ms | best ms | n | |
 |---|---:|---:|---:|---:|---|
-| mcp tools/list | **0.230** | 0.292 | 0.200 | 9 | 8 tools, answered from a static table |
-| mcp cold, spawn included | **9.30** | 15.3 | 9.19 | 9 | process start + initialize + tools/list |
-| broker cold start | **25.1** | 36.7 | 24.4 | 5 | spawn to first status reply |
-| status round trip | **0.052** | 0.081 | 0.046 | 400 | agent -> pipe -> broker -> agent |
-| log.tail 50 | **0.069** | 0.119 | 0.052 | 100 | journal read over the pipe |
-| connect + handshake | **0.167** | 0.234 | 0.129 | 50 | new client, ACL check, hello/ack |
-| candidate compression | **0.030** | 0.031 | 0.030 | 200 | 64 elements -> options |
-| decide (mock, offline) | **0.076** | 0.085 | 0.072 | 200 | two typed questions, 64 options |
-| gate verdict | **0.005** | 0.006 | 0.004 | 20000 | block, deny, review, brand, rate |
-| screen capture | **32.9** | 33.3 | 24.6 | 20 | 1920x1080 virtual desktop, BitBlt + DIB |
-| full fingerprint | **2.87** | 3.63 | 2.52 | 200 | 64x36 greyscale from the grab |
-| element fingerprint | **0.277** | 0.298 | 0.262 | 200 | 96x96 crop of one control |
+| mcp tools/list | **0.221** | 0.242 | 0.197 | 9 | 8 tools, answered from a static table |
+| mcp cold, spawn included | **10.0** | 15.0 | 9.77 | 9 | process start + initialize + tools/list |
+| broker cold start | **25.9** | 32.8 | 24.3 | 5 | spawn to first status reply |
+| status round trip | **0.068** | 0.103 | 0.052 | 400 | agent -> pipe -> broker -> agent |
+| log.tail 50 | **0.064** | 0.098 | 0.056 | 100 | journal read over the pipe |
+| connect + handshake | **0.210** | 0.256 | 0.171 | 50 | new client, ACL check, hello/ack |
+| candidate compression | **0.031** | 0.032 | 0.029 | 200 | 64 elements -> options |
+| decide (mock, offline) | **0.085** | 0.133 | 0.077 | 200 | two typed questions, 64 options |
+| gate verdict | **0.006** | 0.007 | 0.004 | 20000 | block, deny, review, brand, rate |
+| screen capture | **32.3** | 34.0 | 30.3 | 20 | 1920x1080 virtual desktop, BitBlt + DIB |
+| full fingerprint | **3.23** | 3.66 | 2.89 | 200 | 64x36 greyscale from the grab |
+| element fingerprint | **0.307** | 0.342 | 0.299 | 200 | 96x96 crop of one control |
 
 ## How to read this
 
@@ -46,10 +46,10 @@ cargo run --release -p kratos-native -- --bench "Notepad" "Settings" --out      
 <!-- generated: kratos-native --bench ... --out docs/native-benchmarks.md -->
 | window | elements | cold ms | p50 ms | p90 ms | max ms | of which fetch |
 |---|---:|---:|---:|---:|---:|---:|
-| Notepad | 57 | 50.8 | **31.9** | 33.2 | 35.4 | 31ms |
-| File Explorer | 206 | 85.6 | **80.8** | 146.5 | 196.2 | 78ms |
-| Settings | 128 | 51.7 | **42.9** | 53.7 | 55.4 | 42ms |
-| Example Domain | 129 | 22.1 | **20.7** | 22.8 | 24.3 | 18ms |
+| Notepad | 41 | 70.5 | **25.8** | 27.5 | 34.0 | 25ms |
+| File Explorer | 206 | 97.3 | **81.8** | 86.9 | 93.0 | 80ms |
+| Settings | 128 | 70.5 | **52.9** | 57.4 | 57.9 | 51ms |
+| Example Domain | 129 | 26.0 | **21.1** | 22.7 | 23.5 | 19ms |
 
 One cached fetch per window, 21 runs each, the first reported separately as cold. `fetch` is the single cross-process call; everything else is reading the cache locally, which is why it is the whole cost.
 
@@ -57,12 +57,23 @@ One cached fetch per window, 21 runs each, the first reported separately as cold
 
 | window | size | capture | how | OCR | lines | same frame again |
              |---|---|---:|---|---:|---:|---:|
-| Notepad | 970x1032 | 21ms | printwindow | **43ms** | 37 | 0ms |
-| File Explorer | 1210x735 | 19ms | printwindow | **47ms** | 52 | 0ms |
-| Settings | 1936x1048 | 35ms | printwindow | **66ms** | 59 | 0ms |
-| Example Domain | 1936x1048 | 22ms | printwindow | **92ms** | 33 | 0ms |
+| Notepad | 970x1032 | 25ms | printwindow | **23ms** | 11 | 0ms |
+| File Explorer | 1210x735 | 32ms | printwindow | **50ms** | 53 | 0ms |
+| Settings | 1936x1048 | 24ms | printwindow | **60ms** | 59 | 0ms |
+| Example Domain | 1936x1048 | 33ms | printwindow | **147ms** | 33 | 0ms |
 
 `Windows.Media.Ocr`, which ships with Windows and needs no install, no model              download and no network. Capture is `PrintWindow` with full content, so the answer              is right even when something is on top of the window -- falling back to the screen              for windows that render nothing into a bitmap. The last column is the frame cache:              the same pixels are not read twice.
+
+### Finding the controls nothing declares
+
+| window | icons | lines | fused | of those from pixels | resize | network | same              frame again |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Notepad | 28 | 11 | 28 | 28 | 8ms | **394ms** | 0ms |
+| File Explorer | 84 | 53 | 105 | 84 | 5ms | **376ms** | 0ms |
+| Settings | 57 | 59 | 62 | 57 | 4ms | **364ms** | 0ms |
+| Example Domain | 62 | 33 | 80 | 62 | 6ms | **693ms** | 0ms |
+
+OmniParser v2's icon detector, exported to ONNX, on **CPU**: this machine's              onnxruntime offers no GPU provider, so that is the number there is. The spec's              60ms target is a GPU figure and is not met here and not claimed. `resize` is the              letterbox this code does; `network` is onnxruntime, and the split says which of              the two is worth optimising. The weights are AGPL-3.0 and are not in this              repository -- see docs/pixel-path.md.
 
 The Python backend this replaces read 24 elements in 223ms and 168 in 2.1s on the same machine.
 

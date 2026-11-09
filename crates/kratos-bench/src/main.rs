@@ -263,6 +263,10 @@ fn synthetic_elements(n: usize) -> Vec<Element> {
             container: Some(format!("form:section-{}", i / 8)),
             selector: Some(format!("#section-{} > *:nth-child({})", i / 8, i % 8 + 1)),
             sensitive: false,
+            // A DOM observation is one source, so an element from it carries
+            // no per-element source of its own.
+            source: None,
+            confidence: None,
         })
         .collect()
 }

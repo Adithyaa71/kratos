@@ -50,6 +50,15 @@ pub struct Icon {
 pub struct Detector {
     session: Session,
     pub model: PathBuf,
+    /// The last frame detected, so an unchanged window is not detected
+    /// twice. Four hundred milliseconds of CPU is worth not spending on a
+    /// screen nobody touched.
+    last: Option<(u64, Vec<Icon>)>,
+    /// Where the last detection's time went: the resize this code does,
+    /// against the network onnxruntime runs. Reported because the two have
+    /// completely different fixes.
+    pub prepare_ms: u64,
+    pub infer_ms: u64,
 }
 
 /// Where the weights are, if they are anywhere.
@@ -123,24 +132,42 @@ impl Detector {
         // because the operator set it or because the file is really there.
         std::env::set_var("ORT_DYLIB_PATH", &runtime);
 
+        // Threads, explicitly. onnxruntime defaults to one intra-op thread
+        // when embedded this way, and a 640x640 convolution stack is the
+        // kind of work that divides perfectly: measured 420ms on one thread
+        // against the figure in docs/native-benchmarks.md on this machine.
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let session = Session::builder()
             .map_err(|e| format!("onnxruntime would not start: {e}"))?
+            .with_intra_threads(threads)
+            .map_err(|e| format!("could not set the thread count: {e}"))?
             .commit_from_file(&model)
             .map_err(|e| format!("could not load {}: {e}", model.display()))?;
-        Ok(Detector { session, model })
+        Ok(Detector { session, model, last: None, prepare_ms: 0, infer_ms: 0 })
     }
 
     /// Find the icons in a captured frame.
     pub fn detect(&mut self, frame: &Frame) -> Result<Vec<Icon>, String> {
+        let print = frame.fingerprint();
+        if let Some((seen, icons)) = &self.last {
+            if *seen == print {
+                return Ok(icons.clone());
+            }
+        }
         let letterbox = Letterbox::fit(frame.width as usize, frame.height as usize);
+        let started = std::time::Instant::now();
         let input = letterbox.sample(frame);
+        self.prepare_ms = started.elapsed().as_millis() as u64;
 
+        let started = std::time::Instant::now();
         let tensor = Tensor::from_array(([1usize, 3, SIDE, SIDE], input))
             .map_err(|e| format!("could not build the input tensor: {e}"))?;
         let outputs = self
             .session
             .run(ort::inputs!["images" => tensor])
             .map_err(|e| format!("the detector failed: {e}"))?;
+
+        self.infer_ms = started.elapsed().as_millis() as u64;
 
         let (shape, data) = outputs[0]
             .try_extract_tensor::<f32>()
@@ -166,7 +193,9 @@ impl Detector {
         }
 
         found.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(suppress(found))
+        let kept = suppress(found);
+        self.last = Some((print, kept.clone()));
+        Ok(kept)
     }
 }
 

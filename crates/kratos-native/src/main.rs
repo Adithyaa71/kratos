@@ -15,11 +15,8 @@
 
 mod act;
 mod capture;
-// Built and tested, not yet wired: the fusion pass that reads it is the
-// other half of P4d. Everything in here is exercised by its own tests and by
-// the live probe below, so it is dead only to the backend loop.
-#[allow(dead_code)]
 mod detect;
+mod fuse;
 mod input;
 mod ocr;
 mod uia;
@@ -50,6 +47,7 @@ fn main() {
         Some("--bench") => bench(&args[1..]),
         Some("--dump") => dump(args.get(1).map(String::as_str)),
         Some("--ocr") => read_pixels(args.get(1).map(String::as_str)),
+        Some("--pixels") => probe_pixels(args.get(1).map(String::as_str)),
         _ => runtime.block_on(serve()),
     }
 }
@@ -76,7 +74,20 @@ async fn serve() {
     // is also what lets the broker fall back from one to the other, and what
     // lets an operator turn one off in `backends.enabled` without losing the
     // other.
-    let reader = Reader { uia, ocr: ocr::Ocr::new().ok().map(Arc::new) };
+    let detector = match detect::Detector::load() {
+        Ok(d) => {
+            eprintln!("kratos-native: icon detector from {}", d.model.display());
+            Some(Arc::new(std::sync::Mutex::new(d)))
+        }
+        Err(why) => {
+            // Not a failure. The weights are AGPL and not shipped, and a
+            // machine without them has exactly the perception it had before
+            // the detector existed.
+            eprintln!("kratos-native: no icon detector ({why})");
+            None
+        }
+    };
+    let reader = Reader { uia, ocr: ocr::Ocr::new().ok().map(Arc::new), detector };
     match &reader.ocr {
         Some(_) => eprintln!("kratos-native: OCR languages: {:?}", ocr::Ocr::languages()),
         None => eprintln!(
@@ -86,7 +97,7 @@ async fn serve() {
     let reader = Arc::new(reader);
 
     let mut sources = Vec::new();
-    for source in ["uia", "ocr"] {
+    for source in ["uia", "ocr", "pixel"] {
         let pipe = pipe.clone();
         let reader = reader.clone();
         sources.push(tokio::spawn(async move { attach(pipe, source, reader).await }));
@@ -102,6 +113,68 @@ struct Reader {
     /// `None` on a machine with no OCR language pack, which is a real
     /// configuration and not a reason to refuse to start.
     ocr: Option<Arc<ocr::Ocr>>,
+    /// `None` until somebody puts the AGPL weights where they can be found.
+    ///
+    /// Behind a mutex because an onnxruntime session is not re-entrant and
+    /// three source connections share this one: two detections at once would
+    /// be two threads in the same session.
+    detector: Option<Arc<std::sync::Mutex<detect::Detector>>>,
+}
+
+impl Reader {
+    /// Capture a window, find its icons and read its text.
+    ///
+    /// Returns what each source found, and how long each took, so a caller
+    /// can report the split rather than one total.
+    fn look(&self, hwnd: isize) -> Result<Seen, String> {
+        let frame = capture::window(hwnd)?;
+        let capture_ms = frame.took_ms;
+
+        let started = std::time::Instant::now();
+        let (icons, prepare_ms, infer_ms) = match &self.detector {
+            Some(d) => match d.lock() {
+                Ok(mut d) => {
+                    let icons = d.detect(&frame)?;
+                    (icons, d.prepare_ms, d.infer_ms)
+                }
+                Err(_) => return Err("the detector panicked on an earlier call".into()),
+            },
+            None => (Vec::new(), 0, 0),
+        };
+        let detect_ms = started.elapsed().as_millis() as u64;
+
+        let reading = match &self.ocr {
+            Some(engine) => engine.read(&frame)?,
+            None => ocr::Reading::default(),
+        };
+
+        Ok(Seen {
+            window: window::title(hwnd),
+            capture_ms,
+            detect_ms,
+            prepare_ms,
+            infer_ms,
+            ocr_ms: reading.took_ms,
+            cached: reading.cached,
+            lines: reading.lines,
+            icons,
+        })
+    }
+}
+
+/// What the pixels said.
+struct Seen {
+    window: String,
+    capture_ms: u64,
+    detect_ms: u64,
+    /// The resize, and the network: the detector's two halves have different
+    /// fixes, so they are reported apart.
+    prepare_ms: u64,
+    infer_ms: u64,
+    ocr_ms: u64,
+    cached: bool,
+    lines: Vec<ocr::Line>,
+    icons: Vec<detect::Icon>,
 }
 
 async fn attach(pipe: String, source: &'static str, reader: Arc<Reader>) {
@@ -178,7 +251,11 @@ fn act(
     if source != "uia" {
         return Err(WireError::new(
             codes::BACKEND_ERROR,
-            "the ocr source reads pixels; it has nothing to press them with",
+            format!(
+                "the {source} source reads pixels; it has nothing to press them with. A box \
+                 found in an image is somewhere to click, and the broker's own fallback is what \
+                 turns that into a click"
+            ),
         ));
     }
     let req: kratos_protocol::BackendActReq = serde_json::from_value(payload.clone())
@@ -263,18 +340,95 @@ fn observe(
 
     match source {
         "ocr" => observe_by_eye(reader, hwnd),
+        "pixel" => observe_by_pixels(reader, hwnd),
         _ => observe_by_tree(reader, hwnd),
     }
 }
 
+/// The pixel path: what is on the screen, with the controls found as well as
+/// the words.
+///
+/// Fused even though there is no tree to fuse with, because the detector and
+/// OCR overlap each other: an icon with a caption on it is one element, and
+/// reporting the box and the words separately would hand the decision model
+/// two halves of the same button.
+fn observe_by_pixels(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, WireError> {
+    if reader.detector.is_none() && reader.ocr.is_none() {
+        return Err(WireError::new(
+            codes::BACKEND_ERROR,
+            "this machine has neither an icon detector nor an OCR language pack, so there is \
+             nothing to read pixels with",
+        ));
+    }
+    let seen = reader.look(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+    let fused = fuse::fuse(Vec::new(), &seen.lines, &seen.icons);
+    Ok(reply(&seen, fused, "pixel"))
+}
+
+/// What came back, with the cost of each source named separately.
+fn reply(seen: &Seen, elements: Vec<kratos_protocol::Element>, how: &str) -> serde_json::Value {
+    json!({
+        "window": seen.window,
+        "url": null,
+        "elements": elements,
+        "truncated": false,
+        "took_ms": seen.capture_ms + seen.detect_ms + seen.ocr_ms,
+        "segments": {
+            "capture_ms": seen.capture_ms,
+            "detect_ms": seen.detect_ms,
+            "detect_resize_ms": seen.prepare_ms,
+            "detect_net_ms": seen.infer_ms,
+            "ocr_ms": seen.ocr_ms,
+            "cached": seen.cached,
+        },
+        "fused": how,
+    })
+}
+
 fn observe_by_tree(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, WireError> {
     let obs = reader.uia.observe(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+    let elements: Vec<kratos_protocol::Element> = obs
+        .elements
+        .iter()
+        .map(|e| kratos_protocol::Element {
+            id: e.id.clone(),
+            role: e.role.clone(),
+            label: e.label.clone(),
+            value: e.value.clone(),
+            enabled: e.enabled,
+            bbox: e.bbox,
+            container: e.container.clone(),
+            selector: None,
+            sensitive: e.sensitive,
+            source: Some("uia".to_string()),
+            confidence: None,
+        })
+        .collect();
+
+    // A window whose tree holds two things or fewer is a window the
+    // accessibility layer cannot describe -- a canvas app, a remote desktop,
+    // a game. Taking "there is nothing here" at face value is how an agent
+    // concludes a screen is empty when it is full, so the pixels are read
+    // without being asked.
+    if fuse::is_sparse(&elements) && (reader.detector.is_some() || reader.ocr.is_some()) {
+        if let Ok(seen) = reader.look(hwnd) {
+            let fused = fuse::fuse(elements, &seen.lines, &seen.icons);
+            let mut out = reply(&seen, fused, "uia+pixel");
+            out["took_ms"] = json!(
+                obs.fetch_ms + obs.walk_ms + seen.capture_ms + seen.detect_ms + seen.ocr_ms
+            );
+            out["window"] = json!(if obs.window.is_empty() { seen.window.clone() } else { obs.window });
+            return Ok(out);
+        }
+    }
+
     Ok(json!({
         "window": obs.window,
         "url": null,
-        "elements": obs.elements,
+        "elements": elements,
         "truncated": obs.truncated,
         "took_ms": obs.fetch_ms + obs.walk_ms,
+        "fused": "uia",
     }))
 }
 
@@ -415,11 +569,17 @@ fn bench(args: &[String]) {
         if windows.is_empty() { vec![None] } else { windows.iter().map(|w| Some(*w)).collect() };
 
     // The OCR engine is built once: creating it per window costs more than
-    // reading one.
+    // reading one. The detector likewise -- loading 77MB of weights per
+    // window would be the measurement.
     let engine = ocr::Ocr::new().ok();
+    let detector = detect::Detector::load().ok().map(|d| Arc::new(std::sync::Mutex::new(d)));
+    if detector.is_none() {
+        eprintln!("no icon detector; the pixel table will be left out");
+    }
 
     let mut rows = Vec::new();
     let mut eyes = Vec::new();
+    let mut pixels = Vec::new();
     for want in targets {
         let Some(hwnd) = window::find(want) else {
             eprintln!("no window matches {want:?}; skipping");
@@ -433,6 +593,21 @@ fn bench(args: &[String]) {
                     e.window, e.width, e.height, e.capture, e.ocr, e.lines, e.cached
                 );
                 eyes.push(e);
+            }
+        }
+        if let (Some(engine), Some(detector)) = (&engine, &detector) {
+            let reader = Reader {
+                uia: uia.clone(),
+                ocr: Some(Arc::new(ocr::Ocr::new().unwrap_or_else(|_| engine_clone(engine)))),
+                detector: Some(detector.clone()),
+            };
+            if let Some(p) = measure_pixels(&reader, hwnd, want) {
+                println!(
+                    "{:<34} {:>3} icons {:>3} lines {:>3} fused   resize {:>2}ms   net {:>4}ms   \
+                     again {}ms",
+                    p.window, p.icons, p.lines, p.fused, p.resize, p.net, p.again
+                );
+                pixels.push(p);
             }
         }
         match measure(&uia, hwnd, want) {
@@ -449,7 +624,7 @@ fn bench(args: &[String]) {
     }
 
     if let Some(path) = out {
-        let doc = report(&rows, &eyes);
+        let doc = report(&rows, &eyes, &pixels);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -559,7 +734,48 @@ fn measure_ocr(engine: &ocr::Ocr, hwnd: isize, label: Option<&str>) -> Option<Ey
     })
 }
 
-fn report(rows: &[Row], eyes: &[Eye]) -> String {
+struct Pixels {
+    window: String,
+    icons: usize,
+    lines: usize,
+    fused: usize,
+    from_pixels: usize,
+    resize: u64,
+    net: u64,
+    /// The same frame again: the detector's own cache.
+    again: u64,
+}
+
+/// The whole pixel path, twice, so the cache is visible.
+fn measure_pixels(reader: &Reader, hwnd: isize, label: Option<&str>) -> Option<Pixels> {
+    let first = reader.look(hwnd).ok()?;
+    let fused = fuse::fuse(Vec::new(), &first.lines, &first.icons);
+    let from_pixels = fused
+        .iter()
+        .filter(|e| e.source.as_deref().is_some_and(|s| s.starts_with("pixel")))
+        .count();
+    let second = reader.look(hwnd).ok()?;
+    Some(Pixels {
+        window: label.unwrap_or("the window in front").to_string(),
+        icons: first.icons.len(),
+        lines: first.lines.len(),
+        fused: fused.len(),
+        from_pixels,
+        resize: first.prepare_ms,
+        net: first.infer_ms,
+        again: second.detect_ms,
+    })
+}
+
+/// A second OCR engine, for the benchmark's own reader.
+///
+/// `Ocr` holds a frame cache, and sharing the one the eye-table used would
+/// make the pixel table's first read look cached.
+fn engine_clone(_existing: &ocr::Ocr) -> ocr::Ocr {
+    ocr::Ocr::new().expect("an engine existed a moment ago")
+}
+
+fn report(rows: &[Row], eyes: &[Eye], pixels: &[Pixels]) -> String {
     let mut s = String::new();
     s.push_str("<!-- generated: kratos-native --bench ... --out docs/native-benchmarks.md -->\n");
     s.push_str("| window | elements | cold ms | p50 ms | p90 ms | max ms | of which fetch |\n");
@@ -602,6 +818,29 @@ fn report(rows: &[Row], eyes: &[Eye]) -> String {
         }
         s.push_str(
             "\n`Windows.Media.Ocr`, which ships with Windows and needs no install, no model              download and no network. Capture is `PrintWindow` with full content, so the answer              is right even when something is on top of the window -- falling back to the screen              for windows that render nothing into a bitmap. The last column is the frame cache:              the same pixels are not read twice.\n",
+        );
+    }
+
+    if !pixels.is_empty() {
+        s.push_str("\n### Finding the controls nothing declares\n\n");
+        s.push_str(
+            "| window | icons | lines | fused | of those from pixels | resize | network | same              frame again |\n|---|---:|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for p in pixels {
+            s.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {}ms | **{}ms** | {}ms |\n",
+                p.window.replace('|', "/"),
+                p.icons,
+                p.lines,
+                p.fused,
+                p.from_pixels,
+                p.resize,
+                p.net,
+                p.again
+            ));
+        }
+        s.push_str(
+            "\nOmniParser v2's icon detector, exported to ONNX, on **CPU**: this machine's              onnxruntime offers no GPU provider, so that is the number there is. The spec's              60ms target is a GPU figure and is not met here and not claimed. `resize` is the              letterbox this code does; `network` is onnxruntime, and the split says which of              the two is worth optimising. The weights are AGPL-3.0 and are not in this              repository -- see docs/pixel-path.md.\n",
         );
     }
     s
@@ -651,6 +890,78 @@ fn read_pixels(window: Option<&str>) {
             }
             Err(e) => {
                 eprintln!("ocr failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Run the whole pixel path against a window and print what each part cost.
+///
+/// The detector has no benchmark of its own because it is never the whole
+/// answer: what an agent waits for is capture plus detection plus OCR plus
+/// the fuse, and reporting one of those would flatter it.
+fn probe_pixels(window: Option<&str>) {
+    let Some(hwnd) = window::find(window) else {
+        eprintln!("no window matches {window:?}");
+        std::process::exit(1);
+    };
+    let detector = match detect::Detector::load() {
+        Ok(d) => {
+            println!("detector {}", d.model.display());
+            Some(Arc::new(std::sync::Mutex::new(d)))
+        }
+        Err(e) => {
+            println!("no detector: {e}");
+            None
+        }
+    };
+    let reader = Reader { uia: match uia::Uia::start() {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("kratos-native: {e}");
+                std::process::exit(1);
+            }
+        },
+        ocr: ocr::Ocr::new().ok().map(Arc::new),
+        detector,
+    };
+
+    for pass in 1..=3 {
+        match reader.look(hwnd) {
+            Ok(seen) => {
+                let fused = fuse::fuse(Vec::new(), &seen.lines, &seen.icons);
+                let pixel_only = fused
+                    .iter()
+                    .filter(|e| e.source.as_deref().is_some_and(|s| s.starts_with("pixel")))
+                    .count();
+                println!(
+                    "pass {pass}: capture {}ms  detect {}ms (resize {}ms + net {}ms)  ocr                      {}ms{}  ->  {} icons, {} lines, {} fused ({} from pixels)",
+                    seen.capture_ms,
+                    seen.detect_ms,
+                    seen.prepare_ms,
+                    seen.infer_ms,
+                    seen.ocr_ms,
+                    if seen.cached { " (cached)" } else { "" },
+                    seen.icons.len(),
+                    seen.lines.len(),
+                    fused.len(),
+                    pixel_only
+                );
+                if pass == 1 {
+                    for e in fused.iter().take(6) {
+                        println!(
+                            "   {:<10} {:<8} {:?} {:?}",
+                            e.source.as_deref().unwrap_or("?"),
+                            e.role,
+                            e.label,
+                            e.bbox.unwrap_or_default()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("failed: {e}");
                 std::process::exit(1);
             }
         }

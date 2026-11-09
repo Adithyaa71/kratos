@@ -5,54 +5,107 @@ Newest phase first.
 
 ---
 
-## P4d — pixel path (**in progress, stopped part-way**)
-
-Stopped here when the session ran out, with the detector built and the fusion
-not written. What is committed compiles, is unit-tested and is **not wired
-into the backend loop** — `mod detect` carries an `#[allow(dead_code)]` saying
-exactly that.
+## P4d — the pixel path and fusion
 
 ### Done
 
-* **The weights are on this machine.** OmniParser v2's icon detector, the
-  community ONNX export (`onnx-community/OmniParser-v2.0_icon_detect`), 77MB,
-  **AGPL-3.0**, downloaded to `models/omniparser/icon_detect.onnx` — which is
-  **gitignored**, as the spec requires. Model shape confirmed:
-  input `images [1,3,640,640] f32`, output `output0 [1,5,8400]`, a
-  single-class YOLOv8 head (centre x, centre y, w, h, score).
-* **`detect.rs`**: loading, letterbox preprocessing (bilinear, because the
+* **The icon detector runs.** OmniParser v2's icon detector, the community
+  ONNX export, loaded through `ort` with `load-dynamic` and nothing else:
+  its default features download an onnxruntime build during `cargo build`,
+  which puts a network fetch in the build and a binary nobody audited in the
+  tree. This loads a library the machine already has.
+* **Preprocessing, decode, suppression**: letterbox (bilinear, because the
   things being found are twelve pixels across and a nearest-neighbour
   downsample of a 1920-wide window drops every other row of a toolbar icon),
-  YOLOv8 decode, non-maximum suppression, and mapping boxes back to screen
-  coordinates offset by the window origin.
-* **`ort` with `load-dynamic` and nothing else.** Its default features
-  download an onnxruntime build during `cargo build`, which puts a network
-  fetch in the build and a binary of somebody else's choosing in the tree.
-  This loads a library the machine already has, named by `ORT_DYLIB_PATH` or
-  found beside the executable. This machine has onnxruntime 1.27.0 with the
-  CPU provider only, so CPU is what can be measured here.
-* Five unit tests: the letterbox maths both ways, IoU, suppression keeping
-  the best of a cluster, and a missing model being explained rather than
-  panicking.
+  YOLOv8 single-class decode, non-maximum suppression at IoU 0.45, boxes
+  mapped back to screen coordinates offset by the window origin.
+* **The detector caches its last frame**, against the same pixel hash the OCR
+  engine uses. Four hundred milliseconds of CPU is worth not spending on a
+  screen nobody touched, and an agent looks at the same screen repeatedly.
+* **Fusion** (`fuse.rs`): UI Automation leads; OCR text and detector boxes are
+  added only where the tree has nothing. Overlap above 0.5 means one element
+  and the tree's answer wins, because it has a role, a name, a container and a
+  value. Every element carries `source` — `uia`, `ocr`, `pixel`,
+  `pixel+ocr` — and a `confidence` only where something measured one.
+* **A sparse tree runs the pixel path unasked.** Two elements or fewer is not
+  a tree: a canvas app reports its own window and perhaps a scroll bar, and
+  taking that at face value is how an agent concludes a screen is empty when
+  it is full.
+* `Element.source` and `Element.confidence` added to the protocol, both
+  optional.
+* The backend now attaches as three sources: `uia`, `ocr`, `pixel`.
+* `docs/pixel-path.md`: what it is, why the weights and the runtime are not
+  included, how to add them, both off switches, and what it costs.
 
-### Not done
+### Evidence
 
-* **Fusion.** UIA first, OCR text and detector boxes added where UIA has
-  none, IoU > 0.5 meaning the same element, UIA winning label and role, every
-  element carrying its source(s) and confidence, and the automatic pixel pass
-  when the tree is sparse. None of it is written.
-* **`Element.source` and `Element.confidence`** do not exist in the protocol
-  yet; fusion needs them and they are additive.
-* **No detector run, ever.** The model has been loaded by Python to read its
-  shape and by nothing else. There is no timing, no accuracy number, and no
-  claim about either — the spec's detector target (≤60ms on GPU, CPU figures
-  too) is unmeasured.
-* The caption model (Florence-2, on demand, cached by crop hash) is not
-  started.
-* `docs/` says nothing yet about the AGPL weights or how to obtain them. That
-  must land with the rest of P4d.
+Live, this machine, four real windows (`docs/native-benchmarks.md`):
 
----
+```text
+| window         | icons | lines | fused | from pixels | resize | network | again |
+| File Explorer  |    84 |    53 |   105 |          84 |    5ms |   376ms |   0ms |
+| Settings       |    57 |    59 |    62 |          57 |    4ms |   364ms |   0ms |
+| Example Domain |    62 |    33 |    80 |          62 |    6ms |   693ms |   0ms |
+```
+
+**The split is the finding.** The letterbox this code does costs 4–6ms; the
+network costs 360–700ms. There is nothing in this code to optimise —
+it is the model on a CPU.
+
+```text
+cargo test --workspace     395 passed; 0 failed; 0 ignored
+cargo clippy --workspace --all-targets     0 warnings
+```
+
+Seven fusion unit tests pin the rules that are easy to get wrong: the tree
+winning where it has an answer, a detector-only control being kept with no
+invented label, an icon taking the caption that is *on* it, a caption merely
+*near* an icon not becoming its name, text with nothing under it being
+reported, what counts as sparse, and every element naming its source.
+
+### Decisions
+
+* **Containment, not overlap, for text.** A "Send" label inside a Send button
+  covers 0.29 of it, so an overlap test alone reported the word as an element
+  of its own and the decision model got the button twice. Caught by the first
+  fusion test written. Text is small and controls are not: what matters is
+  whether the words are *on* something.
+* **An unlabelled icon gets role `image` and an empty label**, not `button`
+  and a guess. Nobody knows what it is yet, and the caption model that would
+  is not built.
+* **The 60ms detector target is not met and not claimed.** It is a GPU figure
+  in the design document, and this machine's onnxruntime offers
+  `CPUExecutionProvider` and `AzureExecutionProvider` and no GPU provider. The
+  CPU number is reported instead, which is what the spec also asks for.
+* **Threading the session changed nothing** — 420ms before and after
+  `with_intra_threads(6)` — so the measurement was split into resize and
+  network to find out why, and the answer is that the network is simply this
+  expensive at fp32 on a CPU.
+* **The switch is two switches**, and both are the operator's: the weights not
+  being on disk, and `"pixel"` not being in `backends.enabled`. The spec asks
+  for a config switch; routing is where this build already has one, and the
+  AGPL half is answered by the file simply not being there.
+
+### Known gaps
+
+* **No accuracy numbers.** Recall, label exactness and bbox IoU against a
+  golden element list need a corpus that can be committed, and a UIA dump or
+  a screenshot of this machine is a picture of somebody's screen. What exists
+  is the structural check against a locally generated corpus, the per-source
+  element counts above, and fusion rules pinned by unit tests. The spec's "a
+  regression fails CI" needs a corpus built from applications a CI machine can
+  open for itself — which is P7's problem and is written down there.
+* **No captions.** Florence-2 on demand, cached by crop hash, is in the design
+  and not built.
+* **The detector is not wired into actuation.** A box found in an image is
+  somewhere to click, and the broker's own physical fallback is what would
+  turn that into a click; the `pixel` source refuses `backend.act` by name so
+  the fall-through happens.
+* **84 icons in File Explorer against 206 UIA elements** is not obviously
+  right or wrong without a golden list. The fusion keeps all 84 because
+  nothing in the tree covered them, which may mean the detector is finding
+  real controls UIA hides, or may mean it is finding file thumbnails. This is
+  exactly what the accuracy corpus is for.
 
 ## P4c — actuation
 

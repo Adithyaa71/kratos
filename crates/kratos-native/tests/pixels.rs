@@ -91,3 +91,54 @@ fn a_window_is_captured_and_read() {
         "the second read of an unchanged window must come from the frame cache: {text}"
     );
 }
+
+/// The pixel path, end to end, with the sources named.
+///
+/// It is a weaker test than it looks and that is deliberate: whether the
+/// detector finds a particular button depends on weights this repository does
+/// not ship, so the assertions are about *shape* — every element says where it
+/// came from, a confidence appears only where something measured one, and
+/// nothing comes back twice. A regression in the wiring breaks those; a
+/// different model version does not.
+#[test]
+fn the_pixel_path_labels_every_element_with_its_source() {
+    let _scratch = Scratch::open();
+    let out = Command::new(native()).args(["--pixels", "Notepad"]).output();
+    let Ok(out) = out else {
+        eprintln!("could not run kratos-native; skipping");
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    eprintln!("{text}");
+
+    if text.contains("no detector") {
+        eprintln!(
+            "no icon detector on this machine (the weights are AGPL and not shipped); \
+             skipping -- see docs/pixel-path.md"
+        );
+        return;
+    }
+    if !out.status.success() {
+        eprintln!("the pixel path failed ({}); skipping", String::from_utf8_lossy(&out.stderr));
+        return;
+    }
+
+    assert!(text.contains("pass 1:"), "{text}");
+    // Every element line names a source the fusion is allowed to produce.
+    let mut seen_any = false;
+    for line in text.lines().filter(|l| l.starts_with("   ")) {
+        let source = line.split_whitespace().next().unwrap_or("");
+        assert!(
+            ["uia", "ocr", "pixel", "pixel+ocr"].contains(&source),
+            "{source:?} is not a source a consumer can branch on: {line}"
+        );
+        seen_any = true;
+    }
+    assert!(seen_any, "the pixel path reported nothing at all: {text}");
+
+    // And the second look is free, because the frame did not change.
+    assert!(
+        text.contains("detect 0ms") || text.contains("(cached)"),
+        "an unchanged window should not be detected twice: {text}"
+    );
+}

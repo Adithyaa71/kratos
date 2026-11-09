@@ -685,6 +685,23 @@ pub struct Element {
     /// Set by a backend when the control masks input, so the journal redacts.
     #[serde(default)]
     pub sensitive: bool,
+    /// Which source or sources this element came from: `uia`, `ocr`,
+    /// `pixel`, or several joined with `+` when a fusion pass decided two
+    /// sightings were the same thing.
+    ///
+    /// Per element, not per observation, because a fused observation is a
+    /// mixture: a toolbar can have UIA controls next to icons only the
+    /// detector found, and a decision model choosing between them deserves
+    /// to know which is which. Absent means the observation's own `source`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// How sure the source is that this is an element at all, 0 to 1.
+    ///
+    /// A detector reports its score; UI Automation reports nothing, because
+    /// a control either is in the tree or is not, and inventing 1.0 for it
+    /// would put a number next to something that was never measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 fn yes() -> bool {
@@ -711,6 +728,8 @@ impl Default for Element {
             container: None,
             selector: None,
             sensitive: false,
+            source: None,
+            confidence: None,
         }
     }
 }
