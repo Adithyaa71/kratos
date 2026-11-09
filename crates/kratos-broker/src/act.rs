@@ -106,6 +106,7 @@ async fn observe_with_fallback(
     window: Option<&str>,
     timeout: Duration,
     dom: crate::target::Dom<'_>,
+    hwnd: Option<i64>,
 ) -> Result<(String, BackendObservation), WireError> {
     let order = broker.route(class, prefer).await;
     if order.is_empty() {
@@ -125,7 +126,8 @@ async fn observe_with_fallback(
         chain.push(source.as_str());
         let Some(backend) = pick(broker, source, dom).await else { continue };
         let payload = json!({
-            "window": window, "class": class.as_str(), "timeout_ms": timeout.as_millis() as u64
+            "window": window, "class": class.as_str(),
+            "timeout_ms": timeout.as_millis() as u64, "hwnd": hwnd
         });
         match call_backend(&backend, kratos_protocol::ops::BACKEND_OBSERVE, payload, timeout).await {
             Ok(v) => match serde_json::from_value::<BackendObservation>(v) {
@@ -319,6 +321,7 @@ pub async fn observe(
         aim.backend_window.as_deref(),
         Duration::from_millis(req.timeout_ms),
         aim.dom(),
+        aim.window.as_ref().map(|w| w.hwnd as i64),
     )
     .await?;
 
@@ -693,6 +696,7 @@ async fn act_inner(
         aim.backend_window.as_deref(),
         Duration::from_millis(req.timeout_ms.min(10_000)),
         aim.dom(),
+        aim.window.as_ref().map(|w| w.hwnd as i64),
     )
     .await;
     let (obs_source, before) = match before_obs {
@@ -1110,6 +1114,7 @@ async fn act_inner(
         aim.backend_window.as_deref(),
         Duration::from_millis(8_000),
         aim.dom(),
+        aim.window.as_ref().map(|w| w.hwnd as i64),
     )
     .await
     .map(|(_, o)| o)
@@ -1344,6 +1349,7 @@ pub async fn verify(
         aim.backend_window.as_deref(),
         Duration::from_millis(8_000),
         aim.dom(),
+        aim.window.as_ref().map(|w| w.hwnd as i64),
     )
     .await?;
 

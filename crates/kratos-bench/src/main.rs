@@ -111,6 +111,18 @@ impl Rig {
             "decider": {"provider": "mock", "model": "bench"},
             "kill": {"hotkey": "ctrl+alt+shift+f24", "hotkey_scope": "global"},
             "gate": {"rate_limit_per_minute": 100000, "confirm_ttl_ms": 60000},
+            // The benchmark is not a new client asking for permission: an
+            // unapproved harness may call status and whoami and nothing else,
+            // and the approval is a dialog no benchmark can click.
+            "harnesses": [
+                {"id": "bench", "approved": true},
+                {"id": "bench-hs", "approved": true},
+                {"id": "mcp-client", "approved": true},
+            ],
+            // No browser lanes: this measures the broker's own overhead, and
+            // a lane would make these numbers depend on which browser the
+            // machine has open.
+            "defaults": {"browser": "none"},
             "thresholds": {"default": 0.0}
         }))
         .unwrap();
@@ -547,6 +559,12 @@ fn render(rows: &[Row], notes: &[String]) -> String {
 /// something to someone who did not run it.
 fn document(table: &str) -> String {
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+    // Written by `kratos-native --bench --out`, inlined here so regenerating
+    // this file does not silently drop the live half of the story. Absent is
+    // fine: a machine that has never run it says so instead of pretending.
+    let native = std::fs::read_to_string("docs/native-benchmarks.md").unwrap_or_else(|_| {
+        "_No native measurements on this machine yet. Run the command above._\n".to_string()
+    });
     format!(
         "# Benchmarks\n\n\
          Reproduce, on your machine, in one command:\n\n\
@@ -573,10 +591,19 @@ fn document(table: &str) -> String {
          **Screen capture is one grab of the whole virtual desktop, cropped twice.** An earlier \
          build took eight separate grabs per action; both rectangles now come out of one, which \
          is where 407ms became 100ms.\n\n\
+         ## Native perception, measured live\n\n\
+         Not reproducible the way everything above is: these depend on which windows are open \
+         and what is in them. They are here because the claim that matters about          `kratos-native` -- one cached fetch per window instead of a call per property -- is          only meaningful against real applications.\n\n\
+         ```bash\n\
+         cargo run --release -p kratos-native -- --bench \"Notepad\" \"Settings\" --out          docs/native-benchmarks.md\n\
+         ```\n\n\
+         {native}\n\
+         The Python backend this replaces read 24 elements in 223ms and 168 in 2.1s on the same \
+         machine.\n\n\
          ## What is not here\n\n\
-         The decision model's round trip (70-500ms, somebody else's hardware) and the perception \
-         backends (a separate process, a separate language). Those are reported in the README as \
-         observations from a live desktop, which is what they are -- not benchmarks.\n\n\
+         The decision model's round trip (70-500ms, somebody else's hardware). It is reported in \
+         the README as an observation from a live desktop, which is what it is -- not a \
+         benchmark.\n\n\
          ---\n\n\
          Machine: Windows, {cpus} logical cores, release profile (fat LTO, one codegen unit). \
          Percentiles are nearest-rank: no interpolation, so every figure is a sample that was \

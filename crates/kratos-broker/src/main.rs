@@ -13,6 +13,7 @@ mod classify;
 mod diff;
 mod hotkey;
 mod journal;
+mod native;
 mod lane;
 mod peer;
 mod seal;
@@ -130,6 +131,7 @@ async fn run() -> Result<(), String> {
         activity::watch();
     }
 
+    let spawn_native = config.backends.spawn_native;
     let api_key = seal::read_key(&config.decider.api_key_enc);
     let hotkey_spec = config.kill.hotkey.clone();
     let hotkey_scope = config.kill.hotkey_scope.clone();
@@ -165,6 +167,11 @@ async fn run() -> Result<(), String> {
                     .await;
             }
         });
+    }
+
+    // -- the native backend -------------------------------------------------
+    if spawn_native {
+        native::supervise(broker.clone(), pipe_base.clone());
     }
 
     // -- idle watchdog ------------------------------------------------------

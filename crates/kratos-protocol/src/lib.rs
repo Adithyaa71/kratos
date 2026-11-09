@@ -1113,6 +1113,16 @@ pub struct BackendObserveReq {
     pub class: String,
     #[serde(default = "default_observe_timeout")]
     pub timeout_ms: u64,
+    /// The window the broker already resolved, when it resolved one.
+    ///
+    /// The broker matches `window` against the real desktop before routing,
+    /// so sending only the string asks the backend to repeat a search that
+    /// can come out differently -- two windows of one application share a
+    /// title often enough. Saying which one costs an integer. Optional: a
+    /// backend that does not know the field keeps matching by title, which is
+    /// what every backend did before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hwnd: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

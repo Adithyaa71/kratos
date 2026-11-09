@@ -9,6 +9,7 @@ members = [
     "crates/kratos-broker",
     "crates/kratos-mcp",
     "crates/kratos-host",
+    "crates/kratos-native",
     "crates/kratos-ui",
     "crates/kratos-bench",
 ]

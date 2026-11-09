@@ -297,6 +297,28 @@ mod tests {
         );
     }
 
+    /// Installing the hooks is on the broker's startup path, which an agent
+    /// waits through on its first tool call.
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn watching_the_user_costs_nothing_to_start() {
+        let _g = ORDER.lock().await;
+        let started = std::time::Instant::now();
+        watch();
+        for _ in 0..200 {
+            if watching() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let took = started.elapsed();
+        eprintln!("hooks installed in {took:?} (watching={})", watching());
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "the broker is spawned on an agent's first call and this is on that path: {took:?}"
+        );
+    }
+
     #[tokio::test]
     async fn an_action_proceeds_once_the_user_stops() {
         let _g = ORDER.lock().await;

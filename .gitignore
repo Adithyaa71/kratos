@@ -35,3 +35,13 @@ native-host.json
 
 # Working material for the README: renders, frames, samples.
 /draft/
+
+# The accuracy corpus is a picture of the operator's own screen.
+#
+# A UIA dump carries what is on it: the file open in Notepad, the names of
+# the files in a folder, the subject lines in a mail client. Useful to
+# measure against, not something to commit to a repository -- so the corpus
+# is generated locally and the harness skips what is not there.
+#
+#   cargo run --release -p kratos-native -- --dump "Notepad" > fixtures/uia/notepad.json
+/fixtures/uia/

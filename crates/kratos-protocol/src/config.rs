@@ -411,11 +411,21 @@ fn strs(v: &[&str]) -> Vec<String> {
 #[serde(default)]
 pub struct Backends {
     pub enabled: Vec<String>,
+    /// Start `kratos-native.exe` with the broker.
+    ///
+    /// Off until it is at parity with the Python backend it replaces. Both
+    /// register as `uia`, and one registration per source means the newer
+    /// one wins -- so turning this on while the Python backend is running
+    /// displaces it, which is a decision for the operator and not a default.
+    pub spawn_native: bool,
 }
 
 impl Default for Backends {
     fn default() -> Self {
-        Backends { enabled: strs(&["dom-ext", "uia", "pixel", "ocr"]) }
+        Backends {
+            enabled: strs(&["dom-ext", "uia", "pixel", "ocr"]),
+            spawn_native: false,
+        }
     }
 }
 

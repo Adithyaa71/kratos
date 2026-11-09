@@ -1,0 +1,28 @@
+[package]
+name = "kratos-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native perception and actuation in Rust: UI Automation, capture, OCR, pixels."
+
+[dependencies]
+kratos-protocol = { workspace = true }
+kratos-ipc = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# UI Automation is COM, so this is the `windows` crate rather than
+# `windows-sys`: the interfaces, not just the function signatures.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    # VARIANT itself is gated on Ole as well as Com.
+    "Win32_System_Ole",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+]

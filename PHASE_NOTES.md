@@ -5,6 +5,111 @@ Newest phase first.
 
 ---
 
+## P4a — UI Automation in Rust
+
+### Done
+
+* **`crates/kratos-native`**, a backend peer like any other: same protocol,
+  same handshake, and the broker does not know or care which backend answers.
+* **One cached fetch per window.** `BuildUpdatedCache` with a tree scope and a
+  filter brings back the whole subtree *and* its properties in a single
+  cross-process call; everything after that — names, roles, rectangles,
+  parents — is read out of the local cache. Pruning (`IsControlElement` and
+  not offscreen) is in the **condition**, so a filtered element is never
+  marshalled at all.
+* `AutomationElementMode_None`: a cached-only element cannot be used for
+  patterns and nothing here needs to be, so the window's live references are
+  never held.
+* Containers come from the cached **parent**, which is why the tree is cached
+  rather than a flat `FindAll`: `dialog:New Message` is what tells two
+  identically labelled controls apart.
+* Element ids are `uia:<hwnd>:<child path>` rather than a runtime id, because
+  a runtime id is one cross-process call per element — the exact cost this
+  crate exists to remove — and a path is what actuation will re-find by.
+* **The broker spawns and supervises it** (`native.rs`): restart with backoff,
+  dies with the broker, behind `backends.spawn_native` (off until parity).
+* `--bench` and `--dump` modes that need no broker.
+
+### Evidence
+
+Measured on this machine, four real windows, 21 runs each:
+
+```text
+| window         | elements | cold ms | p50 ms | p90 ms | of which fetch |
+| Notepad        |       57 |    51.1 |   31.6 |   32.1 |           30ms |
+| File Explorer  |      206 |    79.9 |   78.0 |   80.3 |           75ms |
+| Settings       |      128 |    45.2 |   42.4 |   46.1 |           41ms |
+| Example Domain |      129 |    20.8 |   21.7 |   22.2 |           19ms |
+```
+
+The Python backend this replaces: **24 elements in 223ms, 168 in 2.1s**. So
+206 elements in 78ms is about 27x faster at a larger size, and the spec's
+target — ~150 elements at p50 ≤ 80ms — is met with 206.
+
+The split is the point: of 78ms, **75ms is the single fetch** and the local
+walk is 2ms. A test asserts that ratio against the corpus, because the way to
+lose it is for something to start calling across the boundary per element
+again, which is what 2.1 seconds looked like.
+
+```text
+cargo test --workspace
+   369 passed; 0 failed; 0 ignored
+cargo clippy --workspace --all-targets
+   0 warnings
+```
+
+### Decisions
+
+* **The accuracy corpus is machine-local and gitignored.** A UIA dump carries
+  what is on the operator's screen: the file open in Notepad, the names in a
+  folder, the subject lines in a mail client. The harness skips what is not
+  there and says so. This means the regression check cannot run in CI as the
+  spec asks; what can is in the repo (the structural invariants), and the
+  honest version of "a regression fails CI" needs a corpus built from
+  applications a CI machine can open for itself. Recorded as a gap for P7.
+* **The benchmark table is written by `kratos-native --bench --out` and
+  *inlined* into `docs/benchmarks.md`** by `kratos-bench`, rather than being
+  generated there. These numbers are live — they depend on which windows are
+  open — and `kratos-bench` is the offline, reproducible half; generating both
+  into one file would make the reproducible one a lie. Regenerating
+  `benchmarks.md` now preserves the live section instead of dropping it.
+* **Rows are labelled by the search string the operator typed**, not by the
+  live window title. A title is the file open in Notepad or the folder in
+  Explorer, and this table is committed.
+* **`backends.spawn_native` is off by default.** Both this and the Python
+  backend register as `uia`, and one registration per source means the newer
+  one displaces the other. Turning it on is the operator's decision until
+  parity.
+* **Two VARIANTs are built by hand.** The `windows` crate exposes the raw
+  union with no conversions, and the alternative — caching patterns instead of
+  property values — needs `AutomationElementMode_Full`, which holds a live
+  reference to every element in the window.
+
+### Known gaps
+
+* **No actuation.** `backend.act` returns `backend_error` naming the phase, so
+  the broker falls back to another backend. That is P4c.
+* **No OCR, no capture, no pixel path**, so `kratos-native` reports nothing for
+  a window that exposes no accessibility tree. P4b and P4d.
+* **No URL** from this backend: a browser's address is the DOM backend's to
+  report, and a UIA-driven browser lane therefore gates on title alone.
+* **Cold start has regressed**: 13.3ms recorded earlier, 25–30ms today. The
+  pause hooks were the obvious suspect and are **ruled out** — measured
+  spawn-to-pipe with them on and off, 48.6/46.3/52.0 against 49.3/43.2/48.7ms,
+  no difference. The cause is not isolated; it may be nothing more than a
+  machine with five applications open. Worth a bisect before P7 quotes the
+  number again.
+* The corpus has four windows. The spec asks for Excel and Gmail too; Excel is
+  not installed here, and a Gmail dump is somebody's mail.
+
+### Next
+
+**P4b — capture and OCR.** Windows Graphics Capture or DXGI cropped to the
+target window with a frame-hash cache, `Windows.Media.Ocr` by default, and the
+numbers in the same table.
+
+---
+
 ## P3 — scoped targeting, tab ownership, one lease, the pause
 
 ### Done
