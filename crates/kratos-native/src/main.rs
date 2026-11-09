@@ -13,7 +13,9 @@
 //! kratos-native --dump  [window]                   write a fixture to stdout
 //! ```
 
+mod act;
 mod capture;
+mod input;
 mod ocr;
 mod uia;
 
@@ -144,10 +146,7 @@ async fn pump(mut peer: kratos_ipc::PipePeer, source: &'static str, reader: &Rea
 
         let reply = match op.as_str() {
             ops::BACKEND_OBSERVE => observe(reader, source, &payload),
-            ops::BACKEND_ACT => Err(WireError::new(
-                codes::BACKEND_ERROR,
-                "kratos-native does not act yet; this is the reading phase",
-            )),
+            ops::BACKEND_ACT => act(reader, source, &payload),
             _ => Err(WireError::new(codes::BAD_REQUEST, format!("unknown op {op}"))),
         };
 
@@ -159,6 +158,73 @@ async fn pump(mut peer: kratos_ipc::PipePeer, source: &'static str, reader: &Rea
             return;
         }
     }
+}
+
+/// Carry one action out.
+///
+/// Only the `uia` source acts. OCR can read a screen and has no way to press
+/// anything on it, and saying so plainly lets the broker fall through to a
+/// backend that can rather than waiting on one that cannot.
+fn act(
+    reader: &Reader,
+    source: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, WireError> {
+    if source != "uia" {
+        return Err(WireError::new(
+            codes::BACKEND_ERROR,
+            "the ocr source reads pixels; it has nothing to press them with",
+        ));
+    }
+    let req: kratos_protocol::BackendActReq = serde_json::from_value(payload.clone())
+        .map_err(|e| WireError::new(codes::BAD_REQUEST, format!("unusable act: {e}")))?;
+
+    let target = req.target.as_ref();
+    let id = target.and_then(|t| t.id.as_deref());
+    // An id from another backend is not this backend's to act on. Saying so
+    // is better than aiming at its rectangle and hoping.
+    let located = match id {
+        Some(id) => match act::parse_id(id) {
+            Some(parsed) => Some(parsed),
+            None => {
+                return Err(WireError::new(
+                    codes::BACKEND_ERROR,
+                    format!("{id:?} is not an element this backend reported"),
+                ))
+            }
+        },
+        None => None,
+    };
+
+    let hwnd = match &located {
+        Some((hwnd, _)) => *hwnd,
+        // A keypress goes to whatever has focus, and an unqualified scroll
+        // moves the page: neither carries an element, and a backend that
+        // refused a null target would break `press Enter` entirely.
+        None => window::find(None).unwrap_or(0),
+    };
+
+    let started = Instant::now();
+    let outcome = reader
+        .uia
+        .act(act::Request {
+            kind: req.kind.clone(),
+            path: located.map(|(_, path)| path),
+            hwnd,
+            bbox: target.and_then(|t| t.bbox),
+            text: req.text.clone(),
+            key: req.key.clone(),
+            amount: req.amount,
+        })
+        .map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+
+    Ok(json!({
+        "applied": outcome.applied,
+        "readback": outcome.readback,
+        "method": outcome.method,
+        "detail": outcome.detail,
+        "took_ms": started.elapsed().as_millis() as u64,
+    }))
 }
 
 /// Which window, from what the broker said.

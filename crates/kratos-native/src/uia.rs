@@ -66,7 +66,7 @@ fn variant_bool(b: bool) -> VARIANT {
 ///
 /// Borrowed, not taken: the VARIANT owns the BSTR and frees it, so this
 /// copies out rather than moving the pointer.
-fn variant_string(v: &VARIANT) -> Option<String> {
+pub fn variant_string(v: &VARIANT) -> Option<String> {
     unsafe {
         let inner = &v.Anonymous.Anonymous;
         if inner.vt != VT_BSTR {
@@ -113,6 +113,12 @@ pub const MAX_ELEMENTS: usize = 400;
 
 enum Job {
     Observe { hwnd: isize, reply: mpsc::Sender<Result<Observation, String>> },
+    /// Acting runs here too, and not only because the patterns are COM.
+    ///
+    /// One apartment thread means an action cannot overlap the observation
+    /// the broker took a moment earlier to decide it -- which is the ordering
+    /// the whole evidence story rests on.
+    Act { req: crate::act::Request, reply: mpsc::Sender<Result<crate::act::Outcome, String>> },
 }
 
 /// A handle to the thread that owns COM.
@@ -154,6 +160,9 @@ impl Uia {
                         Job::Observe { hwnd, reply } => {
                             let _ = reply.send(observe_window(&automation, hwnd));
                         }
+                        Job::Act { req, reply } => {
+                            let _ = reply.send(crate::act::perform(&automation, &req));
+                        }
                     }
                 }
                 CoUninitialize();
@@ -173,11 +182,38 @@ impl Uia {
             .map_err(|_| "the UIA thread has gone".to_string())?;
         rx.recv().map_err(|_| "the UIA thread dropped the request".to_string())?
     }
+
+    pub fn act(&self, req: crate::act::Request) -> Result<crate::act::Outcome, String> {
+        let (tx, rx) = mpsc::channel();
+        self.jobs
+            .send(Job::Act { req, reply: tx })
+            .map_err(|_| "the UIA thread has gone".to_string())?;
+        rx.recv().map_err(|_| "the UIA thread dropped the request".to_string())?
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The one fetch
 // ---------------------------------------------------------------------------
+
+/// What counts as an element worth reporting.
+///
+/// `IsControlElement` is UIA's own answer to "would a user consider this a
+/// thing on the screen", which is a better filter than a list of control
+/// types -- and the provider has already computed it, so it costs nothing.
+///
+/// Shared with actuation on purpose: an element id is a path of child
+/// indices through *this* filter, so walking back down with a different one
+/// would count different children and land somewhere else.
+pub unsafe fn interactive_condition(
+    automation: &IUIAutomation,
+) -> windows::core::Result<windows::Win32::UI::Accessibility::IUIAutomationCondition> {
+    let is_control =
+        automation.CreatePropertyCondition(UIA_IsControlElementPropertyId, &variant_bool(true))?;
+    let on_screen =
+        automation.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &variant_bool(false))?;
+    automation.CreateAndCondition(&is_control, &on_screen)
+}
 
 unsafe fn build_cache(automation: &IUIAutomation) -> windows::core::Result<IUIAutomationCacheRequest> {
     let cache = automation.CreateCacheRequest()?;
@@ -206,16 +242,7 @@ unsafe fn build_cache(automation: &IUIAutomation) -> windows::core::Result<IUIAu
     // Pruned here rather than in Rust: an element filtered out afterwards has
     // already been marshalled across the process boundary, which is the cost
     // this whole design is about.
-    //
-    // `IsControlElement` is UIA's own answer to "would a user consider this a
-    // thing on the screen", which is a better filter than a list of control
-    // types -- and it is the one the provider computes, so it costs nothing.
-    let is_control = automation
-        .CreatePropertyCondition(UIA_IsControlElementPropertyId, &variant_bool(true))?;
-    let on_screen =
-        automation.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &variant_bool(false))?;
-    let filter = automation.CreateAndCondition(&is_control, &on_screen)?;
-    cache.SetTreeFilter(&filter)?;
+    cache.SetTreeFilter(&interactive_condition(automation)?)?;
 
     // None, not Full: a cached-only element cannot be used for patterns, and
     // nothing here needs to be -- acting re-finds its target by path. Full

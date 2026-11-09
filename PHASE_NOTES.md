@@ -5,6 +5,110 @@ Newest phase first.
 
 ---
 
+## P4c — actuation
+
+### Done
+
+* **The control's own interface first.** `click` tries `InvokePattern`, then
+  `TogglePattern` (a checkbox has no Invoke; toggling it *is* clicking it),
+  then `SelectionItemPattern` (a list item, a tab, a radio button), then
+  `ExpandCollapsePattern` (a combo box opens). `type` uses `ValuePattern`,
+  `select` uses `SelectionItemPattern`, `focus` uses `SetFocus`, `scroll` uses
+  `ScrollPattern`.
+* **The mouse and keyboard second**, and the result says which: `semantic` or
+  `physical`. A click at a coordinate is a guess that the button is still
+  where it was, and a guess that can land on whatever moved into that
+  rectangle. It is allowed — most of a Windows desktop exposes no pattern for
+  most things — and it is never silent.
+* **Text the keyboard cannot spell goes through the clipboard.** A unicode
+  character has no scan code, a dead-key layout turns `'` into nothing until
+  the next keystroke, and an emoji has no keys at all. One paste handles any
+  text in any layout.
+* **A read-only control is reported, not retyped.** `ValuePattern` says so,
+  and falling back to the keyboard there would type into whatever has focus
+  instead.
+* **Acting runs on the same apartment thread as observing**, so an action
+  cannot overlap the observation the broker took a moment earlier to decide
+  it — which is the ordering the whole evidence story rests on.
+* An element id is a path of child indices through the *same* filter the
+  observation used, so the walk back down counts the same children. A tree
+  that changed underneath runs out of children and the action is refused
+  rather than landing on whatever is at that index now.
+* An id from another backend is refused rather than aimed at by rectangle.
+
+### Evidence
+
+Live, through the whole stack — MCP shim, broker, gate, lease, the Rust
+backend — against a window the test opens for itself:
+
+```text
+observe: source=uia  11 elements  36ms
+type   : executed / semantic / readback='someone@example.com'
+click  : executed / semantic / evidence=structural+window+region
+labels now: Recipient | Recipient | Urgent | Send | sent to someone@example.com | ...
+```
+
+That last line is the application saying what it did, which is the only
+evidence that cannot be produced by the thing under test.
+
+`crates/kratos-native/tests/actuation.rs` does the same thing as a test: it
+opens its own WinForms window, speaks the protocol to `kratos-native` over a
+real pipe, and asserts the type is semantic with a read-back, the click is
+semantic, the window's own label changed, the checkbox toggles, a keypress
+works with no element at all, and another backend's id is refused.
+
+```text
+cargo test --workspace     382 passed; 0 failed; 0 ignored
+cargo clippy --workspace --all-targets     0 warnings
+```
+
+### Decisions
+
+* **A window of its own for the live test.** The alternative is typing into
+  whatever the operator has open, and a test that edits somebody's document
+  is a test that gets deleted. The scratch window is WinForms through
+  PowerShell: no build step, no dependency, and every control carries the
+  patterns this phase is about.
+* **`SendInput` for everything physical**, which marks its events injected —
+  and that is load-bearing: the broker's user-activity pause reads the same
+  flag to tell the operator's hand from the agent's, so an agent that drove
+  the machine any other way would pause itself after its own first click.
+* **A keypress has no element**, by design. A backend that refused a null
+  target would break `press Enter` entirely, which is exactly what both
+  earlier backends did until a live run caught it.
+* **Scroll inverts the wheel.** Positive means down the page and a wheel
+  delta is positive *away* from the user. Getting it backwards is a bug
+  nobody notices until an agent scrolls away from what it was looking for.
+* **The value is read back even when the keyboard did the typing.** The
+  broker's strongest evidence is the field containing what was asked for, and
+  it does not care how it got there.
+
+### Known gaps
+
+* **`open` and `navigate` are not implemented here.** Launching an
+  application and going to a URL are P5's ensure-lane and the browser's
+  respectively; this backend refuses them by name so the broker can fall
+  through.
+* **No live test of the physical path.** Everything in the scratch window has
+  a pattern, which is the point of it — so `physical` is exercised only by
+  the keypress. A window with no patterns at all (a canvas app) is the case
+  to add with the pixel path in P4d.
+* **The clipboard is not restored after a paste.** A paste replaces whatever
+  the operator had copied. Saving and restoring it is possible and racy
+  (another process can own the clipboard between the two), and the honest
+  options are to do it imperfectly or to say so. Saying so, for now.
+* `select` on a combo box only works when the item is already an element;
+  opening the list first is a two-step the agent has to ask for.
+
+### Next
+
+**P4d — the pixel path and fusion.** OmniParser v2's icon detector exported
+to ONNX and run with `ort`, UIA first with OCR text and detector boxes added
+where UIA has none, IoU > 0.5 as the same element, and the accuracy numbers
+the spec asks for.
+
+---
+
 ## P4b — capture and OCR
 
 ### Done

@@ -28,6 +28,11 @@ features = [
     # Capture: a window's own pixels, not the whole desktop.
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
+    # Actuation: SendInput, and the clipboard for text the keyboard cannot
+    # spell.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     # OCR: Windows.Media.Ocr is WinRT, ships with Windows, needs no install
     # and no network. The language packs the user already has are the
     # languages it reads.
