@@ -313,11 +313,16 @@ async function observe(payload) {
     }
   }
 
+  // An empty list is a real answer: this tab cannot be scripted -- a
+  // browser page, the Web Store, a PDF viewer -- and saying so immediately
+  // lets the broker fall back to UI Automation instead of waiting out a
+  // timeout it cannot interpret.
   return {
     window: tab.title || "",
     url,
     elements,
     truncated,
+    scriptable: elements.length > 0 || perFrame.some((f) => f.result),
   };
 }
 
@@ -331,31 +336,64 @@ async function scanAllFrames(tab) {
   return out;
 }
 
+/// Frames of a tab, or just the main one.
+///
+/// `executeScript` rejects on a page no extension may touch, and used to be
+/// allowed to take as long as it liked about it. Bounded for the same reason
+/// as `ask`: this is on the path of every observation.
 async function listFrames(tabId) {
   // No webNavigation permission, so frames are discovered by asking the main
   // frame first and letting Chromium's message routing enumerate the rest.
   // chrome.tabs.sendMessage without a frameId reaches every frame, but only
   // the first reply is delivered, so each frame is addressed explicitly.
   try {
-    const frames = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: () => 1,
-    });
+    const frames = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        func: () => 1,
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(null), FRAME_TIMEOUT_MS)),
+    ]);
+    if (!frames) return [0];
     return frames.map((f) => f.frameId);
   } catch (_) {
     return [0];
   }
 }
 
+/// How long one frame has to answer.
+///
+/// A content script that is there answers in single-digit milliseconds. One
+/// that is not there is supposed to produce `chrome.runtime.lastError` -- and
+/// on a privileged page (brave://newtab, the Web Store, another extension's
+/// page) the callback can simply never fire. Measured: an observe of a
+/// new-tab page never returned, the broker waited out its eight seconds, and
+/// the native host concluded the extension was dead and exited. A tab nobody
+/// can script has no elements, which is an answer; hanging is not.
+const FRAME_TIMEOUT_MS = 1500;
+
 function ask(tabId, frameId, message) {
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, message, { frameId }, (response) => {
-      if (chrome.runtime.lastError || !response || !response.ok) {
-        resolve(null);
-        return;
-      }
-      resolve(response.result);
-    });
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), FRAME_TIMEOUT_MS);
+    try {
+      chrome.tabs.sendMessage(tabId, message, { frameId }, (response) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError || !response || !response.ok) {
+          finish(null);
+          return;
+        }
+        finish(response.result);
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      finish(null);
+    }
   });
 }
 

@@ -240,6 +240,9 @@ pub struct Broker {
     pub config: RwLock<Config>,
     /// Per-harness decisions made since this broker started.
     pub approvals: Mutex<HashMap<String, Approval>>,
+    /// Lanes the ensure ladder has tried and failed to open: the lane key,
+    /// when it was tried, and what it said.
+    lane_tried: Mutex<HashMap<String, (Instant, String)>>,
     /// Which session first acted on which browser tab: `brand:wN:tN` to a
     /// `peer_id`.
     ///
@@ -305,6 +308,7 @@ impl Broker {
             config: RwLock::new(config),
             approvals: Mutex::new(HashMap::new()),
             tab_owners: Mutex::new(HashMap::new()),
+            lane_tried: Mutex::new(HashMap::new()),
             config_seen: Mutex::new(config_mtime()),
             approval_gate: Mutex::new(()),
             gate: Mutex::new(gate),
@@ -665,6 +669,29 @@ impl Broker {
             ));
         }
         Ok(p)
+    }
+
+    // -- the ensure-lane cooldown -------------------------------------------
+
+    /// Why this lane was left alone, if it was tried too recently.
+    pub async fn lane_cooling(
+        &self,
+        browser: &str,
+        profile_dir: &str,
+        within: Duration,
+    ) -> Option<String> {
+        let key = format!("{browser}/{profile_dir}");
+        let tried = self.lane_tried.lock().await;
+        tried
+            .get(&key)
+            .filter(|(when, _)| when.elapsed() < within)
+            .map(|(_, why)| why.clone())
+    }
+
+    /// Remember that opening this lane did not work.
+    pub async fn lane_cooled(&self, browser: &str, profile_dir: &str, why: &str) {
+        let key = format!("{browser}/{profile_dir}");
+        self.lane_tried.lock().await.insert(key, (Instant::now(), why.to_string()));
     }
 
     // -- tab ownership ------------------------------------------------------

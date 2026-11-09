@@ -80,7 +80,8 @@ pub fn window(hwnd: isize) -> Result<Frame, String> {
     let started = Instant::now();
     let h = HWND(hwnd as *mut _);
     let mut rect = RECT::default();
-    unsafe { GetWindowRect(h, &mut rect) }.map_err(|e| format!("GetWindowRect: {e}"))?;
+    unsafe { GetWindowRect(h, &mut rect) }
+        .map_err(|e| format!("{}: GetWindowRect: {e}", crate::uia::GONE))?;
     let (w, ht) = (rect.right - rect.left, rect.bottom - rect.top);
     if w <= 0 || ht <= 0 {
         return Err("that window has no area on screen".to_string());

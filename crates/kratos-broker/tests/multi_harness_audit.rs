@@ -86,6 +86,11 @@ impl Harness {
                 "review_dialog_timeout_s": 5
             },
             "settle_max_ms": 120,
+            // The ladder is not run by these tests: a suite that opened a
+            // browser on this machine every time it checked lane resolution
+            // would be a suite nobody runs twice. P5 has its own tests for
+            // opening, which set this deliberately.
+            "defaults": {"profile": "Default", "open_method": "none"},
             "thresholds": {"default": 0.0, "click": 0.0, "type": 0.0, "key": 0.0,
                            "scroll": 0.0, "select": 0.0, "navigate": 0.0,
                            "open": 0.0, "focus": 0.0}
@@ -1142,4 +1147,168 @@ async fn a_tab_belongs_to_the_session_that_acted_on_it_first() {
     );
 
     inst.task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// P5 acceptance: the ensure-lane ladder
+// ---------------------------------------------------------------------------
+
+/// Spec 4: a lane with nothing attached is opened, and the rungs that *refuse*
+/// to open one are the ones a test can prove without starting a browser on
+/// somebody's desktop.
+///
+/// The launch itself is verified live, on a real machine, with real browsers —
+/// see PHASE_NOTES. What is pinned here is every way the ladder declines, and
+/// that it declines rather than doing something surprising.
+#[tokio::test]
+async fn a_lane_that_is_not_installed_cannot_be_opened_and_says_which() {
+    let h = Harness::start("ladderabsent");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    // Opera is not on this machine, and the point of the test is the message.
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": "opera", "approved": true}],
+            "defaults": {"open_method": "direct", "profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut one = session(&h.pipe, "claude", None, "s-1").await;
+    let err = one.call(ops::OBSERVE, json!({})).await.unwrap_err();
+    assert_eq!(err.code, "lane_unavailable");
+    assert!(err.message.contains("opera"), "{}", err.message);
+    assert_eq!(err.detail["profile_dir"], json!("Default"), "{:?}", err.detail);
+}
+
+/// `open_method: "none"` is an allocation, not an omission: drive a browser
+/// that is open, never open one.
+#[tokio::test]
+async fn the_operator_can_forbid_opening_a_browser_at_all() {
+    let h = Harness::start("ladderoff");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let Some(brand) = lanes["browsers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["installed"] == json!(true)))
+        .and_then(|b| b["brand"].as_str().map(|s| s.to_string()))
+    else {
+        eprintln!("no Chromium browser here; nothing to decline to open");
+        return;
+    };
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": brand, "approved": true}],
+            // Already the suite's default; set here so the test states what
+            // it is testing rather than relying on the harness.
+            "defaults": {"open_method": "none", "profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut one = session(&h.pipe, "claude", None, "s-1").await;
+    // Whatever the outcome, it must not be "a browser was started". With no
+    // instance paired the lane is degraded, and an observe either reaches a
+    // window of that brand through UIA or reports there is no backend for it.
+    match one.call(ops::OBSERVE, json!({})).await {
+        Ok(obs) => assert!(obs["elements"].is_array(), "{obs}"),
+        Err(e) => assert!(
+            [codes::NO_BACKEND, codes::NO_TARGET, "lane_unavailable"].contains(&e.code.as_str()),
+            "unexpected refusal {} ({})",
+            e.code,
+            e.message
+        ),
+    }
+}
+
+/// The kill switch stops the ladder before it starts a process.
+///
+/// `observe` is the case that matters: it is read-only and therefore never
+/// went through the kill check, and before the ladder existed it could not
+/// start anything either. Now it can, so it has to ask.
+#[tokio::test]
+async fn an_engaged_kill_switch_opens_no_browser() {
+    let h = Harness::start("ladderkill");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let Some(brand) = lanes["browsers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["installed"] == json!(true)))
+        .and_then(|b| b["brand"].as_str().map(|s| s.to_string()))
+    else {
+        eprintln!("no Chromium browser here; skipping");
+        return;
+    };
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": brand, "approved": true}],
+            "defaults": {"open_method": "direct", "profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut one = session(&h.pipe, "claude", None, "s-1").await;
+    one.call(ops::KILL_ENGAGE, json!({"scope": "global", "reason": "test"}))
+        .await
+        .expect("an agent may engage the kill switch");
+
+    let err = one.call(ops::OBSERVE, json!({})).await.unwrap_err();
+    assert_eq!(
+        err.code,
+        codes::KILL_SWITCH,
+        "a halted system must not start a browser: {} {}",
+        err.code,
+        err.message
+    );
+    assert!(err.message.contains("no browser will be opened"), "{}", err.message);
+}
+
+/// A lane with its instance already paired is rung one: nothing is opened.
+#[tokio::test]
+async fn a_lane_that_is_already_attached_opens_nothing() {
+    let h = Harness::start("ladderattached");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let Some(brand) = lanes["browsers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["installed"] == json!(true)))
+        .and_then(|b| b["brand"].as_str().map(|s| s.to_string()))
+    else {
+        eprintln!("no Chromium browser here; skipping");
+        return;
+    };
+
+    let instance = FakeInstance::dom_ext_brand(&brand, "tok-ready").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": brand, "approved": true}],
+            "instances": [{"token": "tok-ready", "brand": brand, "profile_dir": "Default"}],
+            // Opening is allowed, and must not happen: the rung above it
+            // already matched.
+            "defaults": {"open_method": "direct", "profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut one = session(&h.pipe, "claude", None, "s-1").await;
+    assert_eq!(one.ack["lane"]["state"], json!("ready"), "{}", one.ack["lane"]);
+    let obs = one.call(ops::OBSERVE, json!({})).await.expect("observe");
+    assert_eq!(obs["source"], json!("dom-ext"));
+    assert!(
+        obs["window"].as_str().unwrap_or_default().contains(&brand),
+        "the attached instance should have answered: {obs}"
+    );
+    instance.task.abort();
 }

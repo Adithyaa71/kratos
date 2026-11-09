@@ -309,6 +309,21 @@ fn act(
     }))
 }
 
+/// A window that has gone is `no_target`, not `backend_error`.
+///
+/// The broker treats the two completely differently -- one is routing
+/// information, the other stops a mutating action -- and a window can vanish
+/// between being found and being read. A cold browser start is the obvious
+/// case: a splash window exists for about as long as it takes to decide to
+/// ask about it.
+fn gone_or_broken(why: String) -> WireError {
+    if why.contains(uia::GONE) || why.contains("Invalid window handle") {
+        WireError::new(codes::NO_TARGET, why)
+    } else {
+        WireError::new(codes::BACKEND_ERROR, why)
+    }
+}
+
 /// Which window, from what the broker said.
 fn target(req: &kratos_protocol::BackendObserveReq) -> Result<isize, WireError> {
     // The broker resolved the window already and says which one. Matching the
@@ -360,7 +375,7 @@ fn observe_by_pixels(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, 
              nothing to read pixels with",
         ));
     }
-    let seen = reader.look(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+    let seen = reader.look(hwnd).map_err(gone_or_broken)?;
     let fused = fuse::fuse(Vec::new(), &seen.lines, &seen.icons);
     Ok(reply(&seen, fused, "pixel"))
 }
@@ -386,7 +401,7 @@ fn reply(seen: &Seen, elements: Vec<kratos_protocol::Element>, how: &str) -> ser
 }
 
 fn observe_by_tree(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, WireError> {
-    let obs = reader.uia.observe(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+    let obs = reader.uia.observe(hwnd).map_err(gone_or_broken)?;
     let elements: Vec<kratos_protocol::Element> = obs
         .elements
         .iter()

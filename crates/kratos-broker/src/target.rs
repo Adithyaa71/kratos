@@ -145,7 +145,36 @@ pub async fn aim(
         ));
     }
 
-    let instance = instance_for(broker, &lane).await;
+    let mut instance = instance_for(broker, &lane).await;
+    let mut opened = None;
+
+    // Nothing attached for this lane, and no window named: this is the case
+    // the ensure-lane ladder exists for. Only for `window: null` -- a request
+    // that names a window is asking about something that is already there,
+    // and it is also how the ladder's own steps avoid recursing into it.
+    if instance.is_none() && named.is_none() {
+        match crate::ensure::ensure(broker, peer, &lane).await {
+            Ok(outcome) => {
+                if outcome == crate::ensure::Opened::Launched {
+                    instance = instance_for(broker, &lane).await;
+                }
+                // What the ladder concluded, next to the launch it journalled
+                // on the way: an operator reading the log should not have to
+                // infer the outcome from what did not happen afterwards.
+                broker.journal.read().await.append(json!({
+                    "op": "lane.ensure", "peer_id": peer.peer_id, "agent": peer.name,
+                    "harness": peer.harness_id,
+                    "browser": lane.browser, "profile_dir": lane.profile_dir,
+                    "outcome": outcome.as_str(),
+                    "attached": instance.is_some(),
+                }));
+                opened = Some(outcome);
+            }
+            // A lane that cannot be opened is a lane the agent cannot work
+            // in, and the error says which browser and which profile.
+            Err(e) => return Err(e),
+        }
+    }
 
     match named {
         // -- the lane's own active tab --------------------------------------
@@ -161,6 +190,20 @@ pub async fn aim(
                     "no window of that browser is open and no extension instance is paired with \
                      that profile",
                 ));
+            }
+            // What the ladder did, carried through so the result can say
+            // the lane is being driven without the extension rather than
+            // leaving an agent to wonder why there are no selectors.
+            let mut lane = lane;
+            if let Some(outcome) = &opened {
+                lane.state = if instance.is_some() {
+                    LaneState::Ready
+                } else {
+                    outcome.state()
+                };
+                if let crate::ensure::Opened::Degraded(why) = outcome {
+                    lane.warning = Some(why.clone());
+                }
             }
             Ok(Aim {
                 window,

@@ -11,6 +11,7 @@ mod activity;
 mod browsers;
 mod classify;
 mod diff;
+mod ensure;
 mod hotkey;
 mod journal;
 mod native;

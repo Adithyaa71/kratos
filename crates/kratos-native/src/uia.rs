@@ -104,6 +104,17 @@ pub struct Observation {
     pub walk_ms: u64,
 }
 
+/// Marks a failure that means "that window is not there" rather than "this
+/// backend is broken".
+///
+/// The difference matters to the broker: a backend that cannot see a window
+/// is routing information and the next backend is tried, while a backend
+/// error on a mutating action stops everything. A window that vanished
+/// between being found and being read is the former -- and it happens, most
+/// obviously during a cold browser start, where a splash window exists for
+/// about as long as it takes to decide to ask about it.
+pub const GONE: &str = "window-gone";
+
 /// How many elements one observation may carry.
 ///
 /// A dense window -- an IDE, a spreadsheet with every cell a control -- has
@@ -256,7 +267,7 @@ unsafe fn observe_window(automation: &IUIAutomation, hwnd: isize) -> Result<Obse
     let started = std::time::Instant::now();
     let root = automation
         .ElementFromHandle(HWND(hwnd as *mut _))
-        .map_err(|e| format!("no UI Automation element for that window: {e}"))?;
+        .map_err(|e| format!("{GONE}: no UI Automation element for that window: {e}"))?;
     let cache = build_cache(automation).map_err(|e| format!("cache request: {e}"))?;
 
     // The one trip. Everything below this line is local.

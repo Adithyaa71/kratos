@@ -197,6 +197,15 @@ async fn pump(
 ) -> Option<()> {
     // What the broker has asked for and not yet had an answer to.
     let mut awaiting: HashMap<String, std::time::Instant> = HashMap::new();
+    // Whether this extension has ever answered anything.
+    //
+    // The difference between "gone" and "slow" is this flag. An extension
+    // that has answered before and is now late is doing something expensive,
+    // or is on a page it cannot script -- and exiting there closes a live
+    // port, wakes the worker and makes it reconnect, which is a host restart
+    // per slow observation. Measured on a browser whose installed extension
+    // predated the per-frame timeout: seven hosts for three observations.
+    let mut answered_any = false;
     let mut sweep = tokio::time::interval(Duration::from_millis(500));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -222,9 +231,18 @@ async fn pump(
                             )
                             .await;
                     }
+                    if answered_any {
+                        log(&format!(
+                            "the extension was late on {} request(s); the broker has been told                              and this host is staying",
+                            overdue.len()
+                        ));
+                        for id in &overdue {
+                            awaiting.remove(id);
+                        }
+                        continue;
+                    }
                     log(&format!(
-                        "the extension has not answered {} request(s) in {}s; exiting",
-                        overdue.len(),
+                        "the extension has never answered, and not this request in {}s; exiting",
                         EXTENSION_SILENCE.as_secs()
                     ));
                     // Exiting here does not start the reconnect storm the
@@ -262,6 +280,7 @@ async fn pump(
                     // A reply to something the broker asked. Forward verbatim.
                     kratos_protocol::Body::Res { id, ok, payload, error } => {
                         awaiting.remove(id);
+                        answered_any = true;
                         let sent = if *ok {
                             peer.reply(id, payload.clone()).await
                         } else {

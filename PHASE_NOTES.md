@@ -5,6 +5,117 @@ Newest phase first.
 
 ---
 
+## P5 — the ensure-lane ladder
+
+### Done
+
+* **The ladder**, spec §4, in order, stopping at the first rung that works:
+  an instance already paired; an instance of that brand attached and
+  unpaired; a direct launch with `--profile-directory`; bounded, Jev-driven
+  recovery; degraded.
+* **Opening a browser is an action.** The kill switch is checked first, the
+  launch is journalled with the executable and the profile, the outcome is
+  journalled, and each recovery step is a *real* `act` — observed,
+  decided, gated, leased, executed, proved. A broker that clicked things on
+  its own initiative outside the gate would be a second, unaudited way to
+  drive the machine.
+* **Auto-binding.** Exactly one new unbound instance appearing after a launch
+  is that profile's, and it is paired without a human. Exactly one, because
+  "whichever appeared" is a coin toss when two browsers start together, and
+  binding the wrong token points a lane at another profile's tabs.
+* **Rung 1b, which the spec implies and does not state**: an instance of that
+  brand already attached and unpaired is adopted *before* launching. The rule
+  as written is about an instance that appears after a launch, and on a
+  machine where the browser is already open with the extension running there
+  is nothing to appear — so launching would open a window to produce an
+  event that has already happened.
+* **A cooldown.** The ladder runs when a lane is not ready, and a lane that
+  stays degraded is not ready on the next request either: without this, every
+  observation paid for a launch, an eight-second wait and three recovery
+  steps. Measured at fifteen seconds per observe, for ever. Thirty seconds.
+* **The ladder only runs for `window: null`.** A request that names a window
+  is asking about something already there — which is also what stops the
+  recovery's own acts from recursing into the ladder that started them.
+* `open_method: "none"` turns opening off: drive a browser that is open,
+  never open one.
+
+### Evidence
+
+Live, on this machine, with the real Brave:
+
+```text
+cold, nothing running:
+  lane.open      exe=...\BraveSoftware\...\brave.exe  profile=Default
+  instance.bind  token=26f538bc...  brand=brave  profile=Default  by=lane.open
+  whoami         lane: brave/Default  state=ready
+  brave processes 0 -> 14
+
+into a browser already running:
+  lane.open      process count unchanged -- a window opened inside the
+                 running browser, which is what --profile-directory does
+  lane.recover   three steps, then stopped: the bounded abort
+  observe        dom-ext>uia | New Tab - Brave | 71 elements
+
+the ladder runs once per lane, not once per request:
+  first observe 6.9s, second 5.2s, third 5.4s
+  journal: lane.open x1, lane.ensure outcome=launched x1
+```
+
+The restore-pages bubble appeared on its own during a cold start, which is
+exactly the rung-4 case the spec describes: the window the broker read was
+titled "Restore pages?".
+
+```text
+cargo test --workspace     401 passed; 0 failed; 0 ignored
+cargo clippy --workspace --all-targets     0 warnings
+```
+
+Four new tests pin the rungs a test can prove without opening a browser on
+somebody's desktop: a brand that is not installed is `lane_unavailable` and
+names the profile, `open_method: "none"` opens nothing, an engaged kill switch
+opens nothing, and a lane whose instance is already paired opens nothing.
+
+### Two bugs the live run found
+
+1. **A window that vanishes is `no_target`, not `backend_error`.** A cold
+   browser start creates and destroys windows, and `GetWindowRect` on one of
+   them failed the whole observation instead of letting the broker try the
+   next backend. The native backend now distinguishes "that window is not
+   there" from "this backend is broken", which is the difference between
+   routing information and a stop.
+2. **The extension hung on a tab it cannot script.**
+   `chrome.tabs.sendMessage` on a privileged page — a new-tab page, the
+   Web Store — can leave its callback unfired, so an observation never
+   returned, the broker waited out eight seconds, and the native host
+   concluded the extension was dead and exited. Every frame now has a
+   1.5-second bound and an unscriptable tab returns no elements, which is an
+   answer. And the host no longer exits when an extension that *has* answered
+   before is merely late: measured seven host restarts for three observations
+   before that distinction existed.
+
+### Known gaps
+
+* **The extension fix is unverified live.** This machine runs an installed
+  copy of the extension, which takes precedence over `--load-extension`, so
+  the browser keeps running the code from before the fix. Verifying it means
+  removing the installed copy — a change to the operator's browser that is
+  P6/P7's business, not a thing to do unasked.
+* **An unresponsive-but-registered instance costs 5s per observation**, which
+  is the host's "is the extension dead" threshold, and then falls back to UI
+  Automation. The broker does not yet demote an instance that keeps failing;
+  that is the fix rather than tuning the timeout.
+* **The cooldown is not exercised by a test**, because on this machine the
+  ladder succeeds. Its logic is three lines and its measurement is above.
+* **`open_method: "ui"` is accepted and launches nothing.** Rung 3 is "launch
+  the app through its own interface, then pick the profile in the picker", and
+  the native backend refuses the `open` action kind — so `ui` covers the
+  picker half only. Implementing `open` is small; it is also the one action in
+  this design that starts an arbitrary program, so it wants its gate rule
+  written first.
+* **Picker recovery is not proved against a real picker.** The steps ran,
+  bounded and journalled, but the window that appeared was a restore-pages
+  bubble; a profile picker needs a second profile on this machine to produce.
+
 ## P4d — the pixel path and fusion
 
 ### Done
