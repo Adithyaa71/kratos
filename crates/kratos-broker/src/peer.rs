@@ -213,13 +213,13 @@ where
         broker.remember_harness(&harness_id).await;
         let attached = crate::lane::attached_instances(broker).await;
         let config = broker.config.read().await;
-        let lane = crate::lane::resolve(&config, &identity, &attached);
+        let lane = crate::lane::resolve_opt(&config, &identity, &attached);
         let approved = config.harness(&harness_id).is_some_and(|h| h.approved)
             || matches!(
                 broker.approvals.lock().await.get(&harness_id),
                 Some(crate::state::Approval::Allowed)
             );
-        (Some(lane), approved)
+        (lane, approved)
     } else {
         (None, true)
     };
@@ -317,7 +317,7 @@ async fn dispatch(
         ops::OBSERVE => match serde_json::from_value(payload) {
             Ok(req) => {
                 broker.mark_agent_activity();
-                crate::act::observe(broker, req).await.and_then(to_value)
+                crate::act::observe(broker, peer, req).await.and_then(to_value)
             }
             Err(e) => Err(bad(e)),
         },
@@ -328,7 +328,7 @@ async fn dispatch(
         },
 
         ops::VERIFY => match serde_json::from_value(payload) {
-            Ok(req) => crate::act::verify(broker, req).await.and_then(to_value),
+            Ok(req) => crate::act::verify(broker, peer, req).await.and_then(to_value),
             Err(e) => Err(bad(e)),
         },
 
@@ -577,9 +577,9 @@ async fn whoami(broker: &Arc<Broker>, peer: &Arc<PeerHandle>) -> Value {
     let lane = if peer.role == Role::Agent {
         let attached = crate::lane::attached_instances(broker).await;
         let config = broker.config.read().await;
-        let fresh = crate::lane::resolve(&config, &peer.identity, &attached);
-        *peer.lane.lock().await = Some(fresh.clone());
-        Some(fresh)
+        let fresh = crate::lane::resolve_opt(&config, &peer.identity, &attached);
+        *peer.lane.lock().await = fresh.clone();
+        fresh
     } else {
         None
     };
@@ -612,7 +612,7 @@ async fn lane_list(broker: &Arc<Broker>) -> Value {
             .iter()
             .filter(|p| p.role == Role::Agent)
             .map(|p| {
-                let lane = crate::lane::resolve(&config, &p.identity, &attached);
+                let lane = crate::lane::resolve_opt(&config, &p.identity, &attached);
                 json!({
                     "peer_id": p.peer_id,
                     "harness": p.harness_id,

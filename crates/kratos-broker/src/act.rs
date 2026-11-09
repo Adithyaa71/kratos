@@ -105,6 +105,7 @@ async fn observe_with_fallback(
     prefer: Option<Source>,
     window: Option<&str>,
     timeout: Duration,
+    dom: crate::target::Dom<'_>,
 ) -> Result<(String, BackendObservation), WireError> {
     let order = broker.route(class, prefer).await;
     if order.is_empty() {
@@ -122,7 +123,7 @@ async fn observe_with_fallback(
     let mut last: Option<WireError> = None;
     for source in order {
         chain.push(source.as_str());
-        let Some(backend) = broker.backend_for(source).await else { continue };
+        let Some(backend) = pick(broker, source, dom).await else { continue };
         let payload = json!({
             "window": window, "class": class.as_str(), "timeout_ms": timeout.as_millis() as u64
         });
@@ -142,6 +143,27 @@ async fn observe_with_fallback(
     Err(last.unwrap_or_else(|| WireError::new(codes::NO_BACKEND, "every backend declined")))
 }
 
+/// Which peer serves a source for *this* request.
+///
+/// With two browsers attached there is no such thing as "the dom-ext
+/// backend", so a lane names its own instance and that is the peer asked.
+/// Every other source is one per machine and resolves as before.
+async fn pick(
+    broker: &Arc<Broker>,
+    source: Source,
+    dom: crate::target::Dom<'_>,
+) -> Option<Arc<PeerHandle>> {
+    use crate::target::Dom;
+    if source == Source::DomExt {
+        return match dom {
+            Dom::Lane(instance) => instance.cloned(),
+            Dom::Skip => None,
+            Dom::Any => broker.backend_for(source).await,
+        };
+    }
+    broker.backend_for(source).await
+}
+
 /// Dispatch an action.
 ///
 /// Fallback here is deliberately narrower than for observation. `dom-ext`
@@ -152,21 +174,21 @@ async fn observe_with_fallback(
 /// know. So a timeout is returned, not retried.
 async fn execute(
     broker: &Arc<Broker>,
-    class: TargetClass,
-    prefer: Option<Source>,
+    order: &[Source],
     payload: Value,
+    dom: crate::target::Dom<'_>,
 ) -> Result<(String, BackendActRes), WireError> {
-    let order = broker.route(class, prefer).await;
     if order.is_empty() {
         return Err(WireError::new(codes::NO_BACKEND, "no backend is connected to act through"));
     }
+    let order = order.to_vec();
     let timeout = Duration::from_millis(12_000);
     let mut chain: Vec<&str> = Vec::new();
     let mut last: Option<WireError> = None;
 
     for source in order {
         chain.push(source.as_str());
-        let Some(backend) = broker.backend_for(source).await else { continue };
+        let Some(backend) = pick(broker, source, dom).await else { continue };
         match call_backend(&backend, kratos_protocol::ops::BACKEND_ACT, payload.clone(), timeout).await
         {
             Ok(v) => {
@@ -264,11 +286,16 @@ fn effective_target(
 
 pub async fn observe(
     broker: &Arc<Broker>,
+    peer: &Arc<PeerHandle>,
     req: kratos_protocol::ObserveReq,
 ) -> Result<Observation, WireError> {
     let started = Instant::now();
-    let win = target_window(req.window.as_deref())?;
-    let class = win.class();
+    // The session's lane decides what `window` means, including what it means
+    // when it is null. Before this, it meant `GetForegroundWindow()` -- the
+    // same answer for every agent on the broker.
+    let aim = crate::target::aim(broker, peer, req.window.as_deref()).await?;
+    let win = aim.window_or_brand();
+    let class = aim.class;
     let prefer = match req.prefer.as_deref() {
         None => None,
         Some(name) => match Source::parse(name) {
@@ -289,8 +316,9 @@ pub async fn observe(
         broker,
         class,
         prefer,
-        req.window.as_deref(),
+        aim.backend_window.as_deref(),
         Duration::from_millis(req.timeout_ms),
+        aim.dom(),
     )
     .await?;
 
@@ -631,8 +659,9 @@ async fn act_inner(
     let elapsed = || started.elapsed().as_millis() as u64;
 
     // -- 1. what are we aiming at ------------------------------------------
-    let win = target_window(req.window.as_deref())?;
-    let class = win.class();
+    let aim = crate::target::aim(broker, peer, req.window.as_deref()).await?;
+    let win = aim.window_or_brand();
+    let class = aim.class;
 
     // The kill switch is consulted before any work at all, and spends no rate
     // budget: a halted system must answer the same way however often it is
@@ -661,8 +690,9 @@ async fn act_inner(
         broker,
         class,
         None,
-        req.window.as_deref(),
+        aim.backend_window.as_deref(),
         Duration::from_millis(req.timeout_ms.min(10_000)),
+        aim.dom(),
     )
     .await;
     let (obs_source, before) = match before_obs {
@@ -855,24 +885,85 @@ async fn act_inner(
         return Ok(res);
     }
 
-    // -- 6. lease the input devices ----------------------------------------
-    let (lease_token, auto_lease) = match &req.lease {
-        Some(t) => {
-            broker.check_lease(t, &peer.peer_id).await?;
-            (t.clone(), false)
+    // -- 5b. whose tab is this ---------------------------------------------
+    //
+    // Two sessions can share one lane -- two agents of one harness, say -- and
+    // then they share a browser profile, its logins and its tabs. A tab
+    // belongs to the session that first acted on it, and the user can say
+    // otherwise per lane.
+    if let Some(tab) = resolved.target.as_ref().and_then(|t| tab_key(&t.id)) {
+        let shared = match (&aim.lane, &peer.identity.session) {
+            (Some(l), _) => {
+                broker.config.read().await.lane_is_shared(&l.browser, &l.profile_dir)
+            }
+            // No lane, no lane sharing to configure: a machine driven as one
+            // machine has one set of windows and the input lease is what
+            // serialises it.
+            (None, _) => true,
+        };
+        if !shared {
+            if let Err(owner) = broker.claim_tab(&tab, &peer.peer_id).await {
+                let mut res = ActRes::new(st::BLOCKED, elapsed());
+                res.gen = Some(generation);
+                res.decision = Some(resolved.decision.clone());
+                res.gate = Some(kratos_protocol::GateReport {
+                    category: "tab_owned".into(),
+                    rule: Some(format!("tab_owned:{owner}")),
+                    scope_checked: Some(tab.clone()),
+                });
+                res.detail = Some(format!(
+                    "that tab belongs to another session on this lane ({owner}). Nothing ran."
+                ));
+                res.next = Some(
+                    "open your own tab for this work, or ask the operator to mark this lane \
+                     shared in the settings window"
+                        .into(),
+                );
+                broker.counters.record(st::BLOCKED);
+                journal_line(broker, peer, &req, &win, &res, Some(&resolved.decision), None).await;
+                return Ok(res);
+            }
         }
-        None => {
-            let grant = broker
-                .acquire_lease(
-                    &peer.peer_id,
-                    "input",
-                    Duration::from_millis(req.timeout_ms.max(5_000)),
-                    Duration::ZERO,
-                )
-                .await?;
-            (grant.token, true)
+    }
+
+    // -- 6. the input devices, but only if this action needs them ----------
+    //
+    // A DOM action is delivered by the page's own event system: it touches no
+    // pointer, so it needs no lease and does not care what the user is doing.
+    // Two sessions in two browser profiles therefore act at the same time,
+    // which is the whole point of lanes. Taking the lease for every action --
+    // which is what this did -- serialised two agents that could not have
+    // collided if they tried.
+    let chain = broker.route(effective_class, None).await;
+    if chain.is_empty() {
+        return Err(WireError::new(codes::NO_BACKEND, "no backend is connected to act through"));
+    }
+    let dom_first = chain.first() == Some(&Source::DomExt) && aim.instance.is_some();
+
+    let mut hold: Option<Hold> = None;
+    if !dom_first {
+        match take_input(broker, peer, &req).await? {
+            Taken::Held(h) => hold = Some(h),
+            Taken::Paused(waited) => {
+                let mut res = ActRes::new(st::PAUSED, elapsed());
+                res.gen = Some(generation);
+                res.gate = Some(gate_report);
+                res.decision = Some(resolved.decision.clone());
+                res.detail = Some(format!(
+                    "the person at this machine has been using the mouse or keyboard; waited \
+                     {waited}ms and did not take over"
+                ));
+                res.next = Some(
+                    "nothing has run. Wait for them to stop and send this step again; it is \
+                     unchanged and safe to repeat"
+                        .into(),
+                );
+                broker.counters.record(st::PAUSED);
+                journal_line(broker, peer, &req, &win, &res, Some(&resolved.decision), None).await;
+                return Ok(res);
+            }
         }
-    };
+    }
 
     // -- 7. baselines, then act, then look again ---------------------------
     let region = resolved.target.as_ref().and_then(|e| e.bbox);
@@ -910,10 +1001,46 @@ async fn act_inner(
         .await
         .unwrap_or((None, None, (None, None)));
 
-    let dispatch = execute(broker, effective_class, None, payload).await;
+    let dispatch = if dom_first {
+        // Try the page first, with no lease held. Only a dispatch that has to
+        // reach the OS needs the devices, so only that path waits for them --
+        // and for the user.
+        match execute(broker, &chain[..1], payload.clone(), aim.dom()).await {
+            Ok(v) => Ok(v),
+            // A timeout on a mutating action is never retried: it may already
+            // have landed, and clicking Send twice is worse than saying we do
+            // not know.
+            Err(e) if e.code == codes::BACKEND_TIMEOUT => Err(e),
+            Err(dom_error) => {
+                let rest = &chain[1..];
+                if rest.is_empty() {
+                    Err(dom_error)
+                } else {
+                    // The page ignored it, so the next attempt is OS input --
+                    // which does need the lease and does have to wait for the
+                    // user. The baselines above are a few milliseconds older
+                    // than they would otherwise be; a refused DOM dispatch is
+                    // fast, and re-measuring them would cost a screen grab to
+                    // save nothing.
+                    match take_input(broker, peer, &req).await {
+                        Ok(Taken::Held(h)) => {
+                            hold = Some(h);
+                            // The OS path, explicitly not the DOM one: the
+                            // page has already refused it.
+                            execute(broker, rest, payload, crate::target::Dom::Skip).await
+                        }
+                        Ok(Taken::Paused(_)) => Err(dom_error),
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+        }
+    } else {
+        execute(broker, &chain, payload, aim.dom()).await
+    };
 
-    if auto_lease {
-        broker.release_lease(&lease_token).await;
+    if let Some(h) = &hold {
+        h.release(broker).await;
     }
 
     let (act_source, backend_res) = match dispatch {
@@ -976,10 +1103,17 @@ async fn act_inner(
     .await
     .unwrap_or(((None, None), 0, false));
 
-    let after = observe_with_fallback(broker, class, None, req.window.as_deref(), Duration::from_millis(8_000))
-        .await
-        .map(|(_, o)| o)
-        .unwrap_or_default();
+    let after = observe_with_fallback(
+        broker,
+        class,
+        None,
+        aim.backend_window.as_deref(),
+        Duration::from_millis(8_000),
+        aim.dom(),
+    )
+    .await
+    .map(|(_, o)| o)
+    .unwrap_or_default();
 
     // -- 8. prove it ---------------------------------------------------------
     let expected = extract::quoted(&req.instruction);
@@ -1026,47 +1160,6 @@ async fn act_inner(
     Ok(res)
 }
 
-/// The one window this request is about, or an error that says why not.
-///
-/// A `window` string that matches two different applications is refused rather
-/// than resolved. Several windows of one program are fine -- they are the same
-/// program. Windows of different programs mean the string did not say which
-/// was meant, and the failure that matters there is not "no match", it is
-/// acting on the wrong one: a search for "Upwork" once resolved to an editor
-/// whose session was named after the job rather than to the browser showing
-/// the site, and nothing in the result said so.
-fn target_window(window: Option<&str>) -> Result<WindowRef, WireError> {
-    match classify::resolve_window(window) {
-        classify::Resolution::One(w) => Ok(w),
-        classify::Resolution::Ambiguous(all) => {
-            let listed: Vec<String> =
-                all.iter().take(6).map(|w| format!("{:?} ({})", w.title, w.exe)).collect();
-            Err(WireError::with_detail(
-                codes::AMBIGUOUS_WINDOW,
-                format!(
-                    "{:?} matches windows of {} different applications, so it does not say \
-                     which one you mean: {}",
-                    window.unwrap_or(""),
-                    all.iter()
-                        .map(|w| w.exe.to_ascii_lowercase())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len(),
-                    listed.join("; ")
-                ),
-                json!({ "candidates": all.iter().map(|w| json!({
-                    "title": w.title, "exe": w.exe, "class": w.class().as_str()
-                })).collect::<Vec<_>>() }),
-            ))
-        }
-        classify::Resolution::NotFound => Err(WireError::new(
-            codes::NO_TARGET,
-            match window {
-                Some(w) => format!("no visible window matches {w:?}"),
-                None => "there is no foreground window".to_string(),
-            },
-        )),
-    }
-}
 
 /// Collect the evidence and name which sources agreed.
 fn assemble_effect(
@@ -1136,22 +1229,121 @@ fn assemble_effect(
     }
 }
 
+
+
+/// The tab an element id belongs to: `brand:wN:tN` out of
+/// `brand:wN:tN:fN:eN`.
+///
+/// `None` for anything that is not a `dom-ext` id -- a UIA runtime id has no
+/// tab, and neither does a pixel detection.
+fn tab_key(id: &str) -> Option<String> {
+    let mut parts = id.split(':');
+    let brand = parts.next()?;
+    let window = parts.next()?;
+    let tab = parts.next()?;
+    // A frame segment is what tells a dom-ext id apart from `uia:<hwnd>:<rid>`.
+    let frame = parts.next()?;
+    if !window.starts_with('w') || !tab.starts_with('t') || !frame.starts_with('f') {
+        return None;
+    }
+    Some(format!("{brand}:{window}:{tab}"))
+}
+
+// ---------------------------------------------------------------------------
+// The input devices
+// ---------------------------------------------------------------------------
+
+/// A lease this action is holding, and whether it is ours to release.
+struct Hold {
+    token: String,
+    /// False when the agent passed its own lease: releasing somebody else's
+    /// lease on their behalf would end a sequence they meant to keep.
+    auto: bool,
+}
+
+impl Hold {
+    async fn release(&self, broker: &Arc<Broker>) {
+        if self.auto {
+            broker.release_lease(&self.token).await;
+        }
+    }
+}
+
+enum Taken {
+    Held(Hold),
+    /// The user kept using the machine for the whole budget.
+    Paused(u64),
+}
+
+/// Wait for the user, then take the input devices.
+///
+/// In that order on purpose: queueing for the lease first would mean holding
+/// the mouse while waiting for a human to stop using it.
+async fn take_input(
+    broker: &Arc<Broker>,
+    peer: &Arc<PeerHandle>,
+    req: &ActReq,
+) -> Result<Taken, WireError> {
+    let (enabled, idle_ms, max_ms) = {
+        let cfg = broker.config.read().await;
+        (
+            cfg.defaults.pause_on_user_input,
+            cfg.defaults.user_idle_ms,
+            cfg.defaults.pause_max_ms,
+        )
+    };
+    if enabled {
+        if let crate::activity::Pause::Busy(waited) =
+            crate::activity::wait_for_user_to_stop(idle_ms, max_ms).await
+        {
+            return Ok(Taken::Paused(waited));
+        }
+    }
+
+    match &req.lease {
+        Some(t) => {
+            broker.check_lease(t, &peer.peer_id).await?;
+            Ok(Taken::Held(Hold { token: t.clone(), auto: false }))
+        }
+        None => {
+            let grant = broker
+                .acquire_lease(
+                    &peer.peer_id,
+                    "input",
+                    Duration::from_millis(req.timeout_ms.max(5_000)),
+                    Duration::ZERO,
+                )
+                .await?;
+            Ok(Taken::Held(Hold { token: grant.token, auto: true }))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
 
-pub async fn verify(broker: &Arc<Broker>, req: VerifyReq) -> Result<VerifyRes, WireError> {
+pub async fn verify(
+    broker: &Arc<Broker>,
+    peer: &Arc<PeerHandle>,
+    req: VerifyReq,
+) -> Result<VerifyRes, WireError> {
     let started = Instant::now();
     broker.mark_agent_activity();
 
-    let win = target_window(req.window.as_deref())?;
-    let class = win.class();
+    // Verification asks about the same screen the action was aimed at, so it
+    // resolves through the same lane rules. Asking the model about the
+    // foreground window instead would answer a question nobody put.
+    let aim = crate::target::aim(broker, peer, req.window.as_deref()).await?;
+    let win = aim.window_or_brand();
+    let class = aim.class;
     let (_, obs) = observe_with_fallback(
         broker,
         class,
         None,
-        req.window.as_deref(),
+        aim.backend_window.as_deref(),
         Duration::from_millis(8_000),
+        aim.dom(),
     )
     .await?;
 

@@ -123,12 +123,16 @@ pub struct LeaseState {
 }
 
 impl LeaseState {
-    fn expire(&mut self, now: Instant) {
-        if let Some(l) = &self.current {
-            if l.expires <= now {
-                self.current = None;
-            }
+    /// Drop an expired lease. Returns whether one was dropped, because the
+    /// machine-wide guard has to be given back exactly once per acquisition
+    /// and the caller is the one holding the lock.
+    #[must_use]
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.current.as_ref().is_some_and(|l| l.expires <= now) {
+            self.current = None;
+            return true;
         }
+        false
     }
 }
 
@@ -236,6 +240,14 @@ pub struct Broker {
     pub config: RwLock<Config>,
     /// Per-harness decisions made since this broker started.
     pub approvals: Mutex<HashMap<String, Approval>>,
+    /// Which session first acted on which browser tab: `brand:wN:tN` to a
+    /// `peer_id`.
+    ///
+    /// "Tabs a session opened are owned by it" (spec §5). Nothing here can see
+    /// a tab being *opened* -- the extension reports tabs, not their history --
+    /// so first use is the proxy, and it is the same answer in every case that
+    /// matters: the session that opened a tab is the first to act on it.
+    tab_owners: Mutex<HashMap<String, String>>,
     /// The modification time of the config file as this broker last saw it,
     /// so a reload fires on somebody else's edit and not on its own write.
     config_seen: Mutex<Option<std::time::SystemTime>>,
@@ -251,6 +263,14 @@ pub struct Broker {
     pub peers: RwLock<HashMap<String, Arc<PeerHandle>>>,
     pub lease: Mutex<LeaseState>,
     pub lease_notify: Notify,
+    /// The machine-wide input guard: one mouse, one holder, across every
+    /// broker this Windows user is running.
+    ///
+    /// `None` only if the kernel object could not be created at all, in which
+    /// case the broker still works and the lease is per-broker as it was --
+    /// refusing to start over this would trade a rare, narrow race for a
+    /// desktop that cannot be driven.
+    input_guard: Option<kratos_ipc::win::InputGuard>,
     pub parked: Mutex<HashMap<String, Parked>>,
     pub last_observation: RwLock<Option<ObservationRecord>>,
     pub counters: Counters,
@@ -266,12 +286,25 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(config: Config, api_key: String) -> Arc<Self> {
+        Broker::with_input_guard(config, api_key, None)
+    }
+
+    /// For tests: a broker whose machine-wide input guard has a name of its
+    /// own, so two brokers in one test process do not contend for the real
+    /// one -- and neither contends with the broker the operator may have
+    /// running while the suite runs.
+    pub fn with_input_guard(
+        config: Config,
+        api_key: String,
+        guard: Option<&str>,
+    ) -> Arc<Self> {
         let gate = kratos_gate::SafetyGate::new(config.gate.clone());
         let decider = kratos_decide::build(&config.decider, api_key);
         let journal = Journal::from_config(&config.log);
         Arc::new(Broker {
             config: RwLock::new(config),
             approvals: Mutex::new(HashMap::new()),
+            tab_owners: Mutex::new(HashMap::new()),
             config_seen: Mutex::new(config_mtime()),
             approval_gate: Mutex::new(()),
             gate: Mutex::new(gate),
@@ -280,6 +313,20 @@ impl Broker {
             peers: RwLock::new(HashMap::new()),
             lease: Mutex::new(LeaseState::default()),
             lease_notify: Notify::new(),
+            input_guard: match guard
+                .map(|g| Ok(format!("kratos.input.{g}")))
+                .unwrap_or_else(kratos_ipc::input_guard_name)
+                .and_then(|n| kratos_ipc::win::InputGuard::open(&n))
+            {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    eprintln!(
+                        "kratos-broker: no machine-wide input guard ({e}); the input lease is \
+                         per-broker only"
+                    );
+                    None
+                }
+            },
             parked: Mutex::new(HashMap::new()),
             last_observation: RwLock::new(None),
             counters: Counters::default(),
@@ -351,11 +398,13 @@ impl Broker {
 
     pub async fn remove_peer(&self, peer_id: &str) {
         self.peers.write().await.remove(peer_id);
+        self.release_tabs(peer_id).await;
         // Anyone holding the input lease who disconnects must not keep it.
         let mut lease = self.lease.lock().await;
         if lease.current.as_ref().is_some_and(|l| l.holder == peer_id) {
             lease.current = None;
             drop(lease);
+            self.give_back_input();
             self.lease_notify.notify_waiters();
         }
     }
@@ -455,8 +504,22 @@ impl Broker {
             let notified = self.lease_notify.notified();
             {
                 let mut st = self.lease.lock().await;
-                st.expire(Instant::now());
+                if st.expire(Instant::now()) {
+                    self.give_back_input();
+                }
                 if st.current.is_none() && st.queue.front() == Some(&ticket) {
+                    // The machine-wide guard decides, not this broker's own
+                    // bookkeeping: another broker for this user may hold the
+                    // mouse, and its lease is invisible from here.
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if !self.take_input(left) {
+                        st.queue.retain(|t| *t != ticket);
+                        return Err(WireError::with_detail(
+                            codes::LEASE_HELD,
+                            "another kratos broker on this machine holds the input devices",
+                            json!({"holder": "another-broker", "expires_in_ms": 0}),
+                        ));
+                    }
                     st.queue.pop_front();
                     let token = kratos_ipc::next_id("l");
                     st.current = Some(Lease {
@@ -499,14 +562,40 @@ impl Broker {
         if st.current.as_ref().is_some_and(|l| l.token == token) {
             st.current = None;
             drop(st);
+            self.give_back_input();
             self.lease_notify.notify_waiters();
+        }
+    }
+
+    /// Take the machine-wide guard, if there is one.
+    ///
+    /// Waiting here rather than only polling is what makes the FIFO queue mean
+    /// anything across brokers: the second broker's request waits out the
+    /// first's lease instead of failing immediately.
+    fn take_input(&self, wait: Duration) -> bool {
+        match &self.input_guard {
+            Some(g) => {
+                // Clamped: a wait budget is milliseconds in a u32, and an
+                // absurd one would wrap rather than wait.
+                let ms = wait.as_millis().min(60_000) as u32;
+                g.try_take(ms)
+            }
+            None => true,
+        }
+    }
+
+    fn give_back_input(&self) {
+        if let Some(g) = &self.input_guard {
+            g.release();
         }
     }
 
     /// Validate a lease token supplied with an action.
     pub async fn check_lease(&self, token: &str, holder: &str) -> Result<(), WireError> {
         let mut st = self.lease.lock().await;
-        st.expire(Instant::now());
+        if st.expire(Instant::now()) {
+            self.give_back_input();
+        }
         match &st.current {
             Some(l) if l.token == token && l.holder == holder => Ok(()),
             Some(l) if l.token == token => Err(WireError::new(
@@ -522,7 +611,9 @@ impl Broker {
 
     pub async fn lease_snapshot(&self) -> Value {
         let mut st = self.lease.lock().await;
-        st.expire(Instant::now());
+        if st.expire(Instant::now()) {
+            self.give_back_input();
+        }
         match &st.current {
             Some(l) => json!({
                 "scope": l.scope,
@@ -574,6 +665,32 @@ impl Broker {
             ));
         }
         Ok(p)
+    }
+
+    // -- tab ownership ------------------------------------------------------
+
+    /// Claim a tab for a session, or report who already has it.
+    ///
+    /// `Ok(())` means it is this session's to act on; `Err(owner)` names the
+    /// session that got there first.
+    pub async fn claim_tab(&self, tab: &str, peer_id: &str) -> Result<(), String> {
+        let mut owners = self.tab_owners.lock().await;
+        match owners.get(tab) {
+            Some(owner) if owner != peer_id => Err(owner.clone()),
+            Some(_) => Ok(()),
+            None => {
+                owners.insert(tab.to_string(), peer_id.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Forget a disconnected session's tabs.
+    ///
+    /// Otherwise a crashed agent would own its tabs until the broker exited,
+    /// and the agent that replaced it could not touch the work it left behind.
+    pub async fn release_tabs(&self, peer_id: &str) {
+        self.tab_owners.lock().await.retain(|_, owner| owner != peer_id);
     }
 
     // -- hot reload ---------------------------------------------------------
@@ -779,6 +896,32 @@ impl Broker {
                        "connected_ms": p.connected_at.elapsed().as_millis() as u64})
             })
             .collect();
+
+        // Resolved rather than read back from each session, so `status` says
+        // where a session *would* be now -- which is the question somebody
+        // asks after changing an allocation.
+        let attached = crate::lane::attached_instances_with(self, &cfg).await;
+        let agents: Vec<Arc<PeerHandle>> = self
+            .peers
+            .read()
+            .await
+            .values()
+            .filter(|p| p.role == kratos_protocol::Role::Agent)
+            .cloned()
+            .collect();
+        let lanes: Vec<Value> = agents
+            .iter()
+            .map(|p| {
+                json!({
+                    "peer_id": p.peer_id,
+                    "harness": p.harness_id,
+                    "agent": p.identity.agent,
+                    "session": p.identity.session,
+                    "lane": crate::lane::resolve_opt(&cfg, &p.identity, &attached),
+                })
+            })
+            .collect();
+
         let decider = self.decider.read().await;
         json!({
             "broker": BROKER_NAME,
@@ -799,6 +942,18 @@ impl Broker {
                 "key_present": decider.configured(),
             },
             "counters": self.counters.snapshot(),
+            // Which lane every session is in. Reported from `status` and not
+            // only from the UI's `lane.list`, because the first symptom of a
+            // misallocated lane is an agent reading a window it did not
+            // expect, and the agent can read this.
+            "lanes": lanes,
+            "pause": {
+                "on_user_input": cfg.defaults.pause_on_user_input,
+                "user_idle_ms": cfg.defaults.user_idle_ms,
+                "pause_max_ms": cfg.defaults.pause_max_ms,
+                "since_real_input_ms": crate::activity::since_real_input_ms(),
+                "watching": crate::activity::watching(),
+            },
             "journal": self.journal.read().await.path().display().to_string(),
             // Which config this broker actually read. A broker started by
             // hand, from a shell with KRATOS_CONFIG set, is reading a
@@ -827,7 +982,16 @@ mod tests {
     fn broker() -> Arc<Broker> {
         let mut cfg = Config::default();
         cfg.decider.provider = "mock".into();
-        Broker::new(cfg, String::new())
+        // A guard of its own per broker: these tests are about the lease's
+        // own bookkeeping, they run in parallel, and the machine-wide guard
+        // would make them take turns -- or fight the operator's broker.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "unit-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        Broker::with_input_guard(cfg, String::new(), Some(&name))
     }
 
     fn peer(id: &str, role: Role, source: Option<Source>) -> Arc<PeerHandle> {

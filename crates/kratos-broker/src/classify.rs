@@ -232,6 +232,38 @@ pub fn find_all_by_title(needle: &str) -> Vec<WindowRef> {
         .collect()
 }
 
+/// Every visible, titled window, described.
+///
+/// One `EnumWindows` and one process-image lookup per window. Measured at
+/// well under a millisecond on an ordinary desktop, which is why lane
+/// filtering can afford to describe everything and decide in Rust rather than
+/// matching inside the callback: the callback only knows titles, and "which
+/// lane does this window belong to" is a question about the process.
+pub fn visible_windows() -> Vec<WindowRef> {
+    let mut search = Search { needle: String::new(), found: Vec::new() };
+    unsafe {
+        EnumWindows(Some(enum_proc_all), &mut search as *mut Search as LPARAM);
+    }
+    search.found.into_iter().filter_map(|h| describe(h as *mut c_void as HWND)).collect()
+}
+
+unsafe extern "system" fn enum_proc_all(hwnd: HWND, lparam: LPARAM) -> Bool {
+    let search = &mut *(lparam as *mut Search);
+    if IsWindowVisible(hwnd) == 0 || window_title(hwnd).is_empty() {
+        return 1;
+    }
+    search.found.push(hwnd as isize);
+    1
+}
+
+/// Visible windows belonging to one Chromium brand.
+pub fn windows_of_brand(brand: &str) -> Vec<WindowRef> {
+    visible_windows()
+        .into_iter()
+        .filter(|w| w.brand().is_some_and(|b| b.eq_ignore_ascii_case(brand)))
+        .collect()
+}
+
 /// Decide between the windows a `window` argument matched.
 ///
 /// Several windows of one application are not a problem: they are the same

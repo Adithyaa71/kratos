@@ -58,6 +58,48 @@ pub struct AttachedInstance {
     pub bound_to: Option<(String, String)>,
 }
 
+/// The browser this identity is allocated, as written: `""` when nothing is
+/// set, which means fall through to the default.
+fn allocated_browser(config: &Config, id: &Identity) -> String {
+    let from_harness = id
+        .harness
+        .as_deref()
+        .and_then(|h| config.harness(h))
+        .map(|h| h.browser.trim().to_string())
+        .unwrap_or_default();
+    if !from_harness.is_empty() {
+        return from_harness;
+    }
+    config.defaults.browser.trim().to_string()
+}
+
+/// Whether this session has a lane at all.
+///
+/// `none` is a deliberate allocation, not an absence of one: it says "do not
+/// put this client in a browser lane; let it drive the machine as one
+/// machine", which is what a single-agent setup on a desktop with no browser
+/// open actually wants. With no lane, `window: null` means the foreground
+/// window, as it did before lanes existed.
+///
+/// It is the only way back to that behaviour, and it is the operator's to
+/// choose: the default is `os-default`, which gives a lane.
+pub fn lanes_off(config: &Config, id: &Identity) -> bool {
+    allocated_browser(config, id).eq_ignore_ascii_case("none")
+}
+
+/// Resolve the lane for one session, or `None` when the operator has turned
+/// lanes off for it.
+pub fn resolve_opt(
+    config: &Config,
+    id: &Identity,
+    attached: &[AttachedInstance],
+) -> Option<Lane> {
+    if lanes_off(config, id) {
+        return None;
+    }
+    Some(resolve(config, id, attached))
+}
+
 /// Resolve the lane for one session.
 ///
 /// `attached` is every live `dom-ext` instance. It decides the lane's *state*
@@ -202,6 +244,15 @@ fn assignment(id: &Identity) -> LaneAssignment {
 /// Every live `dom-ext` instance, as lane resolution wants to see it.
 pub async fn attached_instances(broker: &crate::state::Broker) -> Vec<AttachedInstance> {
     let config = broker.config.read().await;
+    attached_instances_with(broker, &config).await
+}
+
+/// The same, for a caller that already holds the config read lock -- taking it
+/// twice on one task deadlocks under a writer.
+pub async fn attached_instances_with(
+    broker: &crate::state::Broker,
+    config: &Config,
+) -> Vec<AttachedInstance> {
     broker
         .backends_for(Source::DomExt)
         .await

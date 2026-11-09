@@ -29,6 +29,24 @@ pub fn instance_name(base: &str) -> io::Result<String> {
     Ok(format!("{}.{}", base, win::current_user_sid()?))
 }
 
+/// The name of the machine-wide input guard for this Windows user.
+///
+/// Per user, not per pipe: one person has one mouse, so a second broker on a
+/// second pipe name must not be able to hand out a second input lease. The
+/// override exists because the test suite deliberately runs several brokers at
+/// once and they must not contend for the real one -- it is a test seam, like
+/// `KRATOS_PIPE`, and is not a way to get a second lease on a real machine
+/// (nothing but a test sets it).
+pub fn input_guard_name() -> io::Result<String> {
+    if let Some(explicit) = std::env::var_os("KRATOS_INPUT_GUARD") {
+        let s = explicit.to_string_lossy().trim().to_string();
+        if !s.is_empty() {
+            return Ok(format!("kratos.input.{s}"));
+        }
+    }
+    Ok(format!("kratos.input.{}", win::current_user_sid()?))
+}
+
 // ---------------------------------------------------------------------------
 // Framing
 // ---------------------------------------------------------------------------

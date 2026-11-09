@@ -22,7 +22,8 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, OpenProcessToken,
+    CreateMutexW, CreateSemaphoreW, GetCurrentProcess, OpenProcessToken, ReleaseSemaphore,
+    WaitForSingleObject,
 };
 
 fn last_error() -> io::Error {
@@ -184,6 +185,74 @@ impl SingleInstance {
 }
 
 impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { CloseHandle(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The machine-wide input guard
+// ---------------------------------------------------------------------------
+
+/// A named, count-of-one semaphore: whoever holds it owns the mouse and
+/// keyboard for this Windows user.
+///
+/// There is one physical pointer, and the broker's own lease only serialises
+/// the agents attached to *that* broker. Two brokers -- an old build still
+/// running, a test, a second pipe name -- each had their own lease and each
+/// handed it out, so two agents drove one mouse. This is the primitive that
+/// makes the lease machine-wide rather than per-process.
+///
+/// A **semaphore**, not a mutex: a Win32 mutex is owned by the thread that
+/// took it and may only be released by that thread, which a tokio runtime
+/// cannot promise. A semaphore has no thread affinity.
+///
+/// Caveat, written down because it is the failure mode: a semaphore's count is
+/// not restored when a process holding it dies. The object is destroyed when
+/// the last handle closes, so a crashed single broker leaves nothing behind --
+/// the next one creates it fresh. Two processes holding handles, one of them
+/// killed while it held the count, would leave the other waiting until it
+/// exits. That is a test-only configuration, and `try_take`'s budget is what
+/// stops it being a hang.
+pub struct InputGuard {
+    handle: HANDLE,
+}
+
+unsafe impl Send for InputGuard {}
+unsafe impl Sync for InputGuard {}
+
+/// `WaitForSingleObject` took it.
+const WAIT_OBJECT_0: u32 = 0;
+
+impl InputGuard {
+    pub fn open(name: &str) -> io::Result<Self> {
+        let full = format!("Local\\{name}");
+        // Initial count 1, maximum 1: free when nobody holds it.
+        let handle = unsafe { CreateSemaphoreW(std::ptr::null(), 1, 1, wide(&full).as_ptr()) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(last_error());
+        }
+        Ok(InputGuard { handle })
+    }
+
+    /// Take the guard, waiting up to `timeout_ms`. `false` means somebody else
+    /// has it.
+    pub fn try_take(&self, timeout_ms: u32) -> bool {
+        unsafe { WaitForSingleObject(self.handle, timeout_ms) == WAIT_OBJECT_0 }
+    }
+
+    /// Give it back. Releasing one that is not held returns `false`, which is
+    /// the only reason the result is reported at all: a double release is a
+    /// bug in the caller, not a condition to recover from.
+    pub fn release(&self) -> bool {
+        unsafe { ReleaseSemaphore(self.handle, 1, std::ptr::null_mut()) != 0 }
+    }
+}
+
+impl Drop for InputGuard {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { CloseHandle(self.handle) };

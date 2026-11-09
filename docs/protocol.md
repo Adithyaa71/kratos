@@ -276,8 +276,22 @@ superseded is the only notice it gets.
 {"op":"observe","payload":{"window":null,"prefer":null,"timeout_ms":8000}}
 ```
 
-`window` — substring match on title; `null` means the foreground window.
+`window` — substring match on title. **`null` means this session's lane**, not
+the foreground window: the active tab of the browser and profile the session
+resolved to (§3.0.1). A session with no lane — one whose allocation is
+`browser: "none"` — keeps the old meaning, the window in front.
+
 `prefer` — force a backend `source`; `null` means routing policy (5.1).
+
+**Windows of other lanes are invisible.** A `window` string that matches only
+another lane's browser is `no_target`, with the lane named in the detail, and
+never a silent hit on somebody else's screen. Native windows belong to no lane
+and stay visible to every session: there is one Notepad, and the input lease
+is what serialises it.
+
+> Before lanes, `null` was `GetForegroundWindow()` — the same answer for every
+> agent on the broker. Two agents working at once drove whatever the *user* was
+> looking at, and each could read the other's screen.
 
 ```json
 {"ok":true,"payload":{
@@ -387,6 +401,7 @@ decided by the model.
 | `refused` | Decision confidence below `threshold`. Nothing ran. `decision` is still returned so the agent can see the near-miss. |
 | `blocked` | Gate denylist or rate limit. Nothing ran, no confirmation possible. |
 | `killed` | Kill switch engaged for a scope covering this target. Nothing ran. |
+| `paused` | The person at the machine was using the mouse or keyboard, so an action that needed OS input did not take it. Nothing ran; the step is unchanged and safe to send again. |
 
 `needs_confirmation` carries:
 ```json
@@ -429,6 +444,40 @@ approved. For gate rules configured `require_os_dialog`, that is not enough —
 the broker pops a native OS dialog that no agent can click, and `confirm`
 completes only if a human clicks it (5.3).
 
+### 4.2a Who waits for whom
+
+Two rules decide whether an `act` touches the input devices at all.
+
+**A DOM action takes no lease.** It is delivered by the page's own event
+system and touches no pointer, so two sessions in two browser profiles act at
+the same time — which is the point of lanes. The lease is taken only when the
+dispatch has to reach the OS: a native window, or a fallback after the page
+ignored a synthetic event. Taking it for every action, which is what this did,
+serialised two agents that could not have collided if they tried.
+
+**An action that needs OS input waits for the person at the machine.** If real
+mouse or keyboard input arrived within `defaults.user_idle_ms` (1500ms), the
+action waits for quiet up to `defaults.pause_max_ms` (30s) and then returns
+`paused` with nothing run. Injected input — every action the agent itself
+takes — is ignored: `LLKHF_INJECTED` and `LLMHF_INJECTED` on a low-level hook
+say which is which, and an agent that counted its own clicks would pause
+itself after the first one. `status.pause` reports the settings, how long it
+has been since real input, and whether the hooks are installed at all.
+
+### 4.2b Tab ownership
+
+Two sessions can share one lane — two agents of one harness — and then they
+share a browser profile, its logins and its tabs. A tab belongs to the session
+that first acted on it; another session's `act` on it returns `blocked` with
+`gate.category: "tab_owned"` and the owner's `peer_id` in the rule. The user
+can set `lanes[].shared` for a lane to turn that off. A session that
+disconnects stops owning anything, so a crashed agent does not take its tabs
+with it.
+
+Ownership is recorded on first *use*, not on opening: nothing here can see a
+tab being opened — the extension reports tabs, not their history — and the
+session that opens a tab is the first to act on it in every case that matters.
+
 ### 4.5 `lease.acquire` and `lease.release`
 
 ```json
@@ -439,7 +488,16 @@ completes only if a human clicks it (5.3).
 ```
 
 There is exactly one mouse and one keyboard. The `input` lease serialises them
-across agents. `wait_ms` queues FIFO; `0` fails fast with `lease_held` and
+across agents — and across **brokers**: the holder also holds a named
+semaphore `Local\kratos.input.<user-sid>`, so a second broker (an old build
+still running, a test on another pipe) cannot hand out a second lease on the
+same devices. The broker's own queue orders the agents attached to it; the
+semaphore orders the brokers.
+
+One broker per OS user is the other half of that: the single-instance guard is
+keyed on the user, not on the pipe name, so `KRATOS_PIPE` no longer buys a
+second broker with its own gate, journal and lease. It remains a test seam,
+and setting it is what puts the pipe name back into both guards. `wait_ms` queues FIFO; `0` fails fast with `lease_held` and
 `detail:{"holder":"a-2","expires_in_ms":4120}`.
 
 An `act` without `lease` auto-acquires for the duration of that one action, so
@@ -935,6 +993,7 @@ settings UI is the intended editor; the file is the source of truth.
   "harnesses": [{"id":"claude-code","label":"","browser":"brave","approved":true}],
   "agents": [{"id":"agent-a","label":"","profile_dir":"Profile 2"}],
   "instances": [{"token":"9f2c…","brand":"brave","profile_dir":"Default"}],
+  "lanes": [{"browser":"brave","profile_dir":"Default","shared":false}],
   "defaults": {"browser":"os-default","profile":"last-used","open_method":"direct",
                "pause_on_user_input":true,"user_idle_ms":1500,"pause_max_ms":30000}
 }
@@ -952,6 +1011,15 @@ window is the only thing that writes them.** An `agent` peer cannot:
   empty means `defaults.profile`.
 * `instances[]` pairs an extension instance token with the profile it runs in.
   Written by `instance.bind`.
+* `lanes[]` holds what the user has said about one `(browser, profile_dir)`
+  pair. Today that is `shared` (4.2b). The design document names no field for
+  it and §5 requires one, so it is keyed on what a lane *is*.
+* **`defaults.browser: "none"`** turns lanes off for every harness that has no
+  browser of its own, and `harnesses[].browser: "none"` does it for one. Those
+  sessions get no lane, and `window: null` means the foreground window as it
+  did before lanes existed. It is the deliberate choice for a single-agent
+  desktop — one machine, driven as one machine — and the only way back to that
+  behaviour. The default is `os-default`, which gives a lane.
 * `defaults.open_method`, `pause_on_user_input`, `user_idle_ms` and
   `pause_max_ms` are read by the ensure-lane ladder and the user-activity
   pause.

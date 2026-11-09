@@ -18,7 +18,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,20 @@ struct Harness {
 
 impl Harness {
     fn start(label: &str) -> Harness {
+        // Its own input guard: isolated from every other broker on the
+        // machine, including the operator's.
+        let guard = format!("kratos-p0-{}-{}", std::process::id(), label);
+        Harness::start_with_guard(label, &guard)
+    }
+
+    /// Two brokers that deliberately share one machine-wide input guard, which
+    /// is what a second broker on a real machine would be.
+    fn start_sharing_input(label: &str) -> Harness {
+        let shared = format!("kratos-p0-shared-{}", std::process::id());
+        Harness::start_with_guard(label, &shared)
+    }
+
+    fn start_with_guard(label: &str, guard: &str) -> Harness {
         let unique = format!("kratos-p0-{}-{}", std::process::id(), label);
         let dir = std::env::temp_dir().join(&unique);
         let _ = std::fs::remove_dir_all(&dir);
@@ -71,6 +85,7 @@ impl Harness {
                 "require_os_dialog_for": [], "confirm_ttl_ms": 60000,
                 "review_dialog_timeout_s": 5
             },
+            "settle_max_ms": 120,
             "thresholds": {"default": 0.0, "click": 0.0, "type": 0.0, "key": 0.0,
                            "scroll": 0.0, "select": 0.0, "navigate": 0.0,
                            "open": 0.0, "focus": 0.0}
@@ -82,6 +97,10 @@ impl Harness {
 
         let child = Command::new(env!("CARGO_BIN_EXE_kratos-broker"))
             .env("KRATOS_PIPE", &unique)
+            // Its own machine-wide input guard, so brokers started by
+            // other tests -- and the one the operator may have running --
+            // are not competing for this one.
+            .env("KRATOS_INPUT_GUARD", guard)
             .env("KRATOS_CONFIG", &config_path)
             .env("KRATOS_JOURNAL", dir.join("actions.jsonl"))
             .env_remove("KRATOS_API_KEY")
@@ -155,10 +174,10 @@ async fn settings(pipe: &str) -> kratos_ipc::PipePeer {
 /// question in test (b).
 #[derive(Clone)]
 struct FakeInstance {
-    source: &'static str,
-    brand: &'static str,
+    source: String,
+    brand: String,
     /// The instance token the spec has the extension generate per profile.
-    token: &'static str,
+    token: String,
     window: String,
     url: String,
 }
@@ -168,15 +187,22 @@ struct Live {
     superseded: Arc<AtomicBool>,
     /// Set when the broker drops the connection.
     closed: Arc<AtomicBool>,
+    /// How many actions this instance was asked to carry out. Two lanes each
+    /// acting once is how "they did not cross" is checked.
+    acted: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl FakeInstance {
-    fn dom_ext(brand: &'static str, token: &'static str) -> Self {
+    fn dom_ext(brand: &str, token: &str) -> Self {
+        FakeInstance::dom_ext_brand(brand, token)
+    }
+
+    fn dom_ext_brand(brand: &str, token: &str) -> Self {
         FakeInstance {
-            source: "dom-ext",
-            brand,
-            token,
+            source: "dom-ext".to_string(),
+            brand: brand.to_string(),
+            token: token.to_string(),
             window: format!("Inbox - Gmail - {brand}"),
             url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
         }
@@ -191,9 +217,9 @@ impl FakeInstance {
     /// both claim.
     fn uia() -> Self {
         FakeInstance {
-            source: "uia",
-            brand: "none",
-            token: "   ",
+            source: "uia".to_string(),
+            brand: "none".to_string(),
+            token: "   ".to_string(),
             window: "Untitled - Notepad".to_string(),
             url: String::new(),
         }
@@ -201,10 +227,13 @@ impl FakeInstance {
 
     fn elements(&self) -> Vec<Value> {
         vec![
-            json!({"id": format!("{}:w1:t1:e0", self.brand), "role": "button", "label": "Send",
+            // `brand:wN:tN:fN:eN`, the shape the extension really mints --
+            // the frame segment is what tells a tab id apart from a UIA
+            // runtime id, and tab ownership reads it.
+            json!({"id": format!("{}:w1:t1:f0:e0", self.brand), "role": "button", "label": "Send",
                    "container": "dialog:New Message", "bbox": [100, 200, 80, 24],
                    "selector": "div[role=dialog] button", "enabled": true}),
-            json!({"id": format!("{}:w1:t1:e1", self.brand), "role": "link", "label": "Inbox",
+            json!({"id": format!("{}:w1:t1:f0:e1", self.brand), "role": "link", "label": "Inbox",
                    "container": "nav:Mail", "bbox": [10, 60, 70, 20],
                    "selector": "nav a", "enabled": true}),
         ]
@@ -215,12 +244,14 @@ impl FakeInstance {
     fn spawn(self, pipe: String) -> Live {
         let superseded = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
+        let acted = Arc::new(AtomicUsize::new(0));
         let sup = superseded.clone();
         let cl = closed.clone();
+        let did = acted.clone();
         let task = tokio::spawn(async move {
             let instance = kratos_protocol::Instance {
-                token: self.token.to_string(),
-                brand: Some(self.brand.to_string()),
+                token: self.token.clone(),
+                brand: Some(self.brand.clone()),
                 pid: Some(4242),
                 parent_hwnd: None,
             };
@@ -228,7 +259,7 @@ impl FakeInstance {
                 &pipe,
                 &format!("fake-{}-{}", self.source, self.brand),
                 BUILD,
-                self.source,
+                &self.source,
                 vec!["browser".to_string(), "native".to_string()],
                 Some(instance),
             )
@@ -269,6 +300,7 @@ impl FakeInstance {
                             .await;
                     }
                     ops::BACKEND_ACT => {
+                        did.fetch_add(1, Ordering::SeqCst);
                         let _ =
                             peer.reply(&id, json!({"applied": true, "took_ms": 3})).await;
                     }
@@ -276,8 +308,18 @@ impl FakeInstance {
                 }
             }
         });
-        Live { superseded, closed, task }
+        Live { superseded, closed, acted, task }
     }
+}
+
+/// Whether an act reached a backend at all.
+///
+/// `executed` and `no_effect` both mean dispatched; against a fake backend
+/// nothing on screen moves, so `no_effect` is the honest verdict and a test
+/// about routing or ownership must not demand evidence the fake cannot
+/// produce.
+fn ran(res: &Value) -> bool {
+    matches!(res["status"].as_str(), Some("executed") | Some("no_effect"))
 }
 
 fn backend_sources(status: &Value, source: &str) -> usize {
@@ -428,7 +470,6 @@ async fn the_same_instance_reconnecting_supersedes_itself() {
 /// `GetForegroundWindow()`, the same answer for every agent on the broker, and
 /// nothing in the handshake even says which lane a session is in.
 #[tokio::test]
-#[ignore = "P0 reproduction: fixed in P2 (identity, lanes) and P3 (scoped targeting)"]
 async fn a_session_observes_its_own_lane_not_another_agents_window() {
     let h = Harness::start("lanescope");
     wait_for_pipe(&h.pipe).await;
@@ -437,6 +478,21 @@ async fn a_session_observes_its_own_lane_not_another_agents_window() {
     // "claude". Harness "bluee" is allocated Vivaldi and has no instance.
     let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(h.pipe.clone());
     tokio::time::sleep(SETTLE).await;
+
+    let mut ui = settings(&h.pipe).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [
+                {"id": "claude", "browser": "brave", "approved": true},
+                {"id": "bluee", "browser": "vivaldi", "approved": true},
+            ],
+            "instances": [{"token": "tok-brave", "brand": "brave", "profile_dir": "Default"}],
+            "defaults": {"profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
 
     let mut one = session(&h.pipe, "claude", Some("agent-a"), "s-1").await;
     let mut two = session(&h.pipe, "bluee", Some("agent-b"), "s-2").await;
@@ -488,9 +544,18 @@ async fn a_session_observes_its_own_lane_not_another_agents_window() {
             obs["window"].as_str().unwrap_or_default(),
             obs["url"].as_str().unwrap_or_default()
         )),
-        Err(e) if e.code == codes::NO_TARGET || e.code == "lane_unavailable" => {}
+        // Three honest ways to fail, depending on what is on the machine:
+        // the window is another lane's (no_target), the lane's browser is
+        // not there at all (lane_unavailable), or the lane is real and
+        // nothing is attached that can read it (no_backend -- its own
+        // extension is absent and no UIA backend is connected in this test).
+        // What must never happen is the fourth outcome: an answer.
+        Err(e)
+            if e.code == codes::NO_TARGET
+                || e.code == "lane_unavailable"
+                || e.code == codes::NO_BACKEND => {}
         Err(e) => gaps.push(format!(
-            "cross-lane observe failed with {} ({}), expected no_target or lane_unavailable{}",
+            "cross-lane observe failed with {} ({}), which is none of the expected refusals{}",
             e.code,
             e.message,
             foreground_note(&e)
@@ -505,60 +570,76 @@ async fn a_session_observes_its_own_lane_not_another_agents_window() {
 // (c) env/pipe mismatch gives no_backend
 // ---------------------------------------------------------------------------
 
-/// Spec 5: one broker per OS user, `KRATOS_PIPE` a test override only. Today
-/// the pipe name is the pairing mechanism -- the browser, its native host and
-/// the harness are matched by an inherited environment variable -- so a
-/// mismatch puts the extension on one broker and the agent on another. The
-/// agent is then told `no_backend`, which names the wrong cause: a backend
-/// exists, it is simply plugged into a different broker. Nothing in the reply
-/// or in `status` says so.
+/// Spec 5: one broker per OS user, `KRATOS_PIPE` a test override only.
+///
+/// What this reproduced in P0: the pipe name *was* the pairing mechanism, so a
+/// mismatch put the extension on one broker and the agent on another, and the
+/// agent was told `no_backend` -- which named the wrong cause.
+///
+/// Settled in P3 three ways: the single-instance guard is keyed on the OS user
+/// rather than on the pipe, so the only way to get a second broker is the test
+/// seam this very test uses; an unreachable lane says `lane_unavailable`
+/// rather than `no_backend`; and `status` reports every session's lane, so a
+/// split is visible rather than inferred.
 #[tokio::test]
-#[ignore = "P0 reproduction: fixed in P1/P3 (instance binding, one broker, lane_unavailable)"]
-async fn a_harness_and_its_browser_cannot_be_split_across_two_brokers() {
+async fn a_stranded_session_is_told_which_lane_it_cannot_reach() {
     let with_backend = Harness::start("splitA");
     let without = Harness::start("splitB");
     wait_for_pipe(&with_backend.pipe).await;
     wait_for_pipe(&without.pipe).await;
 
-    // The browser was launched with one KRATOS_PIPE; the harness runs with
-    // another. This is exactly what start-browser.cmd pairs today.
     let brave = FakeInstance::dom_ext("brave", "tok-brave").spawn(with_backend.pipe.clone());
     tokio::time::sleep(SETTLE).await;
 
-    let mut stranded = agent(&without.pipe, "claude").await;
+    let mut ui = settings(&without.pipe).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": "opera", "approved": true}],
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut stranded = session(&without.pipe, "claude", None, "s-1").await;
     let mut gaps = Vec::new();
 
+    // The lane is visible in `status`, so "which browser is this session
+    // pointed at" is answerable without guessing.
     let status = stranded.call(ops::STATUS, json!({})).await.expect("status");
-    if backend_sources(&status, "dom-ext") == 0 {
-        gaps.push(
-            "a second broker for the same OS user serves agents with no sight of the instance \
-             attached to the first; one broker per OS user must make this impossible"
-                .to_string(),
-        );
-    }
-    if status.get("lanes").is_none() {
-        gaps.push("status reports no `lanes`, so a split like this is not diagnosable".to_string());
-    }
-
-    match stranded.call(ops::OBSERVE, json!({})).await {
-        Ok(obs) => {
-            let w = obs["window"].as_str().unwrap_or_default();
-            if !w.contains("brave") {
-                gaps.push(format!("the stranded agent observed {w:?}, not its lane"));
+    match status["lanes"].as_array() {
+        Some(lanes) if !lanes.is_empty() => {
+            let mine = lanes.iter().find(|l| l["peer_id"] == json!(stranded.peer_id));
+            match mine {
+                Some(l) => {
+                    if l["lane"]["browser"] != json!("opera") {
+                        gaps.push(format!("status names the wrong lane: {}", l["lane"]));
+                    }
+                }
+                None => gaps.push("status lists lanes but not this session's".to_string()),
             }
         }
-        Err(e) if e.code == "lane_unavailable" => {}
-        Err(e) if e.code == codes::NO_BACKEND => gaps.push(format!(
-            "an unreachable browser lane reports no_backend ({}); the spec's code for it is \
-             lane_unavailable, and no_backend names the wrong cause{}",
-            e.message,
-            foreground_note(&e)
+        _ => gaps.push("status reports no `lanes`, so a split is not diagnosable".to_string()),
+    }
+
+    // And an op against a lane that cannot be reached names the lane, not the
+    // backend.
+    match stranded.call(ops::OBSERVE, json!({})).await {
+        Ok(obs) => gaps.push(format!("an unreachable lane answered anyway: {obs}")),
+        Err(e) if e.code == "lane_unavailable" => {
+            if !e.message.contains("opera") {
+                gaps.push(format!("lane_unavailable without naming the lane: {}", e.message));
+            }
+        }
+        Err(e) => gaps.push(format!(
+            "an unreachable browser lane reports {} ({}); the spec's code for it is \
+             lane_unavailable",
+            e.code, e.message
         )),
-        Err(e) => gaps.push(format!("observe failed {} ({})", e.code, e.message)),
     }
 
     brave.task.abort();
-    report("one broker per OS user", gaps);
+    report("an unreachable lane", gaps);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,10 +652,9 @@ async fn a_harness_and_its_browser_cannot_be_split_across_two_brokers() {
 /// (`kratos_ipc::instance_name`), so a second broker on a second pipe grants a
 /// second lease and two agents drive one pointer at once.
 #[tokio::test]
-#[ignore = "P0 reproduction: fixed in P3 (one broker, machine-wide lease)"]
 async fn only_one_input_lease_exists_for_one_os_user() {
-    let first = Harness::start("leaseA");
-    let second = Harness::start("leaseB");
+    let first = Harness::start_sharing_input("leaseA");
+    let second = Harness::start_sharing_input("leaseB");
     wait_for_pipe(&first.pipe).await;
     wait_for_pipe(&second.pipe).await;
 
@@ -884,4 +964,182 @@ async fn an_agent_cannot_allocate_or_approve_itself() {
         let err = one.call(op, json!({"patch": {}})).await.unwrap_err();
         assert_eq!(err.code, codes::UNAUTHORIZED, "an agent must not be able to call {op}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// P3 acceptance: parallel lanes, tab ownership, the pause
+// ---------------------------------------------------------------------------
+
+/// Two installed Chromium brands, or `None` on a machine with fewer.
+async fn two_brands(ui: &mut kratos_ipc::PipePeer) -> Option<(String, String)> {
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let installed: Vec<String> = lanes["browsers"]
+        .as_array()?
+        .iter()
+        .filter(|b| b["installed"] == json!(true))
+        .filter_map(|b| b["brand"].as_str().map(|s| s.to_string()))
+        .collect();
+    match installed.len() {
+        0 | 1 => None,
+        _ => Some((installed[0].clone(), installed[1].clone())),
+    }
+}
+
+/// Spec 5: "DOM actions need no input lease and run in parallel across lanes
+/// and sessions."
+///
+/// Proved by holding the lease rather than by timing: a third session takes
+/// the input devices and keeps them, and two DOM sessions act anyway. A timing
+/// test would prove the same thing less certainly and fail on a slow machine.
+#[tokio::test]
+async fn two_sessions_on_two_lanes_act_while_the_input_lease_is_held() {
+    let h = Harness::start("parallel");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let Some((one_brand, two_brand)) = two_brands(&mut ui).await else {
+        eprintln!("fewer than two Chromium browsers here; parallel lanes untested");
+        return;
+    };
+
+    let a = FakeInstance::dom_ext_brand(&one_brand, "tok-a").spawn(h.pipe.clone());
+    let b = FakeInstance::dom_ext_brand(&two_brand, "tok-b").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            // A whole-array patch replaces the list, so the lease holder
+            // has to be in it too -- an approval dropped here is a dialog on
+            // somebody's screen during a test run.
+            "harnesses": [
+                {"id": "claude", "browser": one_brand, "approved": true},
+                {"id": "bluee", "browser": two_brand, "approved": true},
+                {"id": "harness-one", "browser": "none", "approved": true},
+            ],
+            "instances": [
+                {"token": "tok-a", "brand": one_brand, "profile_dir": "Default"},
+                {"token": "tok-b", "brand": two_brand, "profile_dir": "Default"},
+            ],
+            "defaults": {"profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    // A third session holds the mouse and keyboard for the whole test.
+    let mut holder = session(&h.pipe, "harness-one", None, "s-hold").await;
+    holder
+        .call(ops::LEASE_ACQUIRE, json!({"scope": "input", "ttl_ms": 30000, "wait_ms": 0}))
+        .await
+        .expect("the holder takes the input devices");
+
+    let mut one = session(&h.pipe, "claude", None, "s-1").await;
+    let mut two = session(&h.pipe, "bluee", None, "s-2").await;
+    assert_eq!(one.ack["lane"]["state"], json!("ready"), "{}", one.ack["lane"]);
+    assert_eq!(two.ack["lane"]["state"], json!("ready"), "{}", two.ack["lane"]);
+
+    let first = one.call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"})).await;
+    let second = two.call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"})).await;
+
+    for (who, res) in [("claude", &first), ("bluee", &second)] {
+        let r = res.as_ref().unwrap_or_else(|e| {
+            panic!("{who} could not act through its own lane while the lease was held: {} {}",
+                   e.code, e.message)
+        });
+        assert_ne!(r["status"], json!("paused"), "{who}: {r}");
+        assert_eq!(r["backend"], json!("dom-ext"), "{who} must go through its own instance: {r}");
+    }
+
+    // Each instance acted once: the lanes did not cross.
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(a.acted.load(Ordering::SeqCst), 1, "the first lane's instance");
+    assert_eq!(b.acted.load(Ordering::SeqCst), 1, "the second lane's instance");
+
+    a.task.abort();
+    b.task.abort();
+}
+
+/// Spec 5: a tab belongs to the session that got there first, unless the user
+/// marks the lane shared.
+#[tokio::test]
+async fn a_tab_belongs_to_the_session_that_acted_on_it_first() {
+    let h = Harness::start("tabowner");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let lanes = ui.call("lane.list", json!({})).await.expect("lane.list");
+    let Some(brand) = lanes["browsers"]
+        .as_array()
+        .and_then(|b| b.iter().find(|x| x["installed"] == json!(true)))
+        .and_then(|b| b["brand"].as_str().map(|s| s.to_string()))
+    else {
+        eprintln!("no Chromium browser here; tab ownership untested");
+        return;
+    };
+
+    let inst = FakeInstance::dom_ext_brand(&brand, "tok-one").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [{"id": "claude", "browser": brand, "approved": true}],
+            "instances": [{"token": "tok-one", "brand": brand, "profile_dir": "Default"}],
+            "defaults": {"profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    // Two sessions of one harness: one lane, one profile, one set of tabs.
+    let mut first = session(&h.pipe, "claude", None, "s-1").await;
+    let mut second = session(&h.pipe, "claude", None, "s-2").await;
+
+    // Dispatched is what matters here, not what the pixels did: a fake
+    // backend changes nothing on screen, so `no_effect` is the honest verdict
+    // and the question under test is whether it ran at all.
+    let mine = first
+        .call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"}))
+        .await
+        .expect("the first session acts");
+    assert!(ran(&mine), "{mine}");
+
+    let theirs = second
+        .call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"}))
+        .await
+        .expect("a refusal is a result, not an error");
+    assert_eq!(theirs["status"], json!("blocked"), "{theirs}");
+    assert_eq!(theirs["gate"]["category"], json!("tab_owned"));
+    assert!(
+        theirs["gate"]["rule"].as_str().unwrap_or_default().contains(&first.peer_id),
+        "the refusal must name the owner: {theirs}"
+    );
+
+    // The user marks the lane shared, and they share it.
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {"lanes": [{"browser": brand, "profile_dir": "Default", "shared": true}]}}),
+    )
+    .await
+    .expect("config.set");
+    let now = second
+        .call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"}))
+        .await
+        .expect("act");
+    assert!(ran(&now), "a shared lane lets both sessions act: {now}");
+
+    // And a session that goes away stops owning anything.
+    let owner_id = first.peer_id.clone();
+    drop(first);
+    tokio::time::sleep(SETTLE).await;
+    ui.call(ops::CONFIG_SET, json!({"patch": {"lanes": []}})).await.expect("config.set");
+    let mut third = session(&h.pipe, "claude", None, "s-3").await;
+    let after = third
+        .call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"}))
+        .await
+        .expect("act");
+    assert!(
+        ran(&after),
+        "a disconnected session ({owner_id}) must not own its tabs forever: {after}"
+    );
+
+    inst.task.abort();
 }

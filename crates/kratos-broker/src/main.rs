@@ -7,6 +7,7 @@
 //! driven has no process for this at all.
 
 mod act;
+mod activity;
 mod browsers;
 mod classify;
 mod diff;
@@ -16,6 +17,7 @@ mod lane;
 mod peer;
 mod seal;
 mod state;
+mod target;
 
 use std::time::Duration;
 
@@ -84,9 +86,22 @@ async fn run() -> Result<(), String> {
         }
     }
 
-    let pipe_base = std::env::var("KRATOS_PIPE").unwrap_or_else(|_| config.pipe_name.clone());
+    // One broker per OS user, and the guard is keyed on the *user*, not on the
+    // pipe name.
+    //
+    // Keying it on the pipe meant a second `KRATOS_PIPE` was a second broker,
+    // each with its own gate, journal, routing and input lease -- which is
+    // exactly the broker-per-agent model this design removes. `KRATOS_PIPE`
+    // survives as a test seam, and setting it is what puts the pipe name back
+    // in the guard so the suite can run several isolated brokers at once.
+    let pipe_override = std::env::var("KRATOS_PIPE").ok().filter(|p| !p.trim().is_empty());
+    let pipe_base = pipe_override.clone().unwrap_or_else(|| config.pipe_name.clone());
+    let guard_key = match &pipe_override {
+        Some(p) => format!("kratos.broker.{p}"),
+        None => "kratos.broker".to_string(),
+    };
     let instance = kratos_ipc::win::SingleInstance::acquire(
-        &kratos_ipc::instance_name(&pipe_base).map_err(|e| e.to_string())?,
+        &kratos_ipc::instance_name(&guard_key).map_err(|e| e.to_string())?,
     )
     .map_err(|e| format!("could not take the single-instance lock: {e}"))?;
     if instance.already_running {
@@ -106,6 +121,14 @@ async fn run() -> Result<(), String> {
             };
         }
     };
+
+    // Watch for the person at the keyboard before anything can act, so an
+    // action that arrives a second from now already knows whether they are
+    // mid-sentence. Injected input is ignored, or the agent would pause itself
+    // after its own first click.
+    if config.defaults.pause_on_user_input {
+        activity::watch();
+    }
 
     let api_key = seal::read_key(&config.decider.api_key_enc);
     let hotkey_spec = config.kill.hotkey.clone();

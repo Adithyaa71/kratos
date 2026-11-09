@@ -12,6 +12,9 @@
 //! machine that is not necessarily the broker's.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde_json::Value;
 
 /// The Chromium family, in the order a search falls back through them.
 ///
@@ -137,13 +140,44 @@ pub fn installed() -> Vec<Browser> {
 // Local State
 // ---------------------------------------------------------------------------
 
-fn local_state(brand: &str) -> Option<serde_json::Value> {
+/// `Local State` is a megabyte of JSON and lane resolution happens on every
+/// connection and every `status`, so it is cached and invalidated by
+/// modification time.
+///
+/// Not an optimisation for its own sake: without it, `status` with three
+/// sessions attached re-read and re-parsed three browsers' worth of JSON on a
+/// call an agent makes between every action.
+type StateCache = std::collections::HashMap<String, (std::time::SystemTime, u64, Option<Arc<Value>>)>;
+
+fn cache() -> &'static Mutex<StateCache> {
+    static CACHE: OnceLock<Mutex<StateCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(StateCache::new()))
+}
+
+fn local_state(brand: &str) -> Option<Arc<Value>> {
     let path = locate(brand)?.user_data?.join("Local State");
-    let text = std::fs::read_to_string(path).ok()?;
-    // `str::trim` leaves U+FEFF alone and Chromium has been known to write
-    // one, so the BOM is stripped explicitly -- the same byte that broke
-    // config loading and the MCP handshake.
-    serde_json::from_str(text.trim_start_matches('\u{feff}').trim()).ok()
+    let meta = std::fs::metadata(&path).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+
+    if let Ok(c) = cache().lock() {
+        if let Some((seen, size, parsed)) = c.get(brand) {
+            if (*seen, *size) == stamp {
+                return parsed.clone();
+            }
+        }
+    }
+
+    let parsed = std::fs::read_to_string(&path).ok().and_then(|text| {
+        // `str::trim` leaves U+FEFF alone and Chromium has been known to write
+        // one, so the BOM is stripped explicitly -- the same byte that broke
+        // config loading and the MCP handshake.
+        serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}').trim()).ok()
+    });
+    let parsed = parsed.map(Arc::new);
+    if let Ok(mut c) = cache().lock() {
+        c.insert(brand.to_string(), (stamp.0, stamp.1, parsed.clone()));
+    }
+    parsed
 }
 
 /// The profiles a brand knows about, by directory name.

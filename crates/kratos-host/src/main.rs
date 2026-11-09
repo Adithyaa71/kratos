@@ -32,6 +32,20 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A reassembly that never completes is abandoned after this long.
 const CHUNK_TTL: Duration = Duration::from_secs(4);
 
+/// How long the extension has to answer a request before this host concludes
+/// it is gone.
+///
+/// A host outlives the service worker that opened its port: Chromium does not
+/// close its stdin, so a host whose extension has died keeps its registration
+/// and silently swallows everything the broker sends it. Measured live, with
+/// a browser that had been through a reconnect storm: every `observe` on that
+/// lane timed out at the broker's eight seconds, forever.
+///
+/// Shorter than the broker's own timeout on purpose, so the broker hears
+/// `backend_error` -- which it can fall back from -- rather than a timeout,
+/// which on a mutating action it must never retry.
+const EXTENSION_SILENCE: Duration = Duration::from_secs(5);
+
 /// How long to wait for the extension to name its instance before attaching
 /// without one.
 ///
@@ -42,6 +56,24 @@ const CHUNK_TTL: Duration = Duration::from_secs(4);
 /// over one registry slot, which is the whole defect being fixed. So: wait
 /// briefly, then attach anyway and carry on.
 const INSTANCE_GRACE: Duration = Duration::from_millis(1500);
+
+/// Append a line to `KRATOS_HOST_LOG`, if the operator set one.
+///
+/// A host is started by the browser, so its stderr goes wherever the browser's
+/// goes -- which is nowhere anybody looks. Every question about this process
+/// so far ("did it attach?", "did the extension answer?") has had to be
+/// inferred from the broker's side. Opt-in, because a relay that writes a file
+/// nobody asked for is worse than one that is quiet.
+///
+/// Ops and ids only, never payloads: those carry page content.
+fn log(line: &str) {
+    eprintln!("kratos-host: {line}");
+    let Some(path) = std::env::var_os("KRATOS_HOST_LOG") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "[{}] {line}", std::process::id());
+    }
+}
 
 fn main() {
     // `--manifest` prints the native-messaging registration the browser needs,
@@ -86,7 +118,7 @@ async fn relay() {
     // profile.
     let mut instance = wait_for_instance(&mut from_ext).await;
     if let Some(i) = &instance {
-        eprintln!("kratos-host: instance {} ({})", i.token, i.brand.as_deref().unwrap_or("?"));
+        log(&format!("instance {} ({})", i.token, i.brand.as_deref().unwrap_or("?")));
     } else {
         eprintln!(
             "kratos-host: the extension named no instance within {INSTANCE_GRACE:?}; \
@@ -109,7 +141,7 @@ async fn relay() {
         {
             Ok(p) => {
                 backoff = BACKOFF_MIN;
-                eprintln!("kratos-host: attached to the broker as {SOURCE}");
+                log(&format!("attached to the broker as {SOURCE}"));
                 // Tell the extension it is live, so it can stop showing a
                 // disconnected state without having to poll. A write that
                 // fails means there is no extension on the other end, so
@@ -117,7 +149,7 @@ async fn relay() {
                 if !write_extension(&json!({"v": 1, "t": "evt", "op": "connected", "payload": {}}))
                     .await
                 {
-                    eprintln!("kratos-host: the extension is unreachable; exiting");
+                    log("the extension is unreachable; exiting");
                     return;
                 }
                 p
@@ -131,7 +163,7 @@ async fn relay() {
                 )
                 .await
                 {
-                    eprintln!("kratos-host: the extension is unreachable; exiting");
+                    log("the extension is unreachable; exiting");
                     return;
                 }
                 tokio::time::sleep(backoff).await;
@@ -144,11 +176,11 @@ async fn relay() {
             // The extension went away: the browser is closing this host.
             return;
         }
-        eprintln!("kratos-host: lost the broker; waiting to reconnect");
+        log("lost the broker; waiting to reconnect");
         if !write_extension(&json!({"v": 1, "t": "evt", "op": "disconnected", "payload": {}}))
             .await
         {
-            eprintln!("kratos-host: the extension is unreachable; exiting");
+            log("the extension is unreachable; exiting");
             return;
         }
     }
@@ -163,8 +195,45 @@ async fn pump(
     from_ext: &mut mpsc::Receiver<Value>,
     instance: &mut Option<Instance>,
 ) -> Option<()> {
+    // What the broker has asked for and not yet had an answer to.
+    let mut awaiting: HashMap<String, std::time::Instant> = HashMap::new();
+    let mut sweep = tokio::time::interval(Duration::from_millis(500));
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
+            // Has the extension gone quiet on something it was asked?
+            _ = sweep.tick() => {
+                let overdue: Vec<String> = awaiting
+                    .iter()
+                    .filter(|(_, since)| since.elapsed() > EXTENSION_SILENCE)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !overdue.is_empty() {
+                    for id in &overdue {
+                        let _ = peer
+                            .reply_error(
+                                id,
+                                kratos_protocol::WireError::new(
+                                    kratos_protocol::codes::BACKEND_ERROR,
+                                    "the extension did not answer; this host is leaving so the \
+                                     browser can start one that works",
+                                ),
+                            )
+                            .await;
+                    }
+                    log(&format!(
+                        "the extension has not answered {} request(s) in {}s; exiting",
+                        overdue.len(),
+                        EXTENSION_SILENCE.as_secs()
+                    ));
+                    // Exiting here does not start the reconnect storm the
+                    // supersede case did: this port is already dead, and the
+                    // wake-and-reconnect that follows is the repair.
+                    return None;
+                }
+            }
+
             // Extension -> broker
             message = from_ext.recv() => {
                 let message = message?;  // None means the browser closed stdin
@@ -180,6 +249,11 @@ async fn pump(
                     }
                     continue;
                 }
+                log(&format!(
+                    "<- extension t={} id={}",
+                    message.get("t").and_then(|t| t.as_str()).unwrap_or("?"),
+                    message.get("id").and_then(|i| i.as_str()).unwrap_or("-")
+                ));
                 let Ok(frame) = serde_json::from_value::<Frame>(message.clone()) else {
                     eprintln!("kratos-host: dropping an unusable message from the extension");
                     continue;
@@ -187,6 +261,7 @@ async fn pump(
                 match &frame.body {
                     // A reply to something the broker asked. Forward verbatim.
                     kratos_protocol::Body::Res { id, ok, payload, error } => {
+                        awaiting.remove(id);
                         let sent = if *ok {
                             peer.reply(id, payload.clone()).await
                         } else {
@@ -217,22 +292,38 @@ async fn pump(
             incoming = peer.next_frame() => {
                 match incoming {
                     Ok(Some(frame)) => {
-                        // Another host now holds this profile's registration,
-                        // and it can only be a newer one: a host exists
-                        // because an extension created it. So this one has
-                        // nothing left to relay.
+                        // Another host now holds this profile's registration.
+                        // This one stops relaying and stays put.
                         //
-                        // This is how the stale hosts are reaped. Measured
-                        // live: one browser had three hosts alive, two of them
-                        // connected to the broker and registered to nothing,
-                        // because a service-worker restart opens a new port --
-                        // and the old host's stdin does not reach end of file
-                        // when Chromium drops the old one.
+                        // Exiting here is the obvious thing and it is wrong.
+                        // Measured live, with two browsers: a superseded host
+                        // that exits closes its end of the extension's native
+                        // port, Chromium wakes the service worker to tell it,
+                        // the worker reconnects, the new host supersedes the
+                        // one before it, and the whole thing runs away --
+                        // eight processes in fourteen seconds, each one
+                        // starting the next. The cure was worse than the
+                        // stale host it was reaping.
+                        //
+                        // So: no exit. The process sits on its stdin costing
+                        // nothing, and goes when the browser does. The write
+                        // check below is the one notice a host can act on
+                        // without this feedback loop, because a write only
+                        // fails once the extension is genuinely gone.
                         if frame.op() == Some(kratos_protocol::ops::EVT_SUPERSEDED) {
-                            eprintln!(
-                                "kratos-host: superseded by another host for this profile; exiting"
-                            );
-                            return None;
+                            log("superseded by another host for this profile; relaying nothing");
+                            continue;
+                        }
+                        log(&format!(
+                            "-> extension {} id={}",
+                            frame.op().unwrap_or("res"),
+                            frame.id().unwrap_or("-")
+                        ));
+                        // Only requests are owed an answer; events are not.
+                        if matches!(frame.body, kratos_protocol::Body::Req { .. }) {
+                            if let Some(id) = frame.id() {
+                                awaiting.insert(id.to_string(), std::time::Instant::now());
+                            }
                         }
                         let Ok(value) = serde_json::to_value(&frame) else { continue };
                         // A write that fails means the extension is gone --
@@ -240,7 +331,7 @@ async fn pump(
                         // this side. Exiting is the only correct answer; the
                         // browser starts a fresh host when it wants one.
                         if !write_extension(&value).await {
-                            eprintln!("kratos-host: the extension is unreachable; exiting");
+                            log("the extension is unreachable; exiting");
                             return None;
                         }
                     }

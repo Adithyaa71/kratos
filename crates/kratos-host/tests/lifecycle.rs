@@ -168,15 +168,18 @@ async fn a_silent_extension_still_gets_a_host_without_an_instance() {
     assert!(hello.get("instance").is_none() || hello["instance"].is_null(), "{hello}");
 }
 
-/// P1, the half the live run disproved: a host that is superseded must exit.
+/// A superseded host stops relaying and stays put.
 ///
-/// Measured on two real browsers, five hosts attached and three were
-/// superseded -- and all five were still running eleven minutes later. A
-/// service-worker restart opens a new port, Chromium does not close the old
-/// host's stdin, so being superseded is the only notice the old host gets, and
-/// it has to act on it.
+/// It must NOT exit, which is what it did for one afternoon. Exiting closes
+/// its end of the extension's native port, Chromium wakes the service worker
+/// to tell it, the worker reconnects, the new host supersedes the one before
+/// it, and the whole thing runs away: eight processes in fourteen seconds on
+/// two real browsers, each one starting the next.
+///
+/// The test is therefore the opposite of the obvious one -- it pins the
+/// behaviour that stops a feedback loop nobody would guess from the code.
 #[tokio::test]
-async fn a_superseded_host_exits() {
+async fn a_superseded_host_stays_put_rather_than_starting_a_reconnect_storm() {
     let pipe = pipe_name("superseded");
     let mut broker = FakeBroker::bind(&pipe);
     let mut browser = Browser::start(&pipe);
@@ -197,13 +200,20 @@ async fn a_superseded_host_exits() {
         .await
         .expect("send superseded");
 
-    let exited = browser.exited_within(GRACE).await;
+    let exited = browser.exited_within(Duration::from_secs(2)).await;
     assert!(
-        exited,
-        "a superseded host must exit rather than sit there registered to nothing.          host stderr:
+        !exited,
+        "a superseded host that exits closes the extension's port, and the worker          reconnects into a host that supersedes the next one. host stderr:
 {}",
         browser.stderr_so_far().await
     );
+
+    // Still there, and still reachable by the browser: its stdin is open and
+    // nothing has been torn down.
+    browser
+        .send(&json!({"v": 1, "t": "evt", "op": "instance",
+                      "payload": {"token": "tok-same", "brand": "brave"}}))
+        .await;
 }
 
 /// The browser closing is the ordinary end of a host's life.
@@ -235,5 +245,45 @@ async fn closing_the_extension_port_ends_the_host() {
     assert!(
         browser.exited_within(GRACE).await,
         "a host whose extension has gone has nothing to relay"
+    );
+}
+
+/// A host whose extension has stopped answering must get out of the way.
+///
+/// It outlives the service worker that opened its port -- Chromium does not
+/// close its stdin -- so without this it keeps the registration and swallows
+/// everything the broker sends. Measured live: every `observe` on that lane
+/// timed out at the broker's eight seconds, indefinitely.
+#[tokio::test]
+async fn a_host_whose_extension_went_quiet_leaves() {
+    let pipe = pipe_name("quiet");
+    let mut broker = FakeBroker::bind(&pipe);
+    let mut browser = Browser::start(&pipe);
+    browser
+        .send(&json!({"v": 1, "t": "evt", "op": "instance", "payload": {"token": "tok-q"}}))
+        .await;
+    let (_h, mut reader, mut writer) =
+        tokio::time::timeout(GRACE, broker.accept()).await.expect("attach");
+
+    // Ask for something and never answer, the way a dead worker does.
+    writer
+        .send(&Frame::req("b-1", ops::BACKEND_OBSERVE, json!({"window": null})))
+        .await
+        .expect("send observe");
+
+    // The broker hears `backend_error`, which it can fall back from -- not a
+    // timeout, which on a mutating action it must never retry.
+    let reply = tokio::time::timeout(Duration::from_secs(9), reader.next())
+        .await
+        .expect("the host must answer rather than go silent")
+        .expect("read")
+        .expect("a frame");
+    assert_eq!(reply.id(), Some("b-1"));
+    assert!(!reply.is_ok(), "{reply:?}");
+    assert_eq!(reply.wire_error().map(|e| e.code.as_str()), Some("backend_error"));
+
+    assert!(
+        browser.exited_within(GRACE).await,
+        "a host that cannot reach its extension has nothing to do"
     );
 }

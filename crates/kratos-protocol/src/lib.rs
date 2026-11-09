@@ -233,6 +233,10 @@ pub mod status {
     pub const REFUSED: &str = "refused";
     pub const BLOCKED: &str = "blocked";
     pub const KILLED: &str = "killed";
+    /// The person at the machine is using the mouse or keyboard, so an action
+    /// that needed OS input did not take it. Nothing ran; the step is
+    /// unchanged and safe to send again.
+    pub const PAUSED: &str = "paused";
 }
 
 /// Operation names, so a typo is a compile error rather than a `bad_request`.

@@ -5,6 +5,163 @@ Newest phase first.
 
 ---
 
+## P3 — scoped targeting, tab ownership, one lease, the pause
+
+### Done
+
+* **`window: null` is the session's lane, never the OS foreground**
+  (`crates/kratos-broker/src/target.rs`). One place resolves what a request is
+  aimed at, so `observe`, `act` and `verify` cannot drift apart about it.
+* **Windows of other lanes are invisible.** A `window` string that matches only
+  another lane's browser is `no_target`, naming the lane. Native windows belong
+  to no lane and stay visible to everyone — there is one Notepad, and the input
+  lease is what serialises it.
+* **A lane never borrows another lane's extension.** `Dom::Lane(None)` means
+  "this lane's instance or nothing": the router can no longer fall through to
+  whichever `dom-ext` backend happens to be attached.
+* **Tab ownership.** A tab belongs to the session that first acted on it;
+  another session's act is `blocked` with `gate.category: "tab_owned"` and the
+  owner's id. `lanes[].shared` turns it off per lane. A disconnected session
+  stops owning anything.
+* **One broker per OS user.** The single-instance guard is keyed on the user,
+  not the pipe name; `KRATOS_PIPE` is a test seam and setting it is what puts
+  the pipe back in the key.
+* **One machine-wide input lease.** The holder also holds a named semaphore
+  `Local\kratos.input.<sid>`, so a second broker cannot hand out a second lease
+  on the same mouse. A semaphore, not a mutex: a Win32 mutex is owned by the
+  thread that took it, which a tokio runtime cannot promise.
+* **DOM actions take no lease** and no longer wait for the user, so two
+  sessions in two profiles act at the same time.
+* **User-activity pause** (`activity.rs`): low-level keyboard and mouse hooks
+  on their own thread with their own message pump, ignoring `LLKHF_INJECTED`
+  and `LLMHF_INJECTED`. An action needing OS input waits out `user_idle_ms`
+  up to `pause_max_ms`, then returns the new status `paused`.
+* **`status` reports `lanes` and `pause`**, so "which browser is this session
+  pointed at" and "are the hooks even installed" are answerable from any role.
+* `Local State` reads are cached by modification time: lane resolution happens
+  on every connection and every `status`, and it was re-parsing a megabyte of
+  JSON per browser per call.
+* `defaults.browser: "none"` (and the same on a harness) turns lanes off: no
+  lane, and `window: null` means the foreground window as it always did.
+
+### The three defects this phase found by running it
+
+1. **A superseded host must not exit.** P1's reaping fix was wrong, and only a
+   live two-browser run showed it: a superseded host that exits closes its end
+   of the extension's native port, Chromium wakes the service worker to tell
+   it, the worker reconnects, the new host supersedes the one before it —
+   **eight processes in fourteen seconds, each starting the next**. It now
+   stops relaying and stays put. The lifecycle test was inverted to pin the
+   behaviour that stops the loop, because nobody would guess it from the code.
+2. **A stale host black-holes its lane.** The flip side: a host outlives the
+   worker that opened its port, keeps the registration, and silently swallows
+   everything. Live, every `observe` on that lane timed out at eight seconds,
+   indefinitely. The host now gives its extension five seconds to answer a
+   request, replies `backend_error` — which the broker can fall back from,
+   unlike a timeout — and exits. That exit is safe because the port is already
+   dead, and the wake-and-reconnect that follows is the repair.
+3. **`KRATOS_HOST_LOG`.** Every question about this process has had to be
+   inferred from the broker's side, because a browser-started host's stderr
+   goes nowhere anybody looks. Opt-in, ops and ids only, never payloads.
+
+### Evidence
+
+```text
+cargo test --workspace
+   359 passed; 0 failed; 0 ignored     (no test in the tree is ignored any more)
+cargo clippy --workspace --all-targets
+   0 warnings
+```
+
+All three P0 reproductions are now acceptance tests that pass:
+
+```text
+a_session_observes_its_own_lane_not_another_agents_window   (b)
+a_stranded_session_is_told_which_lane_it_cannot_reach       (c, rewritten)
+only_one_input_lease_exists_for_one_os_user                 (d)
+two_sessions_on_two_lanes_act_while_the_input_lease_is_held
+a_tab_belongs_to_the_session_that_acted_on_it_first
+```
+
+Live, one broker, Brave and Vivaldi both attached, two sessions with
+`window: null` — repeated twice to show it is not a fluke:
+
+```text
+claude-code (brave lane)   -> dom-ext | Example Domain | https://example.com/ | 10ms
+bluee-ide   (vivaldi lane) -> dom-ext | Example Domain | https://example.org/ |  6ms
+claude-code (brave lane)   -> dom-ext | Example Domain | https://example.com/ |  5ms
+bluee-ide   (vivaldi lane) -> dom-ext | Example Domain | https://example.org/ |  5ms
+
+claude-code asking for a window by the title "Vivaldi":
+  no_target: "Vivaldi" matches 1 window(s), all of them another lane's browser.
+  This session drives brave (Default); windows of other lanes are not visible to it.
+
+status.pause: watching=true  on_user_input=true  user_idle_ms=1500
+              since_real_input_ms=299453
+```
+
+That last line is also the pause's own evidence: the broker had been driven
+through five minutes of agent activity and the hooks recorded **no real
+input**, which is the injected-flag behaviour working in the running broker
+rather than in a test.
+
+### Decisions
+
+* **The approval of a lane's reachability is the broker's, not the
+  foreground's.** A session whose browser is closed gets `lane_unavailable`
+  rather than silently falling back to whatever is in front. That is a real
+  change in reach: a native window must now be named with `window`. Refusing
+  is what the spec asks for, and falling back to the foreground would undo the
+  isolation this phase exists for. P5's ensure-lane opens the browser instead.
+* **`defaults.browser: "none"`** is how a single-agent desktop keeps the old
+  behaviour, and is the only way back to it. The alternative was a conditional
+  fallback — "the lane, unless there isn't one" — which is the kind of rule
+  that is impossible to reason about at three in the morning.
+* **Tab ownership is recorded on first use, not on opening.** Nothing here can
+  see a tab being opened; the session that opens one is the first to act on it
+  in every case that matters.
+* **The input guard is a semaphore with a documented caveat**: its count is not
+  restored when a process holding it dies. With one broker per user the object
+  is destroyed with the last handle, so a crash leaves nothing behind; two
+  processes holding handles is a test-only configuration, and the wait budget
+  is what stops it being a hang.
+* **`lanes[]` in config** is an addition the design document does not name. §5
+  requires "the user marks the lane shared" and gives no field for it, and a
+  lane is a `(browser, profile_dir)` pair, so that is what it is keyed on.
+
+### Known gaps
+
+* **The pause is not verified end to end against a real hand on the mouse.**
+  Injected input cannot stand in for real input — that is the whole point —
+  and nothing can synthesise an event without the injected flag. What *is*
+  verified: the hooks install and run on this machine, injected input does not
+  register (tested against real `SendInput` on real hardware), and the wait
+  arithmetic is unit-tested in all three outcomes. The one untested link is a
+  human touching the mouse mid-action.
+* **Lane ownership of OS windows is by brand, not by profile.** Chromium runs
+  one process per user-data-dir with windows for every profile, so two lanes on
+  the same browser and different profiles cannot be told apart from the OS
+  side. They are told apart perfectly through the DOM path, where each profile
+  has its own extension instance. A UIA-driven action on a shared-brand lane
+  can therefore reach the other profile's window; P4's native backend and P5's
+  launcher are where that is fixed.
+* **Stale hosts still accumulate**, bounded by worker restarts: six after a
+  two-browser session. They cost a pipe connection and about 2MB each, hold no
+  registration once superseded, and are reaped when the browser exits. The
+  registration itself is now self-healing.
+* `LaneState::Launching` is still never set, and `lane_unavailable` is returned
+  but nothing opens a browser to clear it. Both are P5.
+* `gate_overrides` is still parsed and unread.
+
+### Next
+
+**P4 — `kratos-native`.** 4a UIA, 4b capture and OCR, 4c actuation, 4d pixel
+and fusion, each ending with a benchmark and fixtures before the next starts.
+The baseline to beat is the Python backend's 24 elements in 223ms and 168 in
+2.1s; the target is ~150 elements at p50 ≤ 80ms.
+
+---
+
 ## P2 — identity, sessions, lanes, resolution, approval
 
 ### Done

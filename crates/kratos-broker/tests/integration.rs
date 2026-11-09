@@ -45,6 +45,10 @@ impl Harness {
 
         let child = Command::new(env!("CARGO_BIN_EXE_kratos-broker"))
             .env("KRATOS_PIPE", &unique)
+            // Its own machine-wide input guard, so brokers started by
+            // other tests -- and the one the operator may have running --
+            // are not competing for this one.
+            .env("KRATOS_INPUT_GUARD", &unique)
             .env("KRATOS_CONFIG", &config_path)
             .env("KRATOS_JOURNAL", dir.join("actions.jsonl"))
             // No key: the mock provider needs none, and this proves the tests
@@ -113,6 +117,12 @@ fn base_config(idle_exit_ms: u64) -> Value {
         "idle_exit_ms": idle_exit_ms,
         "decider": {"provider": "mock", "model": "test"},
         "harnesses": approved_harnesses(),
+        // No browser lanes: these tests drive a fake backend and are about the
+        // gate, the kill switch, the lease and the journal. `none` is the
+        // operator-chosen way to say "this machine is one machine", and with
+        // it `window: null` means the foreground window as it always did.
+        // Lane behaviour has its own suite, which does not set this.
+        "defaults": {"browser": "none"},
         "kill": {"hotkey": "ctrl+alt+shift+f23", "hotkey_scope": "global"},
         "gate": {
             "block_keywords": ["format c:"],

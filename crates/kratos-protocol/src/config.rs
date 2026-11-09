@@ -46,6 +46,8 @@ pub struct Config {
     /// name -- so the pairing is made by the user in the settings window or by
     /// the launch that opened the profile.
     pub instances: Vec<InstanceConfig>,
+    /// Per-lane settings, for the lanes the user has said something about.
+    pub lanes: Vec<LaneConfig>,
     pub defaults: Defaults,
 }
 
@@ -83,6 +85,25 @@ pub struct AgentConfig {
     pub profile_dir: String,
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub gate_overrides: serde_json::Value,
+}
+
+/// One lane's settings. Only present for a lane the user has said something
+/// about.
+///
+/// The design document names no config field for this and §5 requires one:
+/// "acting on another session's tab is refused unless the user marks the lane
+/// shared". A lane is a `(browser, profile_dir)` pair, so that is what this is
+/// keyed on.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaneConfig {
+    pub browser: String,
+    pub profile_dir: String,
+    /// Let any session of this lane act on any of its tabs.
+    ///
+    /// Off by default: two agents in one profile taking turns on each other's
+    /// tabs is a race with the user's logged-in session in the middle of it.
+    pub shared: bool,
 }
 
 /// A backend instance token, paired to the browser profile it runs in.
@@ -137,6 +158,15 @@ impl Config {
         self.agents.iter().find(|a| a.id.eq_ignore_ascii_case(id))
     }
 
+    /// Whether a lane lets its sessions act on one another's tabs.
+    pub fn lane_is_shared(&self, browser: &str, profile_dir: &str) -> bool {
+        self.lanes.iter().any(|l| {
+            l.shared
+                && l.browser.eq_ignore_ascii_case(browser)
+                && l.profile_dir == profile_dir
+        })
+    }
+
     /// Which `(brand, profile_dir)` an instance token is paired with.
     pub fn instance(&self, token: &str) -> Option<&InstanceConfig> {
         self.instances.iter().find(|i| i.token == token)
@@ -159,6 +189,7 @@ impl Default for Config {
             harnesses: Vec::new(),
             agents: Vec::new(),
             instances: Vec::new(),
+            lanes: Vec::new(),
             defaults: Defaults::default(),
         }
     }
