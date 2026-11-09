@@ -48,3 +48,16 @@ features = [
 # Waiting for a WinRT async from a worker thread.
 [target.'cfg(windows)'.dependencies.windows-future]
 version = "0.3"
+
+# The icon detector.
+#
+# `load-dynamic` and nothing else: ort's default would download an
+# onnxruntime build at compile time, which puts a network fetch in `cargo
+# build` and a binary of somebody else's choosing in the tree. This loads
+# whatever onnxruntime the machine already has, named by `ORT_DYLIB_PATH` or
+# found beside the executable, and a machine with none simply has no pixel
+# path -- which is the same as a machine with no model weights.
+[dependencies.ort]
+version = "2.0.0-rc.13"
+default-features = false
+features = ["load-dynamic", "ndarray", "std"]

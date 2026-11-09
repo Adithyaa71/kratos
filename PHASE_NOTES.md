@@ -5,6 +5,55 @@ Newest phase first.
 
 ---
 
+## P4d — pixel path (**in progress, stopped part-way**)
+
+Stopped here when the session ran out, with the detector built and the fusion
+not written. What is committed compiles, is unit-tested and is **not wired
+into the backend loop** — `mod detect` carries an `#[allow(dead_code)]` saying
+exactly that.
+
+### Done
+
+* **The weights are on this machine.** OmniParser v2's icon detector, the
+  community ONNX export (`onnx-community/OmniParser-v2.0_icon_detect`), 77MB,
+  **AGPL-3.0**, downloaded to `models/omniparser/icon_detect.onnx` — which is
+  **gitignored**, as the spec requires. Model shape confirmed:
+  input `images [1,3,640,640] f32`, output `output0 [1,5,8400]`, a
+  single-class YOLOv8 head (centre x, centre y, w, h, score).
+* **`detect.rs`**: loading, letterbox preprocessing (bilinear, because the
+  things being found are twelve pixels across and a nearest-neighbour
+  downsample of a 1920-wide window drops every other row of a toolbar icon),
+  YOLOv8 decode, non-maximum suppression, and mapping boxes back to screen
+  coordinates offset by the window origin.
+* **`ort` with `load-dynamic` and nothing else.** Its default features
+  download an onnxruntime build during `cargo build`, which puts a network
+  fetch in the build and a binary of somebody else's choosing in the tree.
+  This loads a library the machine already has, named by `ORT_DYLIB_PATH` or
+  found beside the executable. This machine has onnxruntime 1.27.0 with the
+  CPU provider only, so CPU is what can be measured here.
+* Five unit tests: the letterbox maths both ways, IoU, suppression keeping
+  the best of a cluster, and a missing model being explained rather than
+  panicking.
+
+### Not done
+
+* **Fusion.** UIA first, OCR text and detector boxes added where UIA has
+  none, IoU > 0.5 meaning the same element, UIA winning label and role, every
+  element carrying its source(s) and confidence, and the automatic pixel pass
+  when the tree is sparse. None of it is written.
+* **`Element.source` and `Element.confidence`** do not exist in the protocol
+  yet; fusion needs them and they are additive.
+* **No detector run, ever.** The model has been loaded by Python to read its
+  shape and by nothing else. There is no timing, no accuracy number, and no
+  claim about either — the spec's detector target (≤60ms on GPU, CPU figures
+  too) is unmeasured.
+* The caption model (Florence-2, on demand, cached by crop hash) is not
+  started.
+* `docs/` says nothing yet about the AGPL weights or how to obtain them. That
+  must land with the rest of P4d.
+
+---
+
 ## P4c — actuation
 
 ### Done

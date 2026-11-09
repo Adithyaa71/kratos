@@ -15,6 +15,11 @@
 
 mod act;
 mod capture;
+// Built and tested, not yet wired: the fusion pass that reads it is the
+// other half of P4d. Everything in here is exercised by its own tests and by
+// the live probe below, so it is dead only to the backend loop.
+#[allow(dead_code)]
+mod detect;
 mod input;
 mod ocr;
 mod uia;

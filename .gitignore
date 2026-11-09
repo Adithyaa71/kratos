@@ -45,3 +45,12 @@ native-host.json
 #
 #   cargo run --release -p kratos-native -- --dump "Notepad" > fixtures/uia/notepad.json
 /fixtures/uia/
+
+# Model weights are not this repository's to ship.
+#
+# OmniParser v2's icon detector is AGPL-3.0 and 77MB. It is fetched by hand
+# into models/omniparser/icon_detect.onnx, and the detector stays off until
+# it is there:
+#
+#   https://huggingface.co/onnx-community/OmniParser-v2.0_icon_detect
+/models/
