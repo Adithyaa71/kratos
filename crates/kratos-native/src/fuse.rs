@@ -51,13 +51,61 @@ pub fn is_sparse(uia: &[Element]) -> bool {
     uia.len() <= SPARSE
 }
 
+/// How coarsely a fused id locates its element.
+///
+/// OCR and the detector re-measure a box every pass and the answer moves by a
+/// pixel or two, so an id built from exact coordinates would churn. Four
+/// pixels is below the gap between adjacent controls -- toolbar icons sit 24
+/// or more apart -- and above the jitter, so the same control keeps its id and
+/// its neighbour never borrows it.
+const CELL: i32 = 4;
+/// Which cell of the screen an element's centre falls in.
+///
+/// The centre, not the corner: a box whose width wobbles as the renderer
+/// antialiases keeps its centre and moves both edges.
+fn cell(bbox: [i32; 4]) -> (i32, i32) {
+    let cx = bbox[0] + bbox[2] / 2;
+    let cy = bbox[1] + bbox[3] / 2;
+    (cx.div_euclid(CELL), cy.div_euclid(CELL))
+}
+
+/// Mint an id for something only the pixels saw.
+///
+/// **Not the index in the source list.** That was the first implementation and
+/// it was wrong in a way that only showed up live: the detector found 33 icons
+/// on one pass and 34 on the next, every id after the newcomer shifted by one,
+/// and an agent that pinned `ocr:2` and then acted got `stale_id` -- because
+/// `act` re-observes to ground the instruction, and the ids it compares against
+/// are from that second pass. An id derived from where the thing *is* survives
+/// a list that grew.
+///
+/// `seen` keeps a count per cell so two elements that land in the same four
+/// pixels still get distinct ids, in a way that depends on neither's position
+/// in the list.
+fn mint(prefix: &str, bbox: [i32; 4], seen: &mut Vec<(i32, i32)>) -> String {
+    let (x, y) = cell(bbox);
+    let n = seen.iter().filter(|c| **c == (x, y)).count();
+    seen.push((x, y));
+    if n == 0 {
+        format!("{prefix}:{x}x{y}")
+    } else {
+        format!("{prefix}:{x}x{y}#{n}")
+    }
+}
+
 /// Fuse what three sources saw.
 ///
 /// `uia` leads. `text` and `icons` are added only where nothing in the tree
-/// covers them. Ids are the ids each source minted, so they stay valid for
-/// acting through the backend that reported them.
+/// covers them. UIA keeps the id its backend minted, so it stays valid for
+/// acting through that backend; the pixel sources get an id derived from where
+/// the element is, so a second observation of the same screen names the same
+/// element the same way.
 pub fn fuse(uia: Vec<Element>, text: &[Line], icons: &[Icon]) -> Vec<Element> {
     let mut out = uia;
+    // One tally per source: an icon's id must not change because OCR happened
+    // to read, or miss, a caption in the same four pixels.
+    let mut text_cells: Vec<(i32, i32)> = Vec::new();
+    let mut icon_cells: Vec<(i32, i32)> = Vec::new();
     for e in &mut out {
         if e.source.is_none() {
             e.source = Some("uia".to_string());
@@ -70,7 +118,7 @@ pub fn fuse(uia: Vec<Element>, text: &[Line], icons: &[Icon]) -> Vec<Element> {
     // twice; over nothing, it is a label with no control, which is still
     // worth reporting -- "the word Send is here" is how a decision model
     // finds a button that is drawn rather than declared.
-    for (i, line) in text.iter().enumerate() {
+    for line in text.iter() {
         // Containment, not just overlap. A "Send" label drawn inside a Send
         // button covers a fraction of it -- 0.29 for a 40x14 word in an 80x24
         // control -- so an overlap test alone reports the word as an element
@@ -83,7 +131,7 @@ pub fn fuse(uia: Vec<Element>, text: &[Line], icons: &[Icon]) -> Vec<Element> {
             continue;
         }
         out.push(Element {
-            id: format!("ocr:{i}"),
+            id: mint("ocr", line.bbox, &mut text_cells),
             role: "text".to_string(),
             label: line.text.clone(),
             bbox: Some(line.bbox),
@@ -98,7 +146,7 @@ pub fn fuse(uia: Vec<Element>, text: &[Line], icons: &[Icon]) -> Vec<Element> {
     // caption's words as its label: the detector found the control, OCR
     // found what it is called, and together they are one usable element
     // rather than two halves.
-    for (i, icon) in icons.iter().enumerate() {
+    for icon in icons.iter() {
         if out.iter().any(|e| {
             e.bbox.is_some_and(|b| iou(b, icon.bbox) > SAME) && e.source.as_deref() != Some("ocr")
         }) {
@@ -124,7 +172,7 @@ pub fn fuse(uia: Vec<Element>, text: &[Line], icons: &[Icon]) -> Vec<Element> {
         }
 
         out.push(Element {
-            id: format!("pixel:{i}"),
+            id: mint("pixel", icon.bbox, &mut icon_cells),
             role: if label.is_empty() { "image".to_string() } else { "button".to_string() },
             label,
             bbox: Some(icon.bbox),
@@ -242,6 +290,68 @@ mod tests {
             uia("b", "button", "Go", [0, 0, 10, 10]),
             uia("c", "edit", "Name", [0, 0, 10, 10]),
         ]));
+    }
+
+    #[test]
+    fn an_element_keeps_its_id_when_the_list_around_it_grows() {
+        // The failure this exists for, as it happened: the detector found one
+        // more icon on the second pass than the first, and because the ids
+        // were list indices every id after the newcomer shifted. An agent
+        // that pinned an element and then acted got `stale_id`, because `act`
+        // re-observes to ground the instruction and compares against *that*
+        // pass.
+        let a = icon([300, 300, 24, 24], 0.8);
+        let b = icon([400, 300, 24, 24], 0.8);
+        let newcomer = icon([100, 300, 24, 24], 0.8);
+
+        let first = fuse(vec![], &[line("Total", [10, 10, 70, 12])], &[a, b]);
+        // The newcomer sorts ahead of both, which is what shifted the indices.
+        let second =
+            fuse(vec![], &[line("Hello", [10, 500, 70, 12]), line("Total", [10, 10, 70, 12])], &[
+                newcomer, a, b,
+            ]);
+
+        let id_at = |out: &[Element], bbox: [i32; 4]| {
+            out.iter().find(|e| e.bbox == Some(bbox)).map(|e| e.id.clone())
+        };
+        assert_eq!(id_at(&first, a.bbox), id_at(&second, a.bbox), "the icon did not move");
+        assert_eq!(id_at(&first, b.bbox), id_at(&second, b.bbox));
+        assert_eq!(
+            id_at(&first, [10, 10, 70, 12]),
+            id_at(&second, [10, 10, 70, 12]),
+            "nor did the text, and another line appearing above it is not its business"
+        );
+        assert!(id_at(&second, newcomer.bbox).is_some(), "{second:#?}");
+    }
+
+    #[test]
+    fn a_box_that_was_re_measured_by_a_pixel_keeps_its_id() {
+        // OCR and the detector re-measure every pass and disagree with
+        // themselves slightly. An id that churned on that would be no better
+        // than an index.
+        let first = fuse(vec![], &[], &[icon([300, 300, 24, 24], 0.8)]);
+        let second = fuse(vec![], &[], &[icon([302, 301, 22, 23], 0.8)]);
+        assert_eq!(first[0].id, second[0].id);
+        // A cell has edges, so a centre that jitters across one does get a
+        // new id -- 312 is a boundary, and 311 is the cell below. That case
+        // is not papered over here: the broker re-pins a pixel element by
+        // position when its id is gone, which is what the id meant anyway.
+        // See `repin_by_position` in the broker's act.rs.
+        let moved = fuse(vec![], &[], &[icon([301, 299, 23, 25], 0.8)]);
+        assert_ne!(first[0].id, moved[0].id);
+    }
+
+    #[test]
+    fn two_elements_in_the_same_few_pixels_still_get_two_ids() {
+        // A cell is four pixels across, so a collision is possible. What it
+        // must never do is give two elements one id -- an agent pinning the
+        // second would act on the first.
+        // Same centre, so the same cell; barely any overlap, so neither is
+        // the other seen twice.
+        let out =
+            fuse(vec![], &[], &[icon([300, 300, 24, 24], 0.8), icon([310, 290, 4, 44], 0.4)]);
+        assert_eq!(out.len(), 2, "{out:#?}");
+        assert_ne!(out[0].id, out[1].id);
     }
 
     #[test]

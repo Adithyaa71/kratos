@@ -138,3 +138,50 @@ claimed.
   screenshot of this machine is a picture of somebody's screen. What exists is
   a structural check against a locally generated corpus and the per-source
   element counts in the benchmark table.
+
+## Naming something that nothing declares
+
+A control in the accessibility tree has an identity: a runtime id, a path. A
+control found in an image has a rectangle and nothing else, so its id is built
+from that rectangle -- its centre, in four-pixel cells, as `ocr:77x30` or
+`pixel:126x30`.
+
+The first implementation numbered them by their position in the list the
+detector returned, and it failed the first time it met a real screen. The
+detector found one more icon on the second pass than the first, every id after
+the newcomer shifted by one, and an agent that observed, pinned an element and
+then acted was told its pin was stale -- because `act` re-observes to ground
+the instruction, and compares the pin against *that* pass. The element had not
+moved. Only the list had.
+
+Two things follow from "the id is a position":
+
+* **Four pixels, not one.** OCR and the detector re-measure every pass; a box
+  jitters by a pixel or two. Four is above that and well below the gap between
+  two controls, so the same control keeps its name and its neighbour never
+  borrows it. A cell has edges, so a centre that jitters across one does get a
+  new id.
+* **The broker re-pins by position when the id is gone.** Within six pixels,
+  same source, same size to within six pixels, and only if exactly one element
+  qualifies. That is `repin_by_position` in the broker's `act.rs`, and it
+  applies to `ocr:` and `pixel:` ids only -- never to a tree id, where a
+  missing node means the node is gone and whatever now fills its rectangle is
+  something else.
+
+## Acting on something nothing declares
+
+The `ocr` and `pixel` sources read; they press nothing. The `uia` source owns
+the mouse and the keyboard, so a fused `ocr:`/`pixel:` id is acted on there,
+and it goes straight to the physical path: there is no element, so there is no
+pattern to try, and the click lands at the centre of the rectangle the element
+was seen in. The result says `physical`, as it must -- a click at a coordinate
+is a click at a coordinate however it was decided.
+
+One more thing had to change for this to work at all. `act` re-observes before
+it decides, and it did so through the default route, which prefers the
+accessibility tree wherever the tree answers. A canvas app's tree *does*
+answer: the kratos settings window reports six elements, all of them title
+bar, which is above the two-element threshold that triggers the pixel path on
+its own. So a pin on a drawn control was being judged against a tree that
+never contained it. `act` now prefers the pixel source for exactly as long as
+the pin is a pixel id.

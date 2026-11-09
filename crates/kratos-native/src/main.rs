@@ -265,9 +265,30 @@ fn act(
     let id = target.and_then(|t| t.id.as_deref());
     // An id from another backend is not this backend's to act on. Saying so
     // is better than aiming at its rectangle and hoping.
+    //
+    // A fused element the pixels found is the exception, and it has to be: a
+    // control that is drawn rather than declared has no tree path by
+    // definition, and the pixel source that saw it has no way to press
+    // anything. The whole point of finding it was to be able to click it, and
+    // this source owns the mouse. So an `ocr:`/`pixel:` id with a rectangle
+    // goes straight to the physical path, with no element and therefore no
+    // semantic attempt -- there is no pattern to try. Without a rectangle
+    // there is nothing to aim at and it is refused.
     let located = match id {
         Some(id) => match act::parse_id(id) {
             Some(parsed) => Some(parsed),
+            None if act::is_pixel_id(id) => {
+                if target.and_then(|t| t.bbox).is_none() {
+                    return Err(WireError::new(
+                        codes::BACKEND_ERROR,
+                        format!(
+                            "{id:?} was found in an image, so a rectangle is the only way to \
+                             aim at it, and this act carries none"
+                        ),
+                    ));
+                }
+                None
+            }
             None => {
                 return Err(WireError::new(
                     codes::BACKEND_ERROR,

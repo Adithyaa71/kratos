@@ -689,10 +689,24 @@ async fn act_inner(
     }
 
     // -- 2. observe ---------------------------------------------------------
+    //
+    // Through the same eyes the agent used, when it pinned something only the
+    // pixels can see. The default route answers from the accessibility tree
+    // wherever the tree answers at all, and a canvas app's tree answers --
+    // with its title bar, six elements of it, which is above the threshold
+    // that triggers the pixel path on its own. So an agent that observed with
+    // `prefer: "pixel"`, found a drawn control and pinned it would have had
+    // its pin judged against a tree that never contained it, and been told
+    // the element was stale when it was on screen the whole time.
+    let prefer_for_pin = req
+        .target_id
+        .as_deref()
+        .filter(|id| id.starts_with("ocr:") || id.starts_with("pixel:"))
+        .map(|_| Source::Pixel);
     let before_obs = observe_with_fallback(
         broker,
         class,
-        None,
+        prefer_for_pin,
         aim.backend_window.as_deref(),
         Duration::from_millis(req.timeout_ms.min(10_000)),
         aim.dom(),
@@ -705,8 +719,14 @@ async fn act_inner(
     };
     let url = before.url.clone();
     let generation = broker.next_generation();
-    *broker.last_observation.write().await =
-        Some(ObservationRecord { elements: before.elements.clone() });
+    // What the agent was looking at when it pinned, kept before it is
+    // replaced: an element found in an image is named by where it is, and
+    // re-pinning it needs to know where that was.
+    let seen_before = broker
+        .last_observation
+        .write()
+        .await
+        .replace(ObservationRecord { elements: before.elements.clone() });
 
     // A pinned target is checked against what is on screen *now*, not against
     // the generation the agent saw. Backends mint fresh ids each observation,
@@ -715,13 +735,18 @@ async fn act_inner(
     let pinned: Option<Element> = match &req.target_id {
         Some(id) => match before.elements.iter().find(|e| &e.id == id) {
             Some(e) => Some(e.clone()),
-            None => {
-                return Err(WireError::with_detail(
-                    codes::STALE_ID,
-                    format!("element {id:?} is not on screen any more; observe again and re-pin"),
-                    json!({"gen": generation, "elements_now": before.elements.len()}),
-                ))
-            }
+            None => match repin_by_position(id, seen_before.as_ref(), &before.elements) {
+                Some(e) => Some(e),
+                None => {
+                    return Err(WireError::with_detail(
+                        codes::STALE_ID,
+                        format!(
+                            "element {id:?} is not on screen any more; observe again and re-pin"
+                        ),
+                        json!({"gen": generation, "elements_now": before.elements.len()}),
+                    ))
+                }
+            },
         },
         None => None,
     };
@@ -1412,6 +1437,62 @@ fn truncate(s: &str, n: usize) -> String {
 // Journal
 // ---------------------------------------------------------------------------
 
+/// How far an element found in an image may have moved and still be the one
+/// that was pinned.
+///
+/// Re-measurement, not movement: OCR and the icon detector draw the box again
+/// every pass and disagree with themselves by a pixel or two. Six is above
+/// that and far below the gap between two controls.
+const REPIN_SLACK: i32 = 6;
+
+/// Re-pin an element that the pixels found, by where it was.
+///
+/// Only the pixels. A `uia` or `dom` id names a node, so an id that is gone
+/// means the node is gone, and looking for whatever now occupies its
+/// rectangle is precisely the guess this codebase refuses to make -- something
+/// else moved into that space is the normal case, not the exception. A pixel
+/// id names a *position*, because that is all an image gives you, so matching
+/// it by position is not a fallback: it is what the id meant.
+///
+/// Returns `None` unless exactly one element is close enough. Two candidates
+/// within six pixels of a pin is ambiguity, and the honest answer there is to
+/// make the agent look again.
+fn repin_by_position(
+    id: &str,
+    seen_before: Option<&ObservationRecord>,
+    now: &[Element],
+) -> Option<Element> {
+    let was = seen_before?.element(id)?;
+    let source = was.source.as_deref()?;
+    let from_pixels = (source.contains("ocr") || source.contains("pixel"))
+        && !source.contains("uia")
+        && !source.contains("dom");
+    if !from_pixels {
+        return None;
+    }
+    let [x, y, w, h] = was.bbox?;
+    let (cx, cy) = (x + w / 2, y + h / 2);
+
+    let mut found: Option<&Element> = None;
+    for e in now {
+        if e.source.as_deref() != Some(source) {
+            continue;
+        }
+        let Some([ex, ey, ew, eh]) = e.bbox else { continue };
+        let near = (ex + ew / 2 - cx).abs() <= REPIN_SLACK && (ey + eh / 2 - cy).abs() <= REPIN_SLACK;
+        // Same size to within the same slack: a pin on an icon must not land
+        // on the pane behind it because their centres happen to agree.
+        let alike = (ew - w).abs() <= REPIN_SLACK && (eh - h).abs() <= REPIN_SLACK;
+        if near && alike {
+            if found.is_some() {
+                return None; // two candidates: ambiguous, so look again
+            }
+            found = Some(e);
+        }
+    }
+    found.cloned()
+}
+
 async fn journal_line(
     broker: &Arc<Broker>,
     peer: &Arc<PeerHandle>,
@@ -1702,6 +1783,59 @@ mod tests {
         assert_eq!(class, TargetClass::Native);
         assert_eq!(target.exe.as_deref(), Some("notepad.exe"));
         assert_eq!(target.brand, None);
+    }
+
+    fn pix(id: &str, source: &str, bbox: [i32; 4]) -> Element {
+        Element {
+            id: id.into(),
+            source: Some(source.into()),
+            bbox: Some(bbox),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_pin_on_something_the_pixels_found_survives_it_being_re_measured() {
+        // The live failure: an agent observed, pinned `ocr:...`, and acted.
+        // `act` re-observes to ground the instruction, OCR drew the box one
+        // pixel higher, the id changed and the pin was refused as stale. The
+        // id named a position; the element is still at that position.
+        let before = ObservationRecord { elements: vec![pix("ocr:68x77", "ocr", [270, 306, 24, 12])] };
+        let now = vec![pix("ocr:68x78", "ocr", [271, 307, 23, 13])];
+        let found = repin_by_position("ocr:68x77", Some(&before), &now).expect("re-pinned");
+        assert_eq!(found.id, "ocr:68x78");
+    }
+
+    #[test]
+    fn a_pin_on_a_tree_node_is_never_re_pinned_by_position() {
+        // An id from the tree names a node. If the node is gone, whatever is
+        // now in its rectangle is something else, and clicking it is the
+        // guess this whole file exists to avoid.
+        let before =
+            ObservationRecord { elements: vec![pix("uia:ff:0.1", "uia", [270, 306, 24, 12])] };
+        let now = vec![pix("uia:ff:0.2", "uia", [270, 306, 24, 12])];
+        assert!(repin_by_position("uia:ff:0.1", Some(&before), &now).is_none());
+    }
+
+    #[test]
+    fn two_candidates_near_a_pin_are_ambiguous_rather_than_guessed() {
+        let before =
+            ObservationRecord { elements: vec![pix("pixel:75x75", "pixel", [296, 296, 8, 8])] };
+        let now = vec![
+            pix("pixel:75x75#0", "pixel", [297, 297, 8, 8]),
+            pix("pixel:75x75#1", "pixel", [295, 295, 8, 8]),
+        ];
+        assert!(repin_by_position("pixel:75x75", Some(&before), &now).is_none());
+    }
+
+    #[test]
+    fn a_pin_is_not_re_pinned_onto_something_a_different_size() {
+        // A pane whose centre happens to agree with a vanished icon's is not
+        // that icon.
+        let before =
+            ObservationRecord { elements: vec![pix("pixel:75x75", "pixel", [296, 296, 8, 8])] };
+        let now = vec![pix("pixel:75x75-pane", "pixel", [200, 200, 200, 200])];
+        assert!(repin_by_position("pixel:75x75", Some(&before), &now).is_none());
     }
 
     #[test]

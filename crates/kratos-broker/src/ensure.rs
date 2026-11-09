@@ -265,6 +265,32 @@ pub async fn ensure(
     Ok(Opened::Degraded(why))
 }
 
+/// Where the icon detector's weights are, for the doctor to report.
+///
+/// The detector itself lives in `kratos-native`, which the broker does not
+/// link; this is the same search, so a diagnostic can say whether the file is
+/// there without starting the backend to ask.
+pub fn icon_weights() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("KRATOS_ICON_MODEL") {
+        let p = std::path::PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let rel = std::path::Path::new("models").join("omniparser").join("icon_detect.onnx");
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    for up in [0usize, 1, 2, 3] {
+        let mut p = dir.to_path_buf();
+        for _ in 0..up {
+            p = p.parent()?.to_path_buf();
+        }
+        let candidate = p.join(&rel);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    rel.is_file().then_some(rel)
+}
+
 /// Attached, unpaired instances claiming this brand.
 async fn unbound_of_brand(broker: &Arc<Broker>, brand: &str) -> Vec<String> {
     crate::lane::attached_instances(broker)

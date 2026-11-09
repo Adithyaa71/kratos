@@ -43,6 +43,11 @@ fn main() -> eframe::Result {
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Status,
+    Harnesses,
+    Agents,
+    Profiles,
+    Connect,
+    Behaviour,
     Bridge,
     KillSwitch,
     Decider,
@@ -79,6 +84,17 @@ struct Draft {
     allow_recipients: String,
     allowed_browsers: String,
     per_browser: Vec<(String, bool)>,
+    /// `(id, browser, approved)` per harness. The browser is a brand or the
+    /// empty string, which means "whatever the default is".
+    harnesses: Vec<(String, String, bool)>,
+    /// `(id, profile_dir)` per agent.
+    agents: Vec<(String, String)>,
+    default_browser: String,
+    default_profile: String,
+    open_method: String,
+    pause_on_user_input: bool,
+    user_idle_ms: String,
+    pause_max_ms: String,
 }
 
 struct App {
@@ -163,6 +179,501 @@ impl App {
                 (b.to_string(), config["kill"]["per_browser"][*b].as_bool().unwrap_or(true))
             })
             .collect();
+
+        d.harnesses = config["harnesses"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|h| {
+                        (
+                            string_of(&h["id"], ""),
+                            string_of(&h["browser"], ""),
+                            h["approved"].as_bool().unwrap_or(false),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        d.agents = config["agents"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|x| (string_of(&x["id"], ""), string_of(&x["profile_dir"], "")))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        d.default_browser = string_of(&config["defaults"]["browser"], "os-default");
+        d.default_profile = string_of(&config["defaults"]["profile"], "last-used");
+        d.open_method = string_of(&config["defaults"]["open_method"], "direct");
+        d.pause_on_user_input =
+            config["defaults"]["pause_on_user_input"].as_bool().unwrap_or(true);
+        d.user_idle_ms = config["defaults"]["user_idle_ms"].as_u64().unwrap_or(1_500).to_string();
+        d.pause_max_ms = config["defaults"]["pause_max_ms"].as_u64().unwrap_or(30_000).to_string();
+    }
+
+    /// What `lane.list` last said, or an empty object.
+    fn lanes(&self) -> Value {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|s| s.lanes.clone())
+            .unwrap_or_else(|| json!({}))
+    }
+
+    /// Brands this machine actually has, for a dropdown that cannot offer a
+    /// browser nobody can open.
+    fn installed_brands(&self) -> Vec<String> {
+        self.lanes()["browsers"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|b| b["installed"] == json!(true))
+                    .filter_map(|b| b["brand"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `(dir, label)` for every profile of every installed browser.
+    ///
+    /// Across browsers rather than per browser, because an agent's profile is
+    /// allocated without knowing which harness will drive it -- the agent is
+    /// the person, the harness is the tool.
+    fn known_profiles(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for b in self.lanes()["browsers"].as_array().unwrap_or(&vec![]) {
+            let brand = b["brand"].as_str().unwrap_or("?");
+            for p in b["profiles"].as_array().unwrap_or(&vec![]) {
+                let dir = p["dir"].as_str().unwrap_or("").to_string();
+                if dir.is_empty() || out.iter().any(|(d, _)| *d == dir) {
+                    continue;
+                }
+                let label = match p["name"].as_str() {
+                    Some(n) => format!("{dir} -- {n} ({brand})"),
+                    None => format!("{dir} ({brand})"),
+                };
+                out.push((dir, label));
+            }
+        }
+        out
+    }
+
+    // -- Harnesses ----------------------------------------------------------
+
+    fn harnesses_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "One row per MCP client that has connected. A client appears here the first time it \
+             says hello, unassigned and unapproved -- nothing it asks for happens until somebody \
+             here says it may.",
+        );
+        ui.add_space(8.0);
+
+        if self.draft.harnesses.is_empty() {
+            ui.weak("Nothing has connected yet.");
+        }
+
+        let brands = self.installed_brands();
+        let mut remove: Option<usize> = None;
+        for (i, (id, browser, approved)) in self.draft.harnesses.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.checkbox(approved, "");
+                ui.add_sized([180.0, 20.0], egui::Label::new(egui::RichText::new(id.as_str()).strong()));
+
+                egui::ComboBox::from_id_salt(format!("harness-browser-{i}"))
+                    .selected_text(if browser.is_empty() {
+                        "(the default)".to_string()
+                    } else {
+                        browser.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(browser, String::new(), "(the default)");
+                        for b in &brands {
+                            ui.selectable_value(browser, b.clone(), b);
+                        }
+                        // `none` is an allocation of its own: drive the
+                        // machine as one machine, with no browser lane.
+                        ui.selectable_value(browser, "none".to_string(), "none -- no lane");
+                    });
+
+                if ui.small_button("forget").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.draft.harnesses.remove(i);
+        }
+
+        ui.add_space(6.0);
+        ui.weak(
+            "The tick is approval. Forgetting a harness does not stop it connecting; it will \
+             reappear unapproved the next time it does.",
+        );
+
+        ui.add_space(12.0);
+        if ui.button("Apply").clicked() {
+            let list: Vec<Value> = self
+                .draft
+                .harnesses
+                .iter()
+                .map(|(id, browser, approved)| {
+                    json!({"id": id, "browser": browser, "approved": approved})
+                })
+                .collect();
+            self.send(Cmd::ApplyConfig(json!({"harnesses": list})));
+        }
+    }
+
+    // -- Agents -------------------------------------------------------------
+
+    fn agents_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "One row per agent name. An agent names itself with --agent in its MCP snippet, and \
+             what it gets from this window is a browser profile: its own logins, its own cookies, \
+             its own tabs.",
+        );
+        ui.add_space(8.0);
+
+        let profiles = self.known_profiles();
+        let mut remove: Option<usize> = None;
+        for (i, (id, profile)) in self.draft.agents.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [180.0, 20.0],
+                    egui::TextEdit::singleline(id).hint_text("agent name"),
+                );
+                egui::ComboBox::from_id_salt(format!("agent-profile-{i}"))
+                    .width(260.0)
+                    .selected_text(if profile.is_empty() {
+                        "(the browser's last used)".to_string()
+                    } else {
+                        profile.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(profile, String::new(), "(the browser's last used)");
+                        for (dir, label) in &profiles {
+                            ui.selectable_value(profile, dir.clone(), label);
+                        }
+                    });
+                if ui.small_button("remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.draft.agents.remove(i);
+        }
+
+        ui.add_space(6.0);
+        if ui.button("Add an agent").clicked() {
+            self.draft.agents.push((String::new(), String::new()));
+        }
+
+        ui.add_space(6.0);
+        ui.weak(
+            "A profile that is not in the browser it is used with falls back to that browser's \
+             last-used one, and the session is told so rather than being given a fresh profile \
+             with none of your logins in it.",
+        );
+
+        ui.add_space(12.0);
+        if ui.button("Apply").clicked() {
+            let list: Vec<Value> = self
+                .draft
+                .agents
+                .iter()
+                .filter(|(id, _)| !id.trim().is_empty())
+                .map(|(id, profile)| json!({"id": id.trim(), "profile_dir": profile}))
+                .collect();
+            self.send(Cmd::ApplyConfig(json!({"agents": list})));
+        }
+    }
+
+    // -- Profiles -----------------------------------------------------------
+
+    fn profiles_tab(&mut self, ui: &mut egui::Ui, status: Option<&Value>) {
+        ui.label(
+            "Which browser profile each attached extension is running in. The extension cannot \
+             report this -- no browser API tells it which profile it is -- so it is said here, or \
+             worked out by the launch that opened the profile.",
+        );
+        ui.add_space(10.0);
+
+        let lanes = self.lanes();
+        let instances = lanes["instances"].as_array().cloned().unwrap_or_default();
+        let brands = self.installed_brands();
+        let profiles = self.known_profiles();
+
+        ui.strong("Attached instances");
+        if instances.is_empty() {
+            ui.weak(
+                "  None. A browser with the bridge loaded attaches one per profile; the Browser \
+                 tab is where the bridge is registered.",
+            );
+        }
+        for inst in &instances {
+            let token = inst["token"].as_str().unwrap_or("?").to_string();
+            let short = token.chars().take(8).collect::<String>();
+            let claims = inst["brand"].as_str().unwrap_or("?").to_string();
+            let bound = inst["bound_to"].clone();
+            ui.horizontal(|ui| {
+                ui.monospace(format!("{short}…"));
+                ui.label(format!("says it is {claims}"));
+                if bound.is_null() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 140, 70), "unpaired");
+                } else {
+                    ui.label(format!(
+                        "paired with {}/{}",
+                        bound["brand"].as_str().unwrap_or("?"),
+                        bound["profile_dir"].as_str().unwrap_or("?")
+                    ));
+                    if ui.small_button("unpair").clicked() {
+                        self.send(Cmd::BindInstance(json!({"token": token})));
+                    }
+                }
+            });
+
+            if bound.is_null() {
+                // Pairing it: the brand it claims, and a profile of that
+                // brand. Pre-selected to the claim, because it is right
+                // nearly always and wrong visibly.
+                let mut brand = claims.clone();
+                let mut dir = String::new();
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    egui::ComboBox::from_id_salt(format!("pair-brand-{short}"))
+                        .selected_text(brand.clone())
+                        .show_ui(ui, |ui| {
+                            for b in &brands {
+                                ui.selectable_value(&mut brand, b.clone(), b);
+                            }
+                        });
+                    egui::ComboBox::from_id_salt(format!("pair-dir-{short}"))
+                        .width(240.0)
+                        .selected_text(if dir.is_empty() {
+                            "pick a profile".to_string()
+                        } else {
+                            dir.clone()
+                        })
+                        .show_ui(ui, |ui| {
+                            for (d, label) in &profiles {
+                                ui.selectable_value(&mut dir, d.clone(), label);
+                            }
+                        });
+                    if ui.small_button("pair").clicked() && !dir.is_empty() {
+                        self.send(Cmd::BindInstance(
+                            json!({"token": token, "brand": brand, "profile_dir": dir}),
+                        ));
+                    }
+                });
+            }
+        }
+
+        ui.add_space(14.0);
+        ui.strong("Browsers on this machine");
+        for b in lanes["browsers"].as_array().unwrap_or(&vec![]) {
+            let brand = b["brand"].as_str().unwrap_or("?");
+            if b["installed"] != json!(true) {
+                continue;
+            }
+            let names: Vec<String> = b["profiles"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|p| match p["name"].as_str() {
+                            Some(n) => format!("{} ({n})", p["dir"].as_str().unwrap_or("?")),
+                            None => p["dir"].as_str().unwrap_or("?").to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ui.label(format!(
+                "  {brand}: last used {}; {}",
+                b["last_used"].as_str().unwrap_or("?"),
+                if names.is_empty() { "no profiles listed".to_string() } else { names.join(", ") }
+            ));
+        }
+        if let Some(d) = lanes["os_default"].as_str() {
+            ui.weak(format!("  the default browser for this account is {d}"));
+        }
+
+        ui.add_space(14.0);
+        ui.strong("Sessions");
+        let sessions = status
+            .map(|s| s["lanes"].as_array().cloned().unwrap_or_default())
+            .unwrap_or_default();
+        if sessions.is_empty() {
+            ui.weak("  none connected");
+        }
+        for l in &sessions {
+            let lane = &l["lane"];
+            ui.label(format!(
+                "  {} -> {}/{} ({})",
+                l["harness"].as_str().unwrap_or("?"),
+                lane["browser"].as_str().unwrap_or("?"),
+                lane["profile_dir"].as_str().unwrap_or("?"),
+                lane["state"].as_str().unwrap_or("?")
+            ));
+            if let Some(w) = lane["warning"].as_str() {
+                ui.colored_label(egui::Color32::from_rgb(200, 140, 70), format!("     {w}"));
+            }
+        }
+    }
+
+    // -- Connect ------------------------------------------------------------
+
+    fn connect_tab(&mut self, ui: &mut egui::Ui) {
+        ui.label("Paste one of these into the harness. That is the whole of connecting it.");
+        ui.add_space(8.0);
+
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("kratos-mcp.exe")));
+        let Some(exe) = exe.filter(|p| p.is_file()) else {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 90, 90),
+                "kratos-mcp.exe is not beside this window, so there is no absolute path to \
+                 offer. A relative one would be resolved against whatever directory the harness \
+                 happens to start in, which is the single most common way this is set up wrong.",
+            );
+            return;
+        };
+        let path = exe.display().to_string();
+
+        ui.strong("Any MCP client, from a shell");
+        let add = format!("claude mcp add kratos -- \"{}\"", path.replace('\\', "/"));
+        ui.horizontal(|ui| {
+            ui.monospace(&add);
+            if ui.small_button("copy").clicked() {
+                ui.ctx().copy_text(add.clone());
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.strong("In a JSON config");
+        let json_snippet = format!(
+            "{{\n  \"mcpServers\": {{\n    \"kratos\": {{\n      \"command\": \"{}\"\n    }}\n  }}\n}}",
+            path.replace('\\', "\\\\")
+        );
+        ui.monospace(&json_snippet);
+        if ui.small_button("copy").clicked() {
+            ui.ctx().copy_text(json_snippet.clone());
+        }
+
+        ui.add_space(14.0);
+        ui.strong("Naming the agent");
+        ui.label(
+            "An agent's name is what a profile is allocated to. It is the only setting a client \
+             has, and it is optional: without one, a session gets the browser's last-used \
+             profile.",
+        );
+        for (id, _) in self.draft.agents.iter().filter(|(id, _)| !id.trim().is_empty()) {
+            let line = format!("claude mcp add kratos -- \"{}\" --agent {}", path.replace('\\', "/"), id);
+            ui.horizontal(|ui| {
+                ui.monospace(&line);
+                if ui.small_button("copy").clicked() {
+                    ui.ctx().copy_text(line.clone());
+                }
+            });
+        }
+        if self.draft.agents.is_empty() {
+            ui.weak("  No agents named yet -- the Agents tab is where they are added.");
+        }
+
+        ui.add_space(14.0);
+        ui.weak(
+            "No port, no token, no daemon to start first: the first tool call starts the broker, \
+             and the harness identifies itself from the handshake it already sends.",
+        );
+    }
+
+    // -- Behaviour ----------------------------------------------------------
+
+    fn behaviour_tab(&mut self, ui: &mut egui::Ui) {
+        ui.strong("When a lane is not open");
+        ui.add_space(4.0);
+        let methods = [
+            ("direct", "Launch the browser with the profile. Works whether or not it is already running."),
+            ("ui", "Drive the browser's own interface with the decision model, step by step."),
+            ("none", "Never open one. Drive a browser that is already open, or nothing."),
+        ];
+        for (value, help) in methods {
+            ui.radio_value(&mut self.draft.open_method, value.to_string(), value);
+            ui.weak(format!("      {help}"));
+        }
+
+        ui.add_space(14.0);
+        ui.strong("When you are using the machine");
+        ui.checkbox(
+            &mut self.draft.pause_on_user_input,
+            "Wait while there is real keyboard or mouse input",
+        );
+        ui.weak(
+            "      Input the agent injects is ignored, or it would pause itself after its own \
+             first click. Only actions that need the real mouse and keyboard wait: a browser \
+             action goes through the page and is unaffected.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("      stop if input within");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.user_idle_ms).desired_width(70.0));
+            ui.label("ms, and give up after");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.pause_max_ms).desired_width(70.0));
+            ui.label("ms");
+        });
+
+        ui.add_space(14.0);
+        ui.strong("Defaults for anything unallocated");
+        ui.horizontal(|ui| {
+            ui.label("browser");
+            let brands = self.installed_brands();
+            egui::ComboBox::from_id_salt("default-browser")
+                .selected_text(self.draft.default_browser.clone())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.draft.default_browser,
+                        "os-default".to_string(),
+                        "os-default -- whatever opens a link",
+                    );
+                    for b in &brands {
+                        ui.selectable_value(&mut self.draft.default_browser, b.clone(), b);
+                    }
+                    ui.selectable_value(
+                        &mut self.draft.default_browser,
+                        "none".to_string(),
+                        "none -- no browser lanes at all",
+                    );
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.label("profile");
+            let profiles = self.known_profiles();
+            egui::ComboBox::from_id_salt("default-profile")
+                .width(260.0)
+                .selected_text(self.draft.default_profile.clone())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.draft.default_profile,
+                        "last-used".to_string(),
+                        "last-used",
+                    );
+                    for (dir, label) in &profiles {
+                        ui.selectable_value(&mut self.draft.default_profile, dir.clone(), label);
+                    }
+                });
+        });
+
+        ui.add_space(14.0);
+        if ui.button("Apply").clicked() {
+            self.send(Cmd::ApplyConfig(json!({"defaults": {
+                "browser": self.draft.default_browser,
+                "profile": self.draft.default_profile,
+                "open_method": self.draft.open_method,
+                "pause_on_user_input": self.draft.pause_on_user_input,
+                "user_idle_ms": self.draft.user_idle_ms.trim().parse::<u64>().unwrap_or(1_500),
+                "pause_max_ms": self.draft.pause_max_ms.trim().parse::<u64>().unwrap_or(30_000),
+            }})));
+        }
     }
 }
 
@@ -206,6 +717,11 @@ impl eframe::App for App {
                 ui.separator();
                 for (tab, label) in [
                     (Tab::Status, "Status"),
+                    (Tab::Harnesses, "Harnesses"),
+                    (Tab::Agents, "Agents"),
+                    (Tab::Profiles, "Profiles"),
+                    (Tab::Connect, "Connect"),
+                    (Tab::Behaviour, "Behaviour"),
                     (Tab::Bridge, "Browser"),
                     (Tab::KillSwitch, "Kill switch"),
                     (Tab::Decider, "Decision model"),
@@ -246,6 +762,11 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Status => self.status_tab(ui, connected, status.as_ref()),
+                Tab::Harnesses => self.harnesses_tab(ui),
+                Tab::Agents => self.agents_tab(ui),
+                Tab::Profiles => self.profiles_tab(ui, status.as_ref()),
+                Tab::Connect => self.connect_tab(ui),
+                Tab::Behaviour => self.behaviour_tab(ui),
                 Tab::Bridge => self.bridge_tab(ui),
                 Tab::KillSwitch => self.kill_tab(ui, status.as_ref()),
                 Tab::Decider => self.decider_tab(ui),

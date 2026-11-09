@@ -11,6 +11,7 @@ mod activity;
 mod browsers;
 mod classify;
 mod diff;
+mod doctor;
 mod ensure;
 mod hotkey;
 mod journal;
@@ -32,6 +33,11 @@ use serde_json::json;
 const IDLE_TICK: Duration = Duration::from_secs(5);
 
 fn main() {
+    // `kratos doctor`: read-only, starts nothing, and therefore safe to run
+    // while everything is broken -- which is when it is run.
+    if std::env::args().skip(1).any(|a| a == "--doctor" || a == "doctor") {
+        std::process::exit(doctor::run());
+    }
     if let Err(e) = real_main() {
         eprintln!("kratos-broker: {e}");
         std::process::exit(1);

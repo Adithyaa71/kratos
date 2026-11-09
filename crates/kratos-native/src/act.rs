@@ -64,6 +64,15 @@ pub fn parse_id(id: &str) -> Option<(isize, Vec<usize>)> {
     Some((hwnd, indices?))
 }
 
+/// Whether an id names something the pixels found rather than the tree.
+///
+/// These have no tree path -- a control that is drawn rather than declared has
+/// none -- so they can only be acted on with the mouse, at the rectangle they
+/// were seen in. The prefixes are the ones `fuse` mints.
+pub fn is_pixel_id(id: &str) -> bool {
+    id.starts_with("ocr:") || id.starts_with("pixel:")
+}
+
 /// Walk back down to the element an id names.
 ///
 /// The same filter the observation used, walked live rather than from the
@@ -369,5 +378,15 @@ mod tests {
         assert!(parse_id("brave:w1:t1:f0:e2").is_none());
         assert!(parse_id("uia:notahandle:0").is_none());
         assert!(parse_id("ocr:1a2b:4").is_none());
+    }
+
+    #[test]
+    fn a_pixel_id_is_told_apart_from_another_backends() {
+        // Both are unparseable as a tree path; only one of them is this
+        // backend's to click.
+        assert!(is_pixel_id("ocr:68x42"));
+        assert!(is_pixel_id("pixel:120x300#1"));
+        assert!(!is_pixel_id("brave:w1:t1:f0:e2"));
+        assert!(!is_pixel_id("uia:1a2b:0.3.7"));
     }
 }

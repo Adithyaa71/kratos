@@ -5,6 +5,130 @@ Newest phase first.
 
 ---
 
+## P6 — the allocation lives in the settings window
+
+### Done
+
+* **Five new tabs**, spec §8. *Harnesses*: one row per MCP client that has
+  connected, its browser, and the tick that approves it. *Agents*: one row per
+  agent name and the browser profile it gets. *Profiles*: which profile each
+  attached extension instance is running in, every browser and profile on this
+  machine, and every session's lane. *Connect*: the two snippets to paste into
+  a harness, with and without `--agent`. *Behaviour*: what to do when a lane is
+  not open, what to do while the person is using the machine, and the defaults
+  for anything unallocated.
+* **The window reads the machine through the broker.** `lane.list` on the same
+  poll as `status`, rather than this process reading `Local State` itself: the
+  broker is the one on the machine being driven, and two readers of that file
+  would be two things to keep in step.
+* **`kratos-broker.exe doctor`**, spec §12 — one command that says what is
+  wrong. Binaries, config, decider, harnesses, agents, defaults, browsers and
+  their profiles, the OS default browser, the bridge manifest and each brand's
+  registry hive, the icon weights, and a running broker's backends, lanes, kill
+  state and pause state. Every check is `ok` / `warn` / `fail` / `off` with the
+  evidence beside it. It is read-only, and a test enforces that by grepping its
+  own source for `fs::write`, `connect_or_start`, `RegSetValueW` and
+  `Command::new`: a doctor that repairs things is a doctor you cannot run when
+  you do not yet know what is broken.
+* **Fused element ids are derived from where the element is**, not from its
+  position in the list the detector returned. See below; this was a real
+  failure, found live.
+* **A control that only the pixels found can now be clicked.** The `uia` source
+  accepts an `ocr:`/`pixel:` id with a rectangle and goes straight to the
+  physical path. That closes the gap P4c left open: "no live test of the
+  physical path".
+
+### Evidence
+
+The settings window has no accessibility tree — egui draws into a GL canvas, so
+UIA reports six elements and all six are title bar. It was therefore read and
+driven entirely through the pixel path, which is the first end-to-end use of
+that path on a real window:
+
+```text
+observe (default route)  ->  6 el, all title bar
+observe (prefer: pixel)  -> 55 el | 461ms
+  ocr:77x30   [ocr]       text   'Harnesses Agents Profiles'   222,116,174,13
+  pixel:109x30 [pixel+ocr] button 'Connect'                    405,108,62,24
+  pixel:126x30 [pixel+ocr] button 'Behaviour'                  468,108,73,24
+
+act 'click the Behaviour tab'  target_id=pixel:126x30
+  -> executed | backend uia | method physical | 1103ms
+
+and the tab that opened, read back off the screen:
+  'When a lane is not open'                     -> direct / semantic / none
+  'When you are using the machine'              -> stop if input within 1500
+                                                   ms, give up after 30000
+  'Defaults for anything unallocated'           -> browser none,
+                                                   profile last-used
+```
+
+All five tabs were clicked this way and their contents read back:
+
+| tab | what the screen said afterwards |
+|---|---|
+| Harnesses | `claude-code`, `bluee-ide`, a browser dropdown, Forget, Apply |
+| Agents | `agent-a` -> `Profile 1`, Remove, Add an agent, Apply |
+| Profiles | brave/chrome/edge/vivaldi with their real profile names, `the default browser for this account is brave` |
+| Connect | both snippets, including `--agent agent-a` |
+| Behaviour | the three groups above |
+
+`doctor` on this machine found the sealed Jev key present, four Chrome profiles
+with their display names, the bridge registered for all five brands, and Brave
+as the OS default.
+
+413 tests, no clippy warnings.
+
+### Decisions
+
+* **An id for something found in an image names a position.** `ocr:77x30` is
+  the element's centre in four-pixel cells. Four because OCR and the detector
+  re-measure every pass and a box jitters by a pixel or two; four is above that
+  and far below the gap between two controls.
+* **The broker re-pins a pixel element by position when its id is gone** —
+  within six pixels, same source, same size to within six pixels, and only if
+  exactly one element qualifies. A tree id is never re-pinned that way: a
+  missing node means the node is gone, and whatever now fills its rectangle is
+  something else. `docs/protocol.md` states the exception where it states the
+  rule, because it *is* a weakening of "ids are only valid within their gen"
+  and burying it would be dishonest.
+* **`act` observes through the pixel source for exactly as long as the pin is a
+  pixel id.** It used the default route before, which prefers the tree wherever
+  the tree answers — and a canvas app's tree answers with its title bar.
+* **The window edits config, and config is the only allocation.** Every tab
+  writes through `config.set`; nothing in the UI binds a lane or approves a
+  harness by any other path. An agent cannot approve itself because the thing
+  that approves it is a file this window owns.
+
+### Known gaps
+
+* **The sparse-tree threshold does not catch a canvas app.** Spec §10 says run
+  the pixel path automatically when the tree has two elements or fewer. The
+  kratos settings window has six, all title bar, so the automatic path does not
+  fire and an agent has to ask for `prefer: "pixel"`. The threshold is the
+  spec's number and is left alone here; what a title-bar-only tree should count
+  as is a judgement the spec does not make.
+* **OCR merges a tab strip into one line.** `'Harnesses Agents Profiles'` comes
+  back as a single element 174 pixels wide, so pinning a tab by its label picks
+  the middle of three. The detector does find each tab as its own box, which is
+  how they were clicked here — but those boxes have no caption, so they were
+  pinned by id. An agent naming a tab by name on a screen like this would have
+  to be told which box, which is not yet solved.
+* **Nothing in the UI is covered by a test that drives it.** egui has no tree
+  to assert against; the live run above is the evidence, and it is a run, not a
+  regression test.
+* The UI's own unit tests cover the draft/epoch logic and the config fallbacks,
+  not the new tabs' widgets.
+
+### Next
+
+P7: retire the Python backend after parity, update the README and the skills
+(the broker-per-agent model and the env-var pairing are both gone), the full
+matrix test, the final benchmarks, and the four real tasks the operator added
+to the spec as an addendum.
+
+---
+
 ## P5 — the ensure-lane ladder
 
 ### Done

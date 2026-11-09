@@ -315,9 +315,28 @@ is what serialises it.
   than clicking whatever now sits at that position. This is the whole reason
   `gen` exists: an id that silently re-points is how a subject line ends up in
   a To field.
+
+  One bounded exception, and it is bounded because the exception is in what
+  the id *means*. An `ocr:` or `pixel:` id names a position, because a
+  rectangle in an image is all those sources have; OCR and the detector
+  re-measure every pass and disagree with themselves by a pixel or two. So
+  when such an id is not found verbatim, the broker will accept the element of
+  the same source whose centre is within six pixels of the pinned one **and**
+  whose width and height are within six pixels of it — and only if there is
+  exactly one such element, because two is the ambiguity `stale_id` exists to
+  report. A `uia:` or `dom-ext` id names a node, so a missing node stays
+  `stale_id`: something else moved into that rectangle is the normal case
+  there, not the exception.
 * `id` — opaque to the agent. Namespaced `browser:window:tab:element` for
-  `dom-ext`, `uia:<hwnd>:<runtime-id>` for `uia`, `pixel:<screen>:<n>` for
-  `pixel`. Never parsed by the agent.
+  `dom-ext`, `uia:<hwnd>:<runtime-id>` for `uia`, and for anything the pixels
+  found rather than the tree, `ocr:<cell>` or `pixel:<cell>` where the cell is
+  the element's centre in four-pixel units, with a `#n` suffix if two land in
+  one cell. Never parsed by the agent.
+
+  The cell, rather than the element's position in the list, because the list
+  changes: the icon detector found 33 controls on one pass and 34 on the next,
+  and index-derived ids renumbered every element after the newcomer. An id
+  derived from where the thing is survives a list that grew.
 * `container` — the nearest enclosing named region (ARIA dialog, form or
   landmark; or the UIA parent pane). Supplied so the decision model can tell
   two identically labelled fields apart. **Required** from `dom-ext`,

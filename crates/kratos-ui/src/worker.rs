@@ -26,6 +26,13 @@ pub enum Cmd {
     /// Ask the running broker to exit.
     StopBroker,
     ApplyConfig(Value),
+    /// Pair or unpair a backend instance with a browser profile.
+    ///
+    /// Its own command rather than a config patch, because `instance.bind`
+    /// is the op the broker exposes for it and it validates the brand --
+    /// writing the list by hand from here would be a second implementation
+    /// of a rule that already exists.
+    BindInstance(Value),
     ReloadConfig,
     Kill(String),
     ResetKill(String),
@@ -37,6 +44,13 @@ pub struct Shared {
     pub connected: bool,
     pub status: Option<Value>,
     pub config: Option<Value>,
+    /// What `lane.list` says: the browsers on this machine, their profiles,
+    /// the attached instances and every session's lane.
+    ///
+    /// Read from the broker rather than from this process, because the broker
+    /// is the one on the machine being driven -- and because two readers of
+    /// `Local State` would be two things to keep in step.
+    pub lanes: Option<Value>,
     pub log: Vec<Value>,
     /// Last thing that went wrong, for the status bar.
     pub error: Option<String>,
@@ -116,6 +130,13 @@ async fn run(pipe_base: String, shared: Arc<Mutex<Shared>>, mut rx: mpsc::Receiv
                             continue;
                         }
                     }
+                    // The machine's browsers, profiles and attached
+                    // instances, on the same tick: the broker caches its
+                    // Local State reads, so this costs a round trip rather
+                    // than a megabyte of JSON per poll.
+                    if let Ok(v) = p.call(ops::LANE_LIST, json!({})).await {
+                        set(&shared, |s| s.lanes = Some(v));
+                    }
                     if log_lines > 0 {
                         if let Ok(v) = p.call(ops::LOG_TAIL, json!({"n": log_lines})).await {
                             let lines = v["lines"].as_array().cloned().unwrap_or_default();
@@ -180,6 +201,31 @@ async fn handle(
                             "saved and live".into()
                         });
                     });
+                }
+                Err(e) => set(shared, |s| s.error = Some(format!("{}: {}", e.code, e.message))),
+            }
+        }
+        Cmd::BindInstance(payload) => {
+            let Some(p) = peer.as_mut() else {
+                set(shared, |s| s.error = Some("not connected: start the broker first".into()));
+                return;
+            };
+            let unpair = payload.get("profile_dir").is_none();
+            match p.call(ops::INSTANCE_BIND, payload).await {
+                Ok(v) => {
+                    set(shared, |s| {
+                        s.error = None;
+                        s.notice = Some(if unpair {
+                            "unpaired".into()
+                        } else {
+                            format!(
+                                "paired with {}/{}",
+                                v["brand"].as_str().unwrap_or("?"),
+                                v["profile_dir"].as_str().unwrap_or("?")
+                            )
+                        });
+                    });
+                    refresh_config(p, shared).await;
                 }
                 Err(e) => set(shared, |s| s.error = Some(format!("{}: {}", e.code, e.message))),
             }
