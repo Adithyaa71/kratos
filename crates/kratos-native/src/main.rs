@@ -13,15 +13,17 @@
 //! kratos-native --dump  [window]                   write a fixture to stdout
 //! ```
 
+mod capture;
+mod ocr;
 mod uia;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kratos_protocol::{codes, ops, WireError};
 use serde_json::json;
 
 const BUILD: &str = concat!("kratos-native ", env!("CARGO_PKG_VERSION"));
-const SOURCE: &str = "uia";
 
 /// Reconnect backoff, as the browser host uses.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -40,6 +42,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("--bench") => bench(&args[1..]),
         Some("--dump") => dump(args.get(1).map(String::as_str)),
+        Some("--ocr") => read_pixels(args.get(1).map(String::as_str)),
         _ => runtime.block_on(serve()),
     }
 }
@@ -58,20 +61,57 @@ async fn serve() {
         }
     };
 
+    // One connection per source, from one process.
+    //
+    // The protocol gives a peer one `source`, and these really are different
+    // answers to "what can you see": UI Automation reports a tree, OCR
+    // reports text with boxes and no tree at all. Registering them separately
+    // is also what lets the broker fall back from one to the other, and what
+    // lets an operator turn one off in `backends.enabled` without losing the
+    // other.
+    let reader = Reader { uia, ocr: ocr::Ocr::new().ok().map(Arc::new) };
+    match &reader.ocr {
+        Some(_) => eprintln!("kratos-native: OCR languages: {:?}", ocr::Ocr::languages()),
+        None => eprintln!(
+            "kratos-native: no OCR engine for this user's languages; the ocr source will say so"
+        ),
+    }
+    let reader = Arc::new(reader);
+
+    let mut sources = Vec::new();
+    for source in ["uia", "ocr"] {
+        let pipe = pipe.clone();
+        let reader = reader.clone();
+        sources.push(tokio::spawn(async move { attach(pipe, source, reader).await }));
+    }
+    for s in sources {
+        let _ = s.await;
+    }
+}
+
+/// Everything this backend can see with, shared by its connections.
+struct Reader {
+    uia: uia::Uia,
+    /// `None` on a machine with no OCR language pack, which is a real
+    /// configuration and not a reason to refuse to start.
+    ocr: Option<Arc<ocr::Ocr>>,
+}
+
+async fn attach(pipe: String, source: &'static str, reader: Arc<Reader>) {
     let mut backoff = BACKOFF_MIN;
     loop {
         let peer = match kratos_ipc::PipePeer::attach_backend(
             &pipe,
-            "kratos-native",
+            &format!("kratos-native/{source}"),
             BUILD,
-            SOURCE,
+            source,
             vec!["native".to_string(), "browser".to_string()],
         )
         .await
         {
             Ok(p) => {
                 backoff = BACKOFF_MIN;
-                eprintln!("kratos-native: attached to the broker as {SOURCE}");
+                eprintln!("kratos-native: attached to the broker as {source}");
                 p
             }
             Err(e) => {
@@ -81,12 +121,12 @@ async fn serve() {
                 continue;
             }
         };
-        pump(peer, &uia).await;
-        eprintln!("kratos-native: lost the broker; waiting to reconnect");
+        pump(peer, source, &reader).await;
+        eprintln!("kratos-native: lost the broker on {source}; waiting to reconnect");
     }
 }
 
-async fn pump(mut peer: kratos_ipc::PipePeer, uia: &uia::Uia) {
+async fn pump(mut peer: kratos_ipc::PipePeer, source: &'static str, reader: &Reader) {
     loop {
         let frame = match peer.next_frame().await {
             Ok(Some(f)) => f,
@@ -95,18 +135,18 @@ async fn pump(mut peer: kratos_ipc::PipePeer, uia: &uia::Uia) {
             Err(_) => continue,
         };
         if frame.op() == Some(ops::EVT_SUPERSEDED) {
-            eprintln!("kratos-native: superseded by another {SOURCE} backend; exiting");
-            std::process::exit(0);
+            eprintln!("kratos-native: superseded on {source}; leaving that source alone");
+            return;
         }
         let (Some(op), Some(id)) = (frame.op(), frame.id()) else { continue };
         let (op, id) = (op.to_string(), id.to_string());
         let payload = frame.payload().clone();
 
         let reply = match op.as_str() {
-            ops::BACKEND_OBSERVE => observe(uia, &payload),
+            ops::BACKEND_OBSERVE => observe(reader, source, &payload),
             ops::BACKEND_ACT => Err(WireError::new(
                 codes::BACKEND_ERROR,
-                "kratos-native does not act yet; this is the UI Automation reading phase",
+                "kratos-native does not act yet; this is the reading phase",
             )),
             _ => Err(WireError::new(codes::BAD_REQUEST, format!("unknown op {op}"))),
         };
@@ -121,39 +161,93 @@ async fn pump(mut peer: kratos_ipc::PipePeer, uia: &uia::Uia) {
     }
 }
 
-fn observe(uia: &uia::Uia, payload: &serde_json::Value) -> Result<serde_json::Value, WireError> {
-    let req: kratos_protocol::BackendObserveReq = serde_json::from_value(payload.clone())
-        .map_err(|e| WireError::new(codes::BAD_REQUEST, format!("unusable observe: {e}")))?;
-
+/// Which window, from what the broker said.
+fn target(req: &kratos_protocol::BackendObserveReq) -> Result<isize, WireError> {
     // The broker resolved the window already and says which one. Matching the
     // title again here is a second search that can disagree with the first --
     // two windows of one application share a title often enough -- so the
     // handle wins when there is one.
-    let hwnd = match req.hwnd {
-        Some(h) if h != 0 => h as isize,
-        _ => match window::find(req.window.as_deref()) {
-            Some(h) => h,
-            None => {
-                return Err(WireError::new(
-                    codes::NO_TARGET,
-                    match req.window.as_deref() {
-                        Some(w) => format!("no visible window matches {w:?}"),
-                        None => "there is no foreground window".to_string(),
-                    },
-                ))
-            }
-        },
-    };
+    match req.hwnd {
+        Some(h) if h != 0 => Ok(h as isize),
+        _ => window::find(req.window.as_deref()).ok_or_else(|| {
+            WireError::new(
+                codes::NO_TARGET,
+                match req.window.as_deref() {
+                    Some(w) => format!("no visible window matches {w:?}"),
+                    None => "there is no foreground window".to_string(),
+                },
+            )
+        }),
+    }
+}
 
-    let obs = uia
-        .observe(hwnd)
-        .map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+fn observe(
+    reader: &Reader,
+    source: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, WireError> {
+    let req: kratos_protocol::BackendObserveReq = serde_json::from_value(payload.clone())
+        .map_err(|e| WireError::new(codes::BAD_REQUEST, format!("unusable observe: {e}")))?;
+    let hwnd = target(&req)?;
+
+    match source {
+        "ocr" => observe_by_eye(reader, hwnd),
+        _ => observe_by_tree(reader, hwnd),
+    }
+}
+
+fn observe_by_tree(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, WireError> {
+    let obs = reader.uia.observe(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
     Ok(json!({
         "window": obs.window,
         "url": null,
         "elements": obs.elements,
         "truncated": obs.truncated,
         "took_ms": obs.fetch_ms + obs.walk_ms,
+    }))
+}
+
+/// What is on the screen, for a window that exposes nothing to read.
+///
+/// Every line comes back as a `text` element with a box and no container,
+/// because that is honestly all there is: OCR has no tree, and inventing one
+/// would give the decision model structure that is not there.
+fn observe_by_eye(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, WireError> {
+    let Some(engine) = reader.ocr.as_ref() else {
+        return Err(WireError::new(
+            codes::BACKEND_ERROR,
+            "this machine has no OCR language pack installed, so there is nothing to read \
+             pixels with",
+        ));
+    };
+    let frame = capture::window(hwnd).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+    let capture_ms = frame.took_ms;
+    let how = frame.how;
+    let reading = engine.read(&frame).map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
+
+    let elements: Vec<serde_json::Value> = reading
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            json!({
+                "id": format!("ocr:{hwnd:x}:{i}"),
+                "role": "text",
+                "label": line.text,
+                "enabled": true,
+                "bbox": line.bbox,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "window": window::title(hwnd),
+        "url": null,
+        "elements": elements,
+        "truncated": false,
+        "took_ms": capture_ms + reading.took_ms,
+        "capture": how,
+        "cached": reading.cached,
     }))
 }
 
@@ -249,12 +343,27 @@ fn bench(args: &[String]) {
     let targets: Vec<Option<&str>> =
         if windows.is_empty() { vec![None] } else { windows.iter().map(|w| Some(*w)).collect() };
 
+    // The OCR engine is built once: creating it per window costs more than
+    // reading one.
+    let engine = ocr::Ocr::new().ok();
+
     let mut rows = Vec::new();
+    let mut eyes = Vec::new();
     for want in targets {
         let Some(hwnd) = window::find(want) else {
             eprintln!("no window matches {want:?}; skipping");
             continue;
         };
+        if let Some(engine) = &engine {
+            if let Some(e) = measure_ocr(engine, hwnd, want) {
+                println!(
+                    "{:<34} {:>4}x{:<4} capture {:>3}ms   ocr {:>4}ms   {:>3} lines   cached \
+                     {}ms",
+                    e.window, e.width, e.height, e.capture, e.ocr, e.lines, e.cached
+                );
+                eyes.push(e);
+            }
+        }
         match measure(&uia, hwnd, want) {
             Some(r) => {
                 println!(
@@ -269,7 +378,7 @@ fn bench(args: &[String]) {
     }
 
     if let Some(path) = out {
-        let doc = report(&rows);
+        let doc = report(&rows, &eyes);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -344,7 +453,42 @@ fn measure(uia: &uia::Uia, hwnd: isize, label: Option<&str>) -> Option<Row> {
 /// -- they depend on which windows are open and what is in them -- and
 /// `kratos-bench` is the offline, reproducible half. Mixing the two in one
 /// generated file would make the reproducible one a lie.
-fn report(rows: &[Row]) -> String {
+struct Eye {
+    window: String,
+    width: i32,
+    height: i32,
+    how: &'static str,
+    capture: u64,
+    ocr: u64,
+    lines: usize,
+    cached: u64,
+}
+
+/// Capture a window and read it, twice: the second pass is the frame cache.
+fn measure_ocr(engine: &ocr::Ocr, hwnd: isize, label: Option<&str>) -> Option<Eye> {
+    let first = capture::window(hwnd).ok()?;
+    let (width, height, how, capture_ms) =
+        (first.width, first.height, first.how, first.took_ms);
+    let read = engine.read(&first).ok()?;
+
+    // Again, unchanged: an agent looking at the same screen twice between two
+    // steps should pay once.
+    let again = capture::window(hwnd).ok()?;
+    let cached = engine.read(&again).ok()?;
+
+    Some(Eye {
+        window: label.unwrap_or("the window in front").to_string(),
+        width,
+        height,
+        how,
+        capture: capture_ms,
+        ocr: read.took_ms,
+        lines: read.lines.len(),
+        cached: cached.took_ms,
+    })
+}
+
+fn report(rows: &[Row], eyes: &[Eye]) -> String {
     let mut s = String::new();
     s.push_str("<!-- generated: kratos-native --bench ... --out docs/native-benchmarks.md -->\n");
     s.push_str("| window | elements | cold ms | p50 ms | p90 ms | max ms | of which fetch |\n");
@@ -366,7 +510,80 @@ fn report(rows: &[Row]) -> String {
          cold. `fetch` is the single cross-process call; everything else is reading the cache \
          locally, which is why it is the whole cost.\n"
     ));
+
+    if !eyes.is_empty() {
+        s.push_str("\n### Reading the pixels\n\n");
+        s.push_str(
+            "| window | size | capture | how | OCR | lines | same frame again |\n             |---|---|---:|---|---:|---:|---:|\n",
+        );
+        for e in eyes {
+            s.push_str(&format!(
+                "| {} | {}x{} | {}ms | {} | **{}ms** | {} | {}ms |\n",
+                e.window.replace('|', "/"),
+                e.width,
+                e.height,
+                e.capture,
+                e.how,
+                e.ocr,
+                e.lines,
+                e.cached
+            ));
+        }
+        s.push_str(
+            "\n`Windows.Media.Ocr`, which ships with Windows and needs no install, no model              download and no network. Capture is `PrintWindow` with full content, so the answer              is right even when something is on top of the window -- falling back to the screen              for windows that render nothing into a bitmap. The last column is the frame cache:              the same pixels are not read twice.\n",
+        );
+    }
     s
+}
+
+/// Capture a window and read it, printing what came back and what it cost.
+///
+/// The second run is the one that matters for the cache: a window nobody
+/// touched between two reads should not be read twice.
+fn read_pixels(window: Option<&str>) {
+    let Some(hwnd) = window::find(window) else {
+        eprintln!("no window matches {window:?}");
+        std::process::exit(1);
+    };
+    let engine = match ocr::Ocr::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("kratos-native: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("languages {:?}", ocr::Ocr::languages());
+
+    for pass in 1..=3 {
+        let frame = match capture::window(hwnd) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("capture failed: {e}");
+                std::process::exit(1);
+            }
+        };
+        let capture_ms = frame.took_ms;
+        let (w, h, how) = (frame.width, frame.height, frame.how);
+        match engine.read(&frame) {
+            Ok(r) => {
+                println!(
+                    "pass {pass}: {w}x{h} via {how} in {capture_ms}ms, {} lines in {}ms{}",
+                    r.lines.len(),
+                    r.took_ms,
+                    if r.cached { " (cached)" } else { "" }
+                );
+                if pass == 1 {
+                    for line in r.lines.iter().take(8) {
+                        println!("   {:?} at {:?}", line.text, line.bbox);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("ocr failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 /// Write one window's elements as JSON, for a fixture.

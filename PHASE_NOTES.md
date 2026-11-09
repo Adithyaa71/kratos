@@ -5,6 +5,105 @@ Newest phase first.
 
 ---
 
+## P4b — capture and OCR
+
+### Done
+
+* **Per-window capture** (`capture.rs`): `PrintWindow` with
+  `PW_RENDERFULLCONTENT`, so the window renders *itself* into the bitmap and
+  the answer is right even when something is sitting on top of it — which a
+  screen grab cannot say. A blank result falls back to copying the window's
+  rectangle off the screen, because a hardware-composited window renders
+  nothing into a bitmap and an all-black frame handed to OCR is not a failure
+  anybody notices: it reads as a window with no text in it.
+* **A frame-hash cache**: FNV-1a over every sixteenth pixel plus the
+  dimensions. The same pixels are never read twice, and most of what an agent
+  looks at between two steps is identical.
+* **`Windows.Media.Ocr`**: ships with Windows, no install, no model download,
+  no network, and the languages it reads are the ones the user already has.
+  A machine with no language pack gets a backend that says so rather than one
+  that refuses to start.
+* **One connection per source.** The process now attaches twice, as `uia` and
+  as `ocr`. The protocol gives a peer one source, and these are different
+  answers to "what can you see" — a tree, against text with boxes and no tree
+  at all. It is also what lets the broker fall back from one to the other and
+  the operator disable one in `backends.enabled`.
+* OCR elements are `text` with a box and **no container**, because that is
+  honestly all there is. Inventing structure would give the decision model
+  something that is not on the screen.
+
+### Evidence
+
+Measured here, four real windows:
+
+```text
+| window         | size      | capture | how        |  OCR | lines | again |
+| Notepad        |  970x1032 |    21ms | printwindow|  43ms |   37 |   0ms |
+| File Explorer  |  1210x735 |    19ms | printwindow|  47ms |   52 |   0ms |
+| Settings       | 1936x1048 |    35ms | printwindow|  66ms |   59 |   0ms |
+| Example Domain | 1936x1048 |    22ms | printwindow|  92ms |   33 |   0ms |
+```
+
+The spec's target is a **region** at p50 ≤ 100ms; these are whole windows at
+43–92ms, which is the harder measurement. `PrintWindow` worked for every
+window tried, including a Chromium one, so the screen fallback has not fired
+in practice yet — it is there for the case that it does.
+
+The cache column is the second read of an unchanged window: 0ms, every time.
+
+```text
+cargo test --workspace     372 passed; 0 failed; 0 ignored
+cargo clippy --workspace --all-targets     0 warnings
+```
+
+A live test opens Notepad, drives the real executable, and fails if the frame
+has no area, if nothing was read from a window that has text in it, or if the
+second read is not served from the cache.
+
+### Decisions
+
+* **`PrintWindow` rather than Windows Graphics Capture.** WGC is what the spec
+  names and it needs a D3D device, a frame pool and a WinRT dispatcher to read
+  one still image. `PrintWindow` is one call, handles occlusion, and measured
+  19–35ms for a full window. WGC earns its complexity when frames are wanted
+  continuously, which is a thing to reach for in P4d if the detector needs it.
+* **The OCR engine is built once and shared.** It is agile, so the two source
+  connections share one; building it per call costs more than a recognition.
+* **A ten-second ceiling on the recognition.** OCR runs in a system service,
+  and a wedged service would otherwise hang the backend thread for good — and
+  with it every observation of every window.
+* **`BitmapAlphaMode::Ignore`.** The capture path leaves alpha unset for some
+  windows, and a bitmap declared premultiplied with a zero alpha channel reads
+  as entirely transparent: a blank page to OCR.
+* **The async is awaited by hand.** `windows-future` has a `join` for exactly
+  this and keeps it private in 0.3.2, so the completion handler is wired
+  directly. This thread pumps no message loop, so there is nothing to deadlock
+  on.
+
+### Known gaps
+
+* **No region OCR yet.** Everything reads the whole window. A region is
+  strictly cheaper and the fusion pass (P4d) is what will want one, around a
+  detector box.
+* **No accuracy measurement.** These are timings. Recall, label exactness and
+  bbox IoU against a golden list are P4d's, and need a corpus that can be
+  committed — which the local one cannot be.
+* **The screen fallback is untested in practice**, because `PrintWindow`
+  worked everywhere tried. It is exercised only by the unit test of
+  `is_blank`.
+* OCR confidence is not reported: `Windows.Media.Ocr` does not expose a
+  per-line confidence, so a fused element from this source will carry the
+  source and no number. Something for the fusion to be honest about.
+
+### Next
+
+**P4c — actuation.** Semantic first through UIA patterns, physical second
+with `SendInput` and a clipboard paste for unicode, reporting `method` as the
+protocol already requires, and respecting the lease, the pause and the kill
+switch.
+
+---
+
 ## P4a — UI Automation in Rust
 
 ### Done

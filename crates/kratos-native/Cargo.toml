@@ -25,4 +25,21 @@ features = [
     "Win32_System_Ole",
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
+    # Capture: a window's own pixels, not the whole desktop.
+    "Win32_Graphics_Gdi",
+    "Win32_Storage_Xps",
+    # OCR: Windows.Media.Ocr is WinRT, ships with Windows, needs no install
+    # and no network. The language packs the user already has are the
+    # languages it reads.
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    # The OCR engine reports which language it read in.
+    "Globalization",
 ]
+
+# Waiting for a WinRT async from a worker thread.
+[target.'cfg(windows)'.dependencies.windows-future]
+version = "0.3"
