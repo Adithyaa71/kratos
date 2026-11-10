@@ -20,7 +20,12 @@
 //!
 //! Usage:
 //!   kratos-bench                 print a table
-//!   kratos-bench --out FILE      write docs/benchmarks.md
+//!   kratos-bench --out FILE      write the raw table to FILE
+//!
+//! `docs/benchmarks.md` is a written report that collects every measurement
+//! in this project, including ones no generator produces -- the live browser
+//! numbers, the actuation proofs, what the fixes were worth. It is not this
+//! tool's output and this tool must not be pointed at it.
 //!   kratos-bench --json          one JSON object per line
 
 use std::collections::BTreeMap;
@@ -600,10 +605,13 @@ fn document(table: &str) -> String {
     });
     format!(
         "# Benchmarks\n\n\
-         Reproduce, on your machine, in one command:\n\n\
+         The offline half, reproducible on your machine in one command:\n\n\
          ```bash\n\
-         cargo run --release -p kratos-bench -- --out docs/benchmarks.md\n\
+         cargo run --release -p kratos-bench -- --out /tmp/offline.md\n\
          ```\n\n\
+         A scratch path on purpose: `docs/benchmarks.md` is the written \
+         report that collects every measurement in this project, and this \
+         tool would overwrite it.\n\n\
          Everything below is kratos' own overhead: the MCP shim, the named pipe, the broker's \
          handling, the gate, the candidate compression and the screen fingerprints. The decision \
          model is the offline mock, so no network and no key are involved and nothing here is \
