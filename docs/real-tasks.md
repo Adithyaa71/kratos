@@ -14,6 +14,20 @@ recipient, a message, a product or a price.
 
 ## Status: not run
 
+The screen is unlocked now, and one thing is still missing: nobody has ticked
+`claude-code` in the Harnesses tab.
+
+```text
+[ok  ] session     unlocked: there is a desktop to drive
+[warn] harnesses   1 known, 0 approved: claude-code (not approved)
+```
+
+An agent cannot tick it for itself. Everything else is ready: the broker runs
+on the real config with its sealed key, the settings window is open, and the
+scripts are below.
+
+### What it looked like during P7
+
 **The screen was locked for the whole P7 session.** `kratos-broker.exe doctor`
 said so:
 

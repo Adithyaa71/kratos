@@ -185,12 +185,51 @@ that.
   `activity::tests`; the matrix checks that the setting is honoured, reported,
   and does not stop a DOM action that needs no pointer.
 
+### Afterwards — the screen was unlocked, and the benchmarks re-ran
+
+Both files are now measured on a desktop that was drawing, which fills in the
+rows P7 had to leave empty and settles the question of what the lock was
+actually doing:
+
+```text
+screen capture       p50 32.8ms   best 31.7ms   (locked: 1.7s)
+full fingerprint     p50 3.14ms
+element fingerprint  p50 0.359ms
+Notepad              41 el    p50 39.3ms   capture 36ms   ocr 30ms, 10 lines
+File Explorer        204 el   p50 85.8ms   capture 34ms   ocr 49ms, 56 lines
+```
+
+And the capture that was a lottery while locked is not one now: the same test
+ran three times and read ten lines out of the same window every time, in 19 to
+39ms, against 428 to 751ms with nothing in it while locked. So the attribution
+in "Known gaps" above is right, and the skips are right for a locked session.
+
+The p50s sit above the P4-era figures — cold start 38.9ms against 26ms,
+Notepad 39.3ms against 25.6ms — with best-case figures much closer (32.1ms,
+and File Explorer's 204 elements at 85.8ms against 78ms for 206). That is this
+machine with a browser, a second browser, a chat client, Explorer and two
+Settings windows open, not a regression in the code. Worth re-running on a
+quiet desktop before quoting either number.
+
+One thing the re-run turned up that is nothing to do with the lock: **the
+Windows 11 Notepad puts 35 visible top-level windows on screen from one
+process, all titled "Notepad" or "Untitled - Notepad"**, and there are two
+windows titled "Settings". Matching a window by title picks whichever
+`EnumWindows` reaches first, which for Settings gave an observation with zero
+elements. That is the `ambiguous_window` case the protocol has an error code
+for, and the benchmark has no business resolving it silently — it is named
+here rather than worked around.
+
 ### Next
 
-Unlock the screen and run `docs/real-tasks.md`, recording the per-segment
-numbers in `docs/benchmarks.md`. Then regenerate both benchmark files from an
-unlocked session, which fills in the screen rows and gives the native
-measurements a desktop that is actually drawing.
+Run `docs/real-tasks.md` and record the per-segment numbers. Still waiting on
+one thing, which is not something an agent may do for itself: `claude-code` is
+listed in the Harnesses tab and not ticked.
+
+```text
+[ok  ] session     unlocked: there is a desktop to drive
+[warn] harnesses   1 known, 0 approved: claude-code (not approved)
+```
 
 ---
 
