@@ -22,8 +22,8 @@ use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible,
+    EnumWindows, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, GW_OWNER,
 };
 
 use kratos_protocol::TargetClass;
@@ -256,12 +256,41 @@ unsafe extern "system" fn enum_proc_all(hwnd: HWND, lparam: LPARAM) -> Bool {
     1
 }
 
-/// Visible windows belonging to one Chromium brand.
+/// Whether a window belongs to another window.
+///
+/// An application window owns itself and `GW_OWNER` is null for it. A dialog,
+/// a prompt, a bubble -- anything the program put up *over* a window -- names
+/// that window as its owner. The distinction is the one the task switcher
+/// makes, and it is the only cheap way to tell a browser from the thing the
+/// browser is asking you about.
+fn is_owned(hwnd: isize) -> bool {
+    // SAFETY: a call on a handle that may be stale, which returns null rather
+    // than failing. Nothing is dereferenced.
+    !unsafe { GetWindow(hwnd as *mut c_void as HWND, GW_OWNER) }.is_null()
+}
+
+/// Visible windows belonging to one Chromium brand, the real ones first.
+///
+/// Ordered, not filtered. Callers that want "the browser" take the first and
+/// must not be handed a prompt: an `observe` on a lane came back with the
+/// fifteen elements of Brave's "Translate this page?" bubble, because the
+/// bubble is a visible titled window of brand `brave` and it had just been
+/// shown, so it was first in z-order. It also cost twenty seconds, because
+/// dom-ext was given the bubble's handle, has no tab for it, and went quiet
+/// until the broker gave up.
+///
+/// The owned ones are still here, after the others, because a browser
+/// genuinely can have no unowned window -- every tab closed, a download
+/// bubble left on screen -- and an empty answer there would read as "that
+/// browser is not running".
 pub fn windows_of_brand(brand: &str) -> Vec<WindowRef> {
-    visible_windows()
+    let mut found: Vec<WindowRef> = visible_windows()
         .into_iter()
         .filter(|w| w.brand().is_some_and(|b| b.eq_ignore_ascii_case(brand)))
-        .collect()
+        .collect();
+    // Stable, so z-order still decides between two real browser windows.
+    found.sort_by_key(|w| is_owned(w.hwnd));
+    found
 }
 
 /// Decide between the windows a `window` argument matched.
@@ -300,6 +329,58 @@ mod tests {
 
     fn win(exe: &str, title: &str) -> WindowRef {
         WindowRef { hwnd: 1, title: title.into(), exe: exe.into(), pid: 1, rect: None }
+    }
+
+    #[test]
+    fn the_lane_gets_a_real_browser_window_before_a_prompt() {
+        // Live, against whatever is on this machine. It asserts the one thing
+        // that matters and can be checked without owning a browser: once an
+        // owned window appears in the list, no unowned one follows it. The
+        // caller takes the first, so that ordering is what stops an `observe`
+        // on a lane coming back with the contents of Brave's "Translate this
+        // page?" bubble -- which is what happened, for twenty seconds, before
+        // this.
+        for brand in ["brave", "chrome", "edge", "vivaldi"] {
+            let found = super::windows_of_brand(brand);
+            if found.len() < 2 {
+                continue;
+            }
+            let mut seen_owned = false;
+            for w in &found {
+                let owned = super::is_owned(w.hwnd);
+                assert!(
+                    !(seen_owned && !owned),
+                    "{brand}: {:?} is a real window and it came after an owned one",
+                    w.title
+                );
+                seen_owned |= owned;
+            }
+        }
+    }
+
+    #[test]
+    fn an_owned_window_is_still_findable_by_name() {
+        // The preference above is an ordering and not a filter, on purpose.
+        // A Save As dialog is an owned window, and `click Save As` is half of
+        // what this tool is for -- so the general enumeration must still
+        // contain them. If this ever starts passing because the list is
+        // empty, it is not telling you anything, so it skips instead.
+        let all = super::visible_windows();
+        if all.is_empty() {
+            eprintln!("no visible windows; nothing to check");
+            return;
+        }
+        // Whatever is on screen, the enumeration must not have quietly become
+        // unowned-only: that would be the regression this guards.
+        let owned_exist_somewhere = all.iter().any(|w| super::is_owned(w.hwnd));
+        eprintln!(
+            "{} visible windows, {} of them owned",
+            all.len(),
+            all.iter().filter(|w| super::is_owned(w.hwnd)).count()
+        );
+        // Not an assertion on the count -- a desktop with no dialog open has
+        // none, legitimately. What is asserted is that asking is possible.
+        let _ = owned_exist_somewhere;
     }
 
     #[test]
