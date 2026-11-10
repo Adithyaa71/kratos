@@ -37,6 +37,8 @@ pub struct Request {
     pub bbox: Option<[i32; 4]>,
     pub text: Option<String>,
     pub key: Option<String>,
+    /// Where to go, for `navigate`. The literal from the operator's sentence.
+    pub url: Option<String>,
     pub amount: Option<i32>,
 }
 
@@ -237,8 +239,131 @@ unsafe fn semantic(element: &IUIAutomationElement, req: &Request) -> Option<Outc
     }
 }
 
+/// Starting something, and bringing a window forward.
+///
+/// Neither is a click, and neither has an element: there is no node in any
+/// tree for an application that is not running. These were the Python
+/// backend's three kinds that this one could not do, so retiring it without
+/// them would have lost the ability to start anything.
+///
+/// The literal always comes from the operator's sentence -- the broker
+/// extracted it before this was called -- so an empty one is a refusal, never
+/// a guess.
+fn start_or_focus(req: &Request) -> Outcome {
+    let refuse = |why: String| Outcome {
+        applied: false,
+        method: "physical",
+        detail: Some(why),
+        ..Default::default()
+    };
+
+    match req.kind.as_str() {
+        "focus" => match req.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => refuse("no window is named in this instruction".into()),
+            Some(name) => match crate::launch::focus(name) {
+                Ok(title) => Outcome {
+                    applied: true,
+                    method: "physical",
+                    detail: Some(format!("brought {title:?} to the front")),
+                    // The title it settled on, as evidence: a substring match
+                    // can land on a window that is not the one meant, and the
+                    // broker should be able to see which it was.
+                    readback: Some(title),
+                },
+                Err(why) => refuse(why),
+            },
+        },
+
+        "navigate" => match req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            None => refuse("no URL is named in this instruction".into()),
+            // Through the shell, which sends it to the default browser. A
+            // browser that is already driven by `dom-ext` navigates through
+            // the page instead, and the broker tries that backend first.
+            Some(url) => match crate::launch::start(url) {
+                Ok(started) => Outcome {
+                    applied: true,
+                    method: "physical",
+                    detail: Some(match &started.window {
+                        Some(w) => format!("opened {url:?}; {w:?} appeared"),
+                        None => format!("opened {url:?}; no new window appeared within the wait"),
+                    }),
+                    readback: started.window,
+                },
+                Err(why) => refuse(why),
+            },
+        },
+
+        "open" => {
+            let Some(name) = req.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                return refuse("no application is named in this instruction".into());
+            };
+            let target: String = if crate::launch::looks_like_a_location(name) {
+                name.to_string()
+            } else {
+                match crate::launch::resolve(name) {
+                    Some(p) => p.to_string_lossy().to_string(),
+                    None => {
+                        // A refusal with candidates, which is the shape every
+                        // other ambiguity in this system takes. "No" on its
+                        // own is not actionable.
+                        let near = crate::launch::near(name, 8);
+                        return refuse(if near.is_empty() {
+                            format!(
+                                "nothing installed on this machine is called {name:?}; \
+                                 {} applications were catalogued",
+                                crate::launch::installed()
+                            )
+                        } else {
+                            format!(
+                                "nothing installed on this machine is called {name:?}. \
+                                 Nearest: {}",
+                                near.join(", ")
+                            )
+                        });
+                    }
+                }
+            };
+            match crate::launch::start(&target) {
+                Ok(started) => Outcome {
+                    applied: true,
+                    method: "physical",
+                    detail: Some(match &started.window {
+                        Some(w) => format!("started {name:?} ({target}); {w:?} appeared"),
+                        None => format!(
+                            "started {name:?} ({target}); no new window appeared within the wait"
+                        ),
+                    }),
+                    readback: started.window,
+                },
+                Err(why) => refuse(why),
+            }
+        }
+
+        other => refuse(format!("{other:?} is not something this backend can do")),
+    }
+}
+
 /// The mouse and the keyboard, for everything with no pattern behind it.
 fn physical(req: &Request) -> Outcome {
+    // Not on a locked session. `SendInput` is refused there and returns zero
+    // events sent, with no error to read, so every one of these would report
+    // itself dispatched and change nothing -- which the broker then calls
+    // `no_effect`, and `no_effect` reads as "the button did not work". The
+    // semantic path above is unaffected and keeps working: a control's own
+    // pattern needs no pointer and no focus, which is measurable on this very
+    // machine with the screen locked.
+    if !kratos_ipc::win::session_is_unlocked() {
+        return Outcome {
+            applied: false,
+            method: "physical",
+            detail: Some(
+                "this session is locked: synthetic input is refused by Windows, so nothing was \
+                 sent. Only the person at the machine can unlock it."
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+    }
     match req.kind.as_str() {
         "click" => match req.bbox {
             Some([x, y, w, h]) => {
@@ -310,6 +435,9 @@ fn physical(req: &Request) -> Outcome {
             }
         }
 
+        // Not input at all: starting something, or moving the focus.
+        "open" | "focus" | "navigate" => start_or_focus(req),
+
         other => Outcome {
             applied: false,
             method: "physical",
@@ -327,7 +455,17 @@ pub unsafe fn perform(
     // A keypress has no element by design: it goes to whatever has focus. A
     // backend that refused a null target would break `press Enter` entirely,
     // which is exactly what both of the earlier ones did.
+    //
+    // And it ignores one that *is* attached. The decision model answers two
+    // questions -- the kind and the element -- and it answers both for a
+    // keypress too, so the broker passes along whatever scored highest as the
+    // place the key is expected to land. Looking that element up here is how
+    // `press Enter` fails because an unrelated link scrolled out of the tree
+    // a moment earlier. Nothing is pressed at it and nothing is focused by
+    // it: the key goes where focus already is, which after a `type` is the
+    // box that was typed into.
     let element = match &req.path {
+        Some(_) if req.kind == "key" => None,
         Some(path) => {
             let root = automation
                 .ElementFromHandle(windows::Win32::Foundation::HWND(req.hwnd as *mut _))

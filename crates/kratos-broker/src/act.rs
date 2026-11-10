@@ -662,7 +662,10 @@ async fn act_inner(
     let elapsed = || started.elapsed().as_millis() as u64;
 
     // -- 1. what are we aiming at ------------------------------------------
-    let aim = crate::target::aim(broker, peer, req.window.as_deref()).await?;
+    let aim = match crate::target::aim(broker, peer, req.window.as_deref()).await {
+        Ok(a) => a,
+        Err(e) => return Err(journal_error(broker, peer, &req, started, e).await),
+    };
     let win = aim.window_or_brand();
     let class = aim.class;
 
@@ -715,7 +718,7 @@ async fn act_inner(
     .await;
     let (obs_source, before) = match before_obs {
         Ok(v) => v,
-        Err(e) => return Err(e),
+        Err(e) => return Err(journal_error(broker, peer, &req, started, e).await),
     };
     let url = before.url.clone();
     let generation = broker.next_generation();
@@ -738,13 +741,21 @@ async fn act_inner(
             None => match repin_by_position(id, seen_before.as_ref(), &before.elements) {
                 Some(e) => Some(e),
                 None => {
-                    return Err(WireError::with_detail(
-                        codes::STALE_ID,
-                        format!(
-                            "element {id:?} is not on screen any more; observe again and re-pin"
+                    return Err(journal_error(
+                        broker,
+                        peer,
+                        &req,
+                        started,
+                        WireError::with_detail(
+                            codes::STALE_ID,
+                            format!(
+                                "element {id:?} is not on screen any more; observe again and \
+                                 re-pin"
+                            ),
+                            json!({"gen": generation, "elements_now": before.elements.len()}),
                         ),
-                        json!({"gen": generation, "elements_now": before.elements.len()}),
-                    ))
+                    )
+                    .await)
                 }
             },
         },
@@ -965,7 +976,14 @@ async fn act_inner(
     // collided if they tried.
     let chain = broker.route(effective_class, None).await;
     if chain.is_empty() {
-        return Err(WireError::new(codes::NO_BACKEND, "no backend is connected to act through"));
+        return Err(journal_error(
+            broker,
+            peer,
+            &req,
+            started,
+            WireError::new(codes::NO_BACKEND, "no backend is connected to act through"),
+        )
+        .await);
     }
     let dom_first = chain.first() == Some(&Source::DomExt) && aim.instance.is_some();
 
@@ -1491,6 +1509,42 @@ fn repin_by_position(
         }
     }
     found.cloned()
+}
+
+/// Write down an act that never reached a verdict, and hand the error back.
+///
+/// The early returns -- no window, no backend, a pin that is gone -- used to
+/// leave nothing behind. They are the lines you most want afterwards: they say
+/// an agent asked for something and the system could not even get as far as
+/// judging it, which is a fact about the machine rather than about the
+/// instruction.
+///
+/// There is no `WindowRef` yet at some of these points, so the record carries
+/// the window the request *named*, which is what the agent knows too. No
+/// decision, no gate, no evidence: nothing had happened.
+async fn journal_error(
+    broker: &Arc<Broker>,
+    peer: &Arc<PeerHandle>,
+    req: &ActReq,
+    started: std::time::Instant,
+    error: WireError,
+) -> WireError {
+    // Unredacted only where nothing could be sensitive: this is before any
+    // element was pinned, so the pin's `sensitive` flag is unknown. Treat the
+    // instruction as sensitive, which is the safe direction.
+    let record = json!({
+        "peer_id": peer.peer_id,
+        "agent": peer.name,
+        "op": "act",
+        "instruction": kratos_gate::redact_for_log(&req.instruction, true),
+        "window": req.window,
+        "status": "error",
+        "error": error.code,
+        "detail": error.message,
+        "took_ms": started.elapsed().as_millis() as u64,
+    });
+    broker.journal.read().await.append(record);
+    error
 }
 
 async fn journal_line(

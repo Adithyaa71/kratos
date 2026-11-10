@@ -205,6 +205,9 @@ pub mod codes {
     pub const BACKEND_ERROR: &str = "backend_error";
     pub const BACKEND_TIMEOUT: &str = "backend_timeout";
     pub const STALE_ID: &str = "stale_id";
+    /// The session is locked, so nothing that needs the mouse, the keyboard
+    /// or a visible window can happen. Not a failure of the instruction.
+    pub const SCREEN_LOCKED: &str = "screen_locked";
     pub const STALE_CONFIRM: &str = "stale_confirm";
     pub const GATE_BLOCKED: &str = "gate_blocked";
     pub const KILL_SWITCH: &str = "kill_switch";

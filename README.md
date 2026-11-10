@@ -121,8 +121,10 @@ better than the accessibility tree, so we did.
 git clone https://github.com/Adithyaa71/kratos
 cd kratos
 cargo build --release
-python -m pip install -r backends/requirements.txt
 ```
+
+Rust and a Windows machine. Nothing else: perception is a binary in this
+workspace, and it is the broker's job to start it.
 
 **1 · Point an agent at it.** That is the entire integration — no port, no
 token, no daemon to start first.
@@ -133,18 +135,17 @@ claude mcp add kratos -- ./target/release/kratos-mcp.exe
 
 Works with anything that speaks MCP over stdio. Or skip MCP entirely: the shim
 holds no policy, so any language that can open a named pipe is a first-class
-peer — [`docs/protocol.md`](docs/protocol.md) is the whole contract, and
-`backends/kratos_backend.py` is a working example in 480 lines.
+peer — [`docs/protocol.md`](docs/protocol.md) is the whole contract.
 
-**2 · Give it eyes.**
+**2 · Eyes are already attached.** The broker starts `kratos-native.exe`
+itself on its first call and restarts it with backoff if it dies; it reads the
+accessibility tree, captures windows, runs OCR, and finds the controls nothing
+declares. There is no step here and nothing to remember to start, which is the
+point: a machine where somebody forgot gets `no_backend` for a reason that is
+not the agent's fault.
 
-```bash
-start-backend.cmd          # or: python backends/kratos_backend.py
-```
-
-The perception and actuation packages ship inside `backends/`, so this runs
-from a fresh clone with nothing else on disk. It waits for the broker and
-reconnects on its own, so the order you start things in does not matter.
+To drive a browser and nothing else, turn it off: **Behaviour** in the
+settings window, or `backends.spawn_native` in the config.
 
 **3 · Give it a decision model.**
 
@@ -392,11 +393,14 @@ crates/kratos-host        browser native-messaging relay
 crates/kratos-ui          settings: key, gate rules, kill switch, live log
 crates/kratos-bench       the benchmark, offline and reproducible
 
+crates/kratos-native      perception and actuation, in Rust:
+  uia.rs                    one cached subtree fetch per window
+  capture.rs, ocr.rs        a window's own pixels, read offline
+  detect.rs, fuse.rs        the controls nothing declares, reconciled
+  act.rs, input.rs          patterns first, mouse and keyboard second
+  launch.rs                 starting an application, focusing a window
+
 extension/                MV3 · Brave, Chrome, Edge
-backends/                 the perception backend, self-contained:
-  kratos_backend.py         speaks the wire protocol
-  perception/               the UIA walk, the app index, OCR
-  actuation/                mouse and keyboard
 skills/kratos/            how an agent should drive this
 ```
 

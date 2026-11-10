@@ -93,7 +93,11 @@ impl Harness {
             "defaults": {"profile": "Default", "open_method": "none"},
             "thresholds": {"default": 0.0, "click": 0.0, "type": 0.0, "key": 0.0,
                            "scroll": 0.0, "select": 0.0, "navigate": 0.0,
-                           "open": 0.0, "focus": 0.0}
+                           "open": 0.0, "focus": 0.0},
+            // The fake backends below are the point of this file; a spawned
+            // kratos-native registers as `uia` too and would displace one.
+            "backends": {"enabled": ["dom-ext", "uia", "pixel", "ocr"],
+                         "spawn_native": false}
         });
         let config_path = dir.join("config.json");
         let mut f = std::fs::File::create(&config_path).expect("config");
@@ -1311,4 +1315,167 @@ async fn a_lane_that_is_already_attached_opens_nothing() {
         "the attached instance should have answered: {obs}"
     );
     instance.task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// P7: the whole matrix
+// ---------------------------------------------------------------------------
+
+/// Two agents, two instances, every kill scope, pause on and off.
+///
+/// The spec's P7 acceptance item. Every cell is also covered by a test of its
+/// own above; the cross product is here because that is where the mistakes
+/// live. A kill scope that stops the wrong lane and a pause that stops a DOM
+/// action are both invisible to a test that varies one thing at a time.
+///
+/// What this cannot do is make the *user* type. Pause fires on real keyboard
+/// and mouse input, and input this process injects is ignored on purpose --
+/// that is the whole point of the `LLMHF_INJECTED` check -- so no test outside
+/// the broker's own process can produce the condition. The paused branch is
+/// covered by `activity::tests` in the broker; what the matrix checks is that
+/// the setting is honoured, reported, and does not stop a DOM action.
+#[tokio::test]
+async fn the_matrix_two_agents_two_instances_kill_scopes_and_pause() {
+    let h = Harness::start("matrix");
+    wait_for_pipe(&h.pipe).await;
+    let mut ui = settings(&h.pipe).await;
+    let Some((brand_a, brand_b)) = two_brands(&mut ui).await else {
+        eprintln!("fewer than two Chromium browsers here; the matrix needs two lanes");
+        return;
+    };
+
+    let _a = FakeInstance::dom_ext_brand(&brand_a, "tok-a").spawn(h.pipe.clone());
+    let _b = FakeInstance::dom_ext_brand(&brand_b, "tok-b").spawn(h.pipe.clone());
+    tokio::time::sleep(SETTLE).await;
+
+    // Two harnesses, one browser each; two agents, one profile each.
+    ui.call(
+        ops::CONFIG_SET,
+        json!({"patch": {
+            "harnesses": [
+                {"id": "claude", "browser": brand_a, "approved": true},
+                {"id": "bluee", "browser": brand_b, "approved": true},
+            ],
+            "agents": [
+                {"id": "agent-one", "profile_dir": "Default"},
+                {"id": "agent-two", "profile_dir": "Default"},
+            ],
+            "instances": [
+                {"token": "tok-a", "brand": brand_a, "profile_dir": "Default"},
+                {"token": "tok-b", "brand": brand_b, "profile_dir": "Default"},
+            ],
+            "defaults": {"profile": "Default"},
+        }}),
+    )
+    .await
+    .expect("config.set");
+
+    let mut one = session(&h.pipe, "claude", Some("agent-one"), "s-1").await;
+    let mut two = session(&h.pipe, "bluee", Some("agent-two"), "s-2").await;
+    assert_eq!(one.ack["lane"]["state"], json!("ready"), "{}", one.ack["lane"]);
+    assert_eq!(two.ack["lane"]["state"], json!("ready"), "{}", two.ack["lane"]);
+    assert_eq!(one.ack["lane"]["browser"], json!(brand_a), "{}", one.ack["lane"]);
+    assert_eq!(two.ack["lane"]["browser"], json!(brand_b), "{}", two.ack["lane"]);
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for pause in [false, true] {
+        ui.call(
+            ops::CONFIG_SET,
+            json!({"patch": {"defaults": {
+                "pause_on_user_input": pause,
+                // Short, so that if anybody *is* at this machine the wait is
+                // a moment rather than half a minute.
+                "user_idle_ms": 300,
+                "pause_max_ms": 1500,
+            }}}),
+        )
+        .await
+        .expect("config.set pause");
+
+        let status = ui.call(ops::STATUS, json!({})).await.expect("status");
+        if status["pause"]["on_user_input"] != json!(pause) {
+            failures.push(format!(
+                "pause={pause}: status does not report the setting: {}",
+                status["pause"]
+            ));
+        }
+
+        // scope -> which lanes it should stop
+        let scopes: Vec<(String, bool, bool)> = vec![
+            ("".to_string(), false, false),
+            (format!("browser:{brand_a}"), true, false),
+            (format!("browser:{brand_b}"), false, true),
+            ("global".to_string(), true, true),
+        ];
+
+        for (scope, stops_one, stops_two) in scopes {
+            if !scope.is_empty() {
+                ui.call(
+                    ops::KILL_ENGAGE,
+                    json!({"scope": scope, "reason": "matrix"}),
+                )
+                .await
+                .expect("kill.engage");
+            }
+
+            for (who, peer, stopped) in [
+                ("claude", &mut one, stops_one),
+                ("bluee", &mut two, stops_two),
+            ] {
+                let res = peer.call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"})).await;
+                let label = format!("pause={pause} scope={scope:?} {who}");
+                match (&res, stopped) {
+                    // Stopped: either the kill switch refused it outright or
+                    // the act came back `killed`. Both are honest; what must
+                    // never happen is that it ran.
+                    (Ok(v), true) => {
+                        if v["status"] != json!("killed") {
+                            failures.push(format!("{label}: ran anyway: {v}"));
+                        }
+                    }
+                    (Err(e), true) => {
+                        if e.code != codes::KILL_SWITCH {
+                            failures.push(format!("{label}: {} {}", e.code, e.message));
+                        }
+                    }
+                    // Not stopped: it must go through its own instance, and
+                    // a DOM action must not be paused -- it never touches
+                    // the pointer, so there is nothing for the user to
+                    // collide with.
+                    (Ok(v), false) => {
+                        if v["status"] == json!("killed") {
+                            failures.push(format!("{label}: killed by another lane's scope: {v}"));
+                        }
+                        if v["status"] == json!("paused") {
+                            failures.push(format!(
+                                "{label}: a DOM action was paused; it needs no pointer: {v}"
+                            ));
+                        }
+                        if v["backend"] != json!("dom-ext") {
+                            failures.push(format!("{label}: wrong backend: {v}"));
+                        }
+                    }
+                    (Err(e), false) => {
+                        failures.push(format!("{label}: refused: {} {}", e.code, e.message));
+                    }
+                }
+            }
+
+            if !scope.is_empty() {
+                // Only the settings window can clear one. An agent asking is
+                // the thing that must be refused, so ask as the agent first.
+                let refused = one.call(ops::KILL_RESET, json!({"scope": scope})).await;
+                if refused.is_ok() {
+                    failures.push(format!("an agent cleared the kill switch for {scope:?}"));
+                }
+                ui.call(ops::KILL_RESET, json!({"scope": scope})).await.expect("kill.reset");
+            }
+        }
+    }
+
+    eprintln!(
+        "P7 matrix: {brand_a} and {brand_b}, 2 pause settings x 4 kill scopes x 2 lanes, 16 cells"
+    );
+    report("P7 matrix: two agents x two instances x kill scopes x pause", failures);
 }

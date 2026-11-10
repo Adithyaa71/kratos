@@ -167,9 +167,24 @@ Stop acting on that target entirely. You can engage a kill switch and you can
 never clear one. Tell the operator; only they can resume.
 
 ### `no_backend` — the broker cannot see the screen
-Not your fault and not fixable by you. Tell the operator:
-> The perception backend is not running. Start it with
-> `D:\Kratos\start-backend.cmd`
+Not your fault and not fixable by you. The broker starts its own
+perception backend, so this means it could not. Tell the operator:
+> The broker has no perception backend. It starts `kratos-native.exe`
+> itself, so either that binary is not beside `kratos-broker.exe` (build
+> it with `cargo build --release`) or `backends.spawn_native` is off --
+> settings window, **Behaviour**.
+
+### `screen_locked` — nobody is at the machine
+
+The session is locked. The mouse, the keyboard and every window are out of
+reach, and **nothing was dispatched** — this is not a half-done action, so
+there is nothing to check or undo. Do not retry; it will say the same thing
+until a person unlocks the screen.
+
+A browser action through `dom-ext` still works, because it goes through the
+page's own event system. Everything else waits. Tell the operator:
+> The screen is locked, so I cannot touch the mouse, the keyboard or any
+> window. Unlock it and I will carry on from here.
 
 ### `decider_unconfigured` — no API key
 > No decision-model key is set. Open the settings window

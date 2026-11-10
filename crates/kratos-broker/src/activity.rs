@@ -266,6 +266,13 @@ mod tests {
             eprintln!("no input hooks in this session (headless?); skipping");
             return;
         }
+        // A locked session refuses SendInput and returns zero sent, with no
+        // error to read. The test below would then fail with "SendInput
+        // refused", which says nothing about the actual cause.
+        if !kratos_ipc::win::session_is_unlocked() {
+            eprintln!("this session is locked, so SendInput is refused; skipping");
+            return;
+        }
 
         // Only run while nobody is using the machine, so a real hand on the
         // mouse cannot be mistaken for a failure.

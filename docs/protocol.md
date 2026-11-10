@@ -207,9 +207,21 @@ A `backend` must set `source` and `handles`:
 | `source` | provided by | `handles` |
 |---|---|---|
 | `dom-ext` | MV3 extension via `kratos-host` | `["browser"]` |
-| `uia` | Python, Windows UI Automation | `["native","browser"]` |
-| `ocr` | Python, Tesseract | `["native","browser"]` |
-| `pixel` | Python, detector plus OCR | `["native","browser"]` |
+| `uia` | `kratos-native`, Windows UI Automation | `["native","browser"]` |
+| `ocr` | `kratos-native`, Windows.Media.Ocr | `["native","browser"]` |
+| `pixel` | `kratos-native`, icon detector plus OCR | `["native","browser"]` |
+
+### 3.0 a `key` action's `target`
+
+A keypress goes to whatever has focus. The decision model still answers both of
+its questions for one, so a `backend.act` with `kind: "key"` may carry a
+`target`: it means *where the key is expected to land*, and the broker uses it
+for the region it watches for pixel evidence and for deciding whose tab this
+is.
+
+**A backend must not press it, focus it, or fail without it.** Looking it up is
+how `press Enter` fails because an unrelated element moved; clicking it first
+is an action nobody asked for. `kratos-native` ignores it for this kind alone.
 
 ### 3.1 `instance` — which one of a source
 
@@ -936,6 +948,7 @@ is the narrower question of whether repeating is *safe*.
 | `backend_error` | backend failed | broker falls back |
 | `backend_timeout` | backend silent past `timeout_ms` | broker falls back |
 | `stale_id` | element id from a superseded `gen` | re-observe |
+| `screen_locked` | the session is locked: the mouse, the keyboard and the windows are out of reach and nothing was dispatched. Reported by a backend that needs local input, never by `dom-ext` | when somebody unlocks it |
 | `stale_confirm` | foreground window changed since parking | re-issue `act` |
 | `gate_blocked` | denylist | no |
 | `kill_switch` | an engaged scope covers this target | after reset |

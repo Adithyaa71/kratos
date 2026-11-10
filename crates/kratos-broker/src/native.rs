@@ -49,6 +49,14 @@ pub fn supervise(broker: Arc<Broker>, pipe: String) {
             eprintln!("kratos-broker: starting {}", exe.display());
             let child = tokio::process::Command::new(&exe)
                 .env("KRATOS_PIPE", &pipe)
+                // "You were started by a broker." A backend that knows this
+                // exits when it cannot find one, instead of retrying for
+                // ever. `kill_on_drop` below is not enough on its own: it
+                // does not run when this process exits without dropping the
+                // handle, and nothing runs when this process is force-killed
+                // -- which left three orphaned backends behind on the first
+                // benchmark run after this became the default.
+                .env("KRATOS_NATIVE_SUPERVISED", "1")
                 // It dies with the broker. A perception backend outliving the
                 // thing it reports to is a process reading somebody's screen
                 // for nobody.

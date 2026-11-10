@@ -10,18 +10,18 @@ Everything below is kratos' own overhead: the MCP shim, the named pipe, the brok
 
 | what | p50 ms | p95 ms | best ms | n | |
 |---|---:|---:|---:|---:|---|
-| mcp tools/list | **0.221** | 0.242 | 0.197 | 9 | 8 tools, answered from a static table |
-| mcp cold, spawn included | **10.0** | 15.0 | 9.77 | 9 | process start + initialize + tools/list |
-| broker cold start | **25.9** | 32.8 | 24.3 | 5 | spawn to first status reply |
-| status round trip | **0.068** | 0.103 | 0.052 | 400 | agent -> pipe -> broker -> agent |
-| log.tail 50 | **0.064** | 0.098 | 0.056 | 100 | journal read over the pipe |
-| connect + handshake | **0.210** | 0.256 | 0.171 | 50 | new client, ACL check, hello/ack |
-| candidate compression | **0.031** | 0.032 | 0.029 | 200 | 64 elements -> options |
-| decide (mock, offline) | **0.085** | 0.133 | 0.077 | 200 | two typed questions, 64 options |
-| gate verdict | **0.006** | 0.007 | 0.004 | 20000 | block, deny, review, brand, rate |
-| screen capture | **32.3** | 34.0 | 30.3 | 20 | 1920x1080 virtual desktop, BitBlt + DIB |
-| full fingerprint | **3.23** | 3.66 | 2.89 | 200 | 64x36 greyscale from the grab |
-| element fingerprint | **0.307** | 0.342 | 0.299 | 200 | 96x96 crop of one control |
+| mcp tools/list | **0.234** | 0.256 | 0.193 | 9 | 8 tools, answered from a static table |
+| mcp cold, spawn included | **16.3** | 18.7 | 15.4 | 9 | process start + initialize + tools/list |
+| broker cold start | **36.3** | 40.2 | 25.2 | 5 | spawn to first status reply |
+| status round trip | **0.064** | 0.080 | 0.052 | 400 | agent -> pipe -> broker -> agent |
+| log.tail 50 | **0.070** | 0.103 | 0.059 | 100 | journal read over the pipe |
+| connect + handshake | **0.178** | 0.283 | 0.138 | 50 | new client, ACL check, hello/ack |
+| candidate compression | **0.032** | 0.037 | 0.031 | 200 | 64 elements -> options |
+| decide (mock, offline) | **0.134** | 0.162 | 0.093 | 200 | two typed questions, 64 options |
+| gate verdict | **0.006** | 0.007 | 0.005 | 20000 | block, deny, review, brand, rate |
+| screen capture | **--** | -- | -- | 0 | not measured: this session was locked |
+
+**The screen rows were not measured.** This session was locked when the benchmark ran. A locked desktop has nothing drawn to copy, so a capture of it is both blank and slow -- 1.7s against the 30-odd ms it costs on a desktop in use -- and recording that as a capture cost would describe the lock screen rather than this code. Run it again from an unlocked session.
 
 ## How to read this
 

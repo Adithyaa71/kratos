@@ -111,6 +111,25 @@ pub fn run() -> i32 {
         }
     }
 
+    // -- is anybody home ----------------------------------------------------
+    //
+    // Early, because every row below it is beside the point when the answer
+    // is no. A locked session refuses SendInput and SetForegroundWindow with
+    // no error to read and hands back window captures that were never drawn,
+    // so a run on a locked machine produces a log full of `no_effect` and
+    // nothing that says why.
+    if kratos_ipc::win::session_is_unlocked() {
+        r.add(Verdict::Ok, "session", "unlocked: there is a desktop to drive");
+    } else {
+        r.add(
+            Verdict::Fail,
+            "session",
+            "locked. Nothing that needs the mouse, the keyboard or a visible window can run \
+             until the person at this machine unlocks it; a `dom-ext` action through a browser \
+             still can.",
+        );
+    }
+
     // -- config -------------------------------------------------------------
     let config_path = kratos_protocol::paths::config_path();
     let config = match Config::load_from(&config_path) {

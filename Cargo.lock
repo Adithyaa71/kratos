@@ -1181,6 +1181,7 @@ dependencies = [
 name = "kratos-shot"
 version = "0.1.0"
 dependencies = [
+ "kratos-ipc",
  "windows-sys 0.61.2",
 ]
 

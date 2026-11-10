@@ -318,8 +318,77 @@ fn crypt(input: &[u8], seal: bool) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Is there a desktop to drive?
+// ---------------------------------------------------------------------------
+
+/// Whether there is a desktop here to drive.
+///
+/// `false` means the session is locked. In that state the lock screen owns
+/// the foreground, `SetForegroundWindow` returns false, `SendInput` is
+/// refused without an error anyone can see, and `PrintWindow` hands back an
+/// undrawn frame -- so an action reports itself dispatched and nothing
+/// happens, and an observation reads a window with no text in it. "The screen
+/// is locked" is a far better answer than "no text was read".
+///
+/// Two probes were tried here before this one, and both were wrong on this
+/// machine, measured rather than assumed:
+///
+/// * `OpenInputDesktop` succeeding. It succeeds while locked.
+/// * The input desktop's *name* being `Default`. It is `Default` while
+///   locked: Windows 10 and 11 draw the lock screen with an ordinary app
+///   (`LockApp.exe`) on the ordinary desktop. Only UAC and the credential
+///   prompt move input to `Winlogon`.
+///
+/// So this asks the terminal-services session itself, which is the question
+/// rather than a proxy for it. `WTS_SESSIONSTATE_LOCK` is 0 and `_UNLOCK` is
+/// 1 -- the two were swapped before Windows 7 SP1 and have been this way
+/// since.
+pub fn session_is_unlocked() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+    };
+    const WTS_SESSIONSTATE_UNLOCK: u32 = 1;
+
+    let mut buf: *mut u16 = std::ptr::null_mut();
+    let mut len: u32 = 0;
+    unsafe {
+        let ok = WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buf,
+            &mut len,
+        );
+        if ok == 0 || buf.is_null() || (len as usize) < std::mem::size_of::<WTSINFOEXW>() {
+            if !buf.is_null() {
+                WTSFreeMemory(buf.cast());
+            }
+            // Cannot tell. Say yes: refusing to work because a diagnostic
+            // was unavailable would be worse than trying and reporting what
+            // happened.
+            return true;
+        }
+        let info = &*(buf as *const WTSINFOEXW);
+        // Level 1 is the only level this structure defines.
+        let flags = info.Data.WTSInfoExLevel1.SessionFlags;
+        WTSFreeMemory(buf.cast());
+        flags as u32 == WTS_SESSIONSTATE_UNLOCK
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn whether_the_screen_is_locked_can_be_asked_safely() {
+        // The answer depends on the machine right now, so this asserts only
+        // that asking is safe and cheap. The value is printed, because a run
+        // where it is false explains every live test that skipped.
+        let unlocked = super::session_is_unlocked();
+        eprintln!("session_is_unlocked() = {unlocked}");
+    }
+
     use super::*;
 
     #[test]

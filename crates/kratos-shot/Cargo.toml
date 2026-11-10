@@ -11,3 +11,9 @@ description = "Screen and region fingerprints: mechanical evidence that an actio
 [dependencies.windows-sys]
 workspace = true
 features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"]
+
+# Tests only, and only to ask one question: is this session locked? A capture
+# of a locked desktop is slow and blank, so the live tests here skip rather
+# than report a timing failure that has nothing to do with the code.
+[dev-dependencies]
+kratos-ipc = { workspace = true }

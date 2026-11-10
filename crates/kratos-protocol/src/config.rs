@@ -413,10 +413,12 @@ pub struct Backends {
     pub enabled: Vec<String>,
     /// Start `kratos-native.exe` with the broker.
     ///
-    /// Off until it is at parity with the Python backend it replaces. Both
-    /// register as `uia`, and one registration per source means the newer
-    /// one wins -- so turning this on while the Python backend is running
-    /// displaces it, which is a decision for the operator and not a default.
+    /// On. It was off while there was a Python backend to be at parity with;
+    /// that backend is gone, and a broker that starts no perception at all
+    /// answers `no_backend` to every observation for a reason that is not the
+    /// agent's fault. Turning it off is now a deliberate choice -- to drive a
+    /// browser through `dom-ext` and nothing else, or to run a backend by
+    /// hand while working on one.
     pub spawn_native: bool,
 }
 
@@ -424,7 +426,7 @@ impl Default for Backends {
     fn default() -> Self {
         Backends {
             enabled: strs(&["dom-ext", "uia", "pixel", "ocr"]),
-            spawn_native: false,
+            spawn_native: true,
         }
     }
 }

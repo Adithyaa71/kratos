@@ -25,6 +25,9 @@ features = [
     "Win32_System_Ole",
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",
+    # Starting an application: ShellExecute, because the catalogue holds
+    # shortcuts and a shortcut is not an executable.
+    "Win32_UI_Shell",
     # Capture: a window's own pixels, not the whole desktop.
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",

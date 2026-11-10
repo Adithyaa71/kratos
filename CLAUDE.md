@@ -45,7 +45,7 @@ crates/kratos-host       browser native-messaging relay
 crates/kratos-ui         settings window
 crates/kratos-bench      offline, reproducible benchmarks
 extension/               MV3, loaded from disk, never installed by hand
-backends/                Python perception: UIA walk, app index, OCR, actuation
+crates/kratos-native     perception and actuation in Rust: UIA, capture, OCR, pixels
 docs/protocol.md         the wire contract. Locked before any code was written.
 _legacy/                 the old Python build. Gitignored. Does not run.
 draft/                   working material for the README. Gitignored.
@@ -55,36 +55,52 @@ draft/                   working material for the README. Gitignored.
 
 **Working and verified**: broker, gate, kill switch, lease, journal, evidence,
 MCP shim, browser extension end to end (`dom-ext` attaches as a backend),
-295 tests, no clippy warnings. Benchmarks reproduce with
-`cargo run --release -p kratos-bench -- --out docs/benchmarks.md`.
+lanes (a browser per harness, a profile per agent), the native backend
+(UIA, capture, OCR, the icon detector, actuation, launching), the settings
+window's allocation forms, and `kratos-broker.exe doctor`. 423 tests, no
+clippy warnings.
 
-**Not yet done**:
+**Run `kratos-broker.exe doctor` first.** It prints one line per thing that
+has to be true, with the evidence beside it, and it is read-only. Everything
+below that used to be a list of what to check by hand is a row in it now.
 
-1. **No decision-model key is saved.** `desktop_status` → `key_present: false`,
-   so every `desktop_act` fails `decider_unconfigured`. Only the operator can
-   fix this: settings window → Decision model → paste → Save. Nothing can be
-   tested end to end until it is done. **Check this first.**
-2. **An act that fails before the decide stage is never journalled.** The
-   counter increments, `desktop_log` stays empty. That contradicts "everything
-   is written down" and is a known gap.
-3. **`press Enter` has never been tested end to end.**
-4. **One profile per agent** is not built. One browser per harness is.
-5. The Python perception backend must be started by hand: `start-backend.cmd`.
+Benchmarks reproduce with
+`cargo run --release -p kratos-bench -- --out docs/benchmarks.md`; the native
+ones with `kratos-native.exe --bench --out docs/native-benchmarks.md`.
+
+**Known gaps**, as of P7:
+
+1. **The four real tasks in the spec's addendum have not been run.** The
+   machine was locked for the whole P7 session, and they need a desktop. The
+   scripts are written: `docs/real-tasks.md`.
+2. **No GPU numbers for the icon detector.** The spec's 60ms target is a GPU
+   figure; this machine ran it on CPU at 360-700ms. Not met, and not claimed.
+3. **The sparse-tree threshold does not fire on a canvas app.** A window whose
+   tree is six title-bar elements is above the spec's "<=2", so the pixel path
+   has to be asked for by name there.
 
 ## Who drives what
 
-| harness | browser | pipe |
+One broker. One pipe. Every harness and every agent shares it, and the
+allocation lives in the config file that only the settings window writes.
+
+| what | decides | where it is set |
 |---|---|---|
-| claude | Brave | `kratos.v1` |
-| bluee | Vivaldi | `kratos.bluee` |
+| harness → browser | which browser a client drives | Harnesses tab |
+| agent → profile | whose logins, cookies and tabs | Agents tab |
+| neither → defaults | the OS default browser, last-used profile | Behaviour tab |
 
-```bash
-start-browser.cmd claude brave
-start-browser.cmd bluee vivaldi
-```
+A harness names itself in the MCP handshake (`clientInfo.name`); an agent
+names itself with `--agent` in the snippet the Connect tab generates. Both are
+*claims*, and they decide which lane a session resolves to and nothing else:
+an agent cannot approve itself, choose a browser or pick a profile by claiming
+a name, because the allocation is in a file it cannot write.
 
-The browser inherits `KRATOS_PIPE`; so does the native host it launches. Point
-the harness's MCP server at the same pipe and the two are paired.
+**The pipe-per-harness model is gone.** It was one broker per harness paired
+by `KRATOS_PIPE`, which meant two brokers held two input leases on one mouse
+— and whichever one acted second fought the first. `KRATOS_PIPE` still exists
+and is now for tests and for running a second broker deliberately, never for
+pairing.
 
 ---
 

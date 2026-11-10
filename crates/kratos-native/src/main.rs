@@ -17,6 +17,7 @@ mod act;
 mod capture;
 mod detect;
 mod fuse;
+mod launch;
 mod input;
 mod ocr;
 mod uia;
@@ -32,6 +33,12 @@ const BUILD: &str = concat!("kratos-native ", env!("CARGO_PKG_VERSION"));
 /// Reconnect backoff, as the browser host uses.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long a backend the broker started waits for a broker before giving up.
+///
+/// Long enough that a broker restarting between two agent calls does not take
+/// its backend down with it; short enough that an orphan is gone before
+/// anybody notices it in Task Manager.
+const ORPHAN_GRACE: Duration = Duration::from_secs(15);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -179,6 +186,11 @@ struct Seen {
 
 async fn attach(pipe: String, source: &'static str, reader: Arc<Reader>) {
     let mut backoff = BACKOFF_MIN;
+    // Set by the broker that spawned us. Without it this process is one
+    // somebody started by hand, and retrying for ever is the right thing: the
+    // broker comes and goes and this waits for it.
+    let supervised = std::env::var_os("KRATOS_NATIVE_SUPERVISED").is_some();
+    let mut missing_since: Option<std::time::Instant> = None;
     loop {
         let peer = match kratos_ipc::PipePeer::attach_backend(
             &pipe,
@@ -195,12 +207,28 @@ async fn attach(pipe: String, source: &'static str, reader: Arc<Reader>) {
                 p
             }
             Err(e) => {
+                // A supervised backend whose broker has been gone this long
+                // is an orphan: it is reading nothing, for nobody, and the
+                // next broker will start its own. Exiting is the only thing
+                // that ends it, because nothing else is left to do it.
+                if supervised {
+                    let since = *missing_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= ORPHAN_GRACE {
+                        eprintln!(
+                            "kratos-native: no broker for {:?} and this process was started by \
+                             one; exiting rather than retrying for ever",
+                            ORPHAN_GRACE
+                        );
+                        std::process::exit(0);
+                    }
+                }
                 eprintln!("kratos-native: no broker yet ({e}); retrying in {backoff:?}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
         };
+        missing_since = None;
         pump(peer, source, &reader).await;
         eprintln!("kratos-native: lost the broker on {source}; waiting to reconnect");
     }
@@ -317,6 +345,7 @@ fn act(
             bbox: target.and_then(|t| t.bbox),
             text: req.text.clone(),
             key: req.key.clone(),
+            url: req.url.clone(),
             amount: req.amount,
         })
         .map_err(|e| WireError::new(codes::BACKEND_ERROR, e))?;
@@ -516,7 +545,7 @@ fn observe_by_eye(reader: &Reader, hwnd: isize) -> Result<serde_json::Value, Wir
 // Finding a window without the broker's help
 // ---------------------------------------------------------------------------
 
-mod window {
+pub mod window {
     use windows::Win32::Foundation::{HWND, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
@@ -558,6 +587,29 @@ mod window {
         search.found
     }
 
+    /// Every visible window with a title.
+    ///
+    /// Taken before and after a launch: the difference is the window that
+    /// opened, which is the only honest proof that something started.
+    pub fn visible_titles() -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        unsafe {
+            let _ = EnumWindows(Some(collect), LPARAM(&mut found as *mut Vec<String> as isize));
+        }
+        found
+    }
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
+        let out = &mut *(lparam.0 as *mut Vec<String>);
+        if IsWindowVisible(hwnd).as_bool() {
+            let t = title(hwnd.0 as isize);
+            if !t.is_empty() {
+                out.push(t);
+            }
+        }
+        true.into()
+    }
+
     unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
         let search = &mut *(lparam.0 as *mut Search);
         if IsWindowVisible(hwnd).as_bool() {
@@ -582,6 +634,18 @@ mod window {
 /// remove, and the number that matters is what an agent pays per step in a
 /// session. Both are reported.
 fn bench(args: &[String]) {
+    // Not on a locked session. UI Automation still answers, but a window
+    // capture there is a lottery: the same Notepad window measured 16ms with
+    // ten lines read out of it one minute and 428ms with nothing in it the
+    // next. These numbers go into a file whose whole purpose is to be quoted,
+    // so half of them being about the lock screen is not acceptable.
+    if !kratos_ipc::win::session_is_unlocked() {
+        eprintln!(
+            "kratos-native: this session is locked, and a window capture is unreliable there; nothing was written. Run this from an unlocked session."
+        );
+        std::process::exit(2);
+    }
+
     let out = args
         .iter()
         .position(|a| a == "--out")

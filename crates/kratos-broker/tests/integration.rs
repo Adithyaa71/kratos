@@ -38,6 +38,16 @@ impl Harness {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
 
+        // No real perception backend. These tests attach their own fake
+        // `uia`, and one registration per source means whichever connected
+        // last wins -- so a spawned kratos-native would silently replace the
+        // backend the test is asserting about. It is the default now, so it
+        // has to be turned off here rather than simply not turned on.
+        let mut config = config;
+        if config["backends"]["spawn_native"].is_null() {
+            config["backends"]["spawn_native"] = serde_json::json!(false);
+        }
+
         let config_path = dir.join("config.json");
         let mut f = std::fs::File::create(&config_path).expect("config");
         f.write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes()).unwrap();
@@ -165,6 +175,9 @@ struct FakeBackend {
     elements: Vec<Value>,
     /// What `backend.act` reports for `applied`.
     applied: bool,
+    /// Every `backend.act` payload it was sent, when a test wants to assert
+    /// on what actually arrived rather than on what the broker said.
+    seen: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
 }
 
 impl FakeBackend {
@@ -183,7 +196,14 @@ impl FakeBackend {
                        "selector": "nav a", "enabled": true}),
             ],
             applied: true,
+            seen: None,
         }
+    }
+
+    /// Record every act payload into `log`.
+    fn recording(mut self, log: std::sync::Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+        self.seen = Some(log);
+        self
     }
 
     /// Serve until the broker disconnects. Returns how many actions it was
@@ -221,6 +241,11 @@ impl FakeBackend {
                     }
                     ops::BACKEND_ACT => {
                         acted += 1;
+                        if let Some(log) = &self.seen {
+                            if let Ok(mut v) = log.lock() {
+                                v.push(frame.payload().clone());
+                            }
+                        }
                         let text = frame.payload()["text"].as_str().map(String::from);
                         let _ = peer
                             .reply(
@@ -829,6 +854,52 @@ async fn a_backend_that_dispatches_without_effect_reports_no_effect_not_success(
 }
 
 #[tokio::test]
+async fn pressing_enter_reaches_the_backend_as_a_keypress_with_no_element() {
+    // The one action with no target by design: a keypress goes to whatever
+    // has focus. Both backends before this one refused a null target and so
+    // broke `press Enter` entirely, which is why this is its own test and not
+    // a corollary of the click path.
+    let h = Harness::start("enter", base_config(0));
+    wait_for_pipe(&h.pipe).await;
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _backend = FakeBackend::browser("uia").recording(seen.clone()).spawn(h.pipe.clone());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut a = agent(&h.pipe, "t").await;
+
+    let res = a
+        .call(ops::ACT, json!({"instruction": "press Enter", "timeout_ms": 8000}))
+        .await
+        .expect("act");
+    assert_ne!(res["status"], json!(st::REFUSED), "{res}");
+    assert_ne!(res["status"], json!(st::BLOCKED), "{res}");
+
+    let acts = seen.lock().unwrap().clone();
+    let key = acts
+        .iter()
+        .find(|p| p["kind"] == json!("key"))
+        .unwrap_or_else(|| panic!("no keypress reached the backend: {acts:#?}"));
+    // The key itself, case-folded by the extractor so a backend has one
+    // spelling to match.
+    assert_eq!(
+        key["key"].as_str().unwrap_or_default().to_lowercase(),
+        "enter",
+        "{key}"
+    );
+    // One dispatch, not two. A keypress that is delivered by clicking the
+    // element first is two actions, and the second one is the one nobody
+    // asked for.
+    assert_eq!(acts.len(), 1, "{acts:#?}");
+    assert_eq!(acts[0]["kind"], json!("key"), "{acts:#?}");
+
+    // And it is in the journal as a keypress, so a session can be read back.
+    let lines = h.journal();
+    assert!(
+        lines.iter().any(|l| l["kind"] == json!("key")),
+        "the keypress is not in the journal: {lines:#?}"
+    );
+}
+
+#[tokio::test]
 async fn acting_with_no_backend_at_all_says_so_plainly() {
     let h = Harness::start("nobackend", base_config(0));
     wait_for_pipe(&h.pipe).await;
@@ -837,6 +908,42 @@ async fn acting_with_no_backend_at_all_says_so_plainly() {
     let err = a.call(ops::ACT, json!({"instruction": "click the \"Inbox\" link"})).await.unwrap_err();
     assert_eq!(err.code, codes::NO_BACKEND);
     assert!(err.message.contains("backend"), "{}", err.message);
+
+    // And it is written down. This was a known gap for the life of the
+    // build: an act that failed before the decide stage incremented the
+    // counter and left the log empty, so the one record you would actually
+    // want afterwards -- an agent asked and the machine could not even judge
+    // it -- did not exist.
+    let lines = h.journal();
+    let failed = lines
+        .iter()
+        .find(|l| l["status"] == json!("error"))
+        .unwrap_or_else(|| panic!("no error line in the journal: {lines:#?}"));
+    assert_eq!(failed["op"], json!("act"));
+    assert_eq!(failed["error"], json!(codes::NO_BACKEND));
+    assert!(failed["took_ms"].is_number(), "{failed}");
+}
+
+#[tokio::test]
+async fn a_stale_pin_is_written_down_as_well_as_refused() {
+    let h = Harness::start("stalejournal", base_config(0));
+    wait_for_pipe(&h.pipe).await;
+    let _backend = FakeBackend::browser("uia").spawn(h.pipe.clone());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut a = agent(&h.pipe, "t").await;
+
+    let err = a
+        .call(ops::ACT, json!({"instruction": "click it", "target_id": "uia:dead:beef"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, codes::STALE_ID);
+
+    let lines = h.journal();
+    let failed = lines
+        .iter()
+        .find(|l| l["error"] == json!(codes::STALE_ID))
+        .unwrap_or_else(|| panic!("the stale pin left no trace: {lines:#?}"));
+    assert_eq!(failed["status"], json!("error"));
 }
 
 #[tokio::test]

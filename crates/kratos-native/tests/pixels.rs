@@ -11,6 +11,8 @@
 
 use std::process::Command;
 
+mod common;
+
 /// Open something with text in it, so there is a window to read.
 ///
 /// Notepad, because it is on every Windows machine, starts in well under a
@@ -48,6 +50,18 @@ fn native() -> std::path::PathBuf {
 
 #[test]
 fn a_window_is_captured_and_read() {
+    // A locked session captures a window *sometimes*. Measured on this
+    // machine, same window, minutes apart: once 970x1032 in 16ms with ten
+    // lines of text read out of it, and once the same geometry in 428ms with
+    // nothing in it at all. The composition surface is there or it is not,
+    // and a test cannot tell which it will get. So this skips -- not because
+    // capture is impossible while locked, but because it is unreliable, and a
+    // test that fails one run in three teaches people to ignore it.
+    let Some(_desktop) =
+        common::Desktop::take_or_skip(std::time::Duration::from_secs(180), "capture and read")
+    else {
+        return;
+    };
     let _scratch = Scratch::open();
     let out = Command::new(native()).args(["--ocr", "Notepad"]).output();
     let Ok(out) = out else {
@@ -102,6 +116,11 @@ fn a_window_is_captured_and_read() {
 /// different model version does not.
 #[test]
 fn the_pixel_path_labels_every_element_with_its_source() {
+    let Some(_desktop) =
+        common::Desktop::take_or_skip(std::time::Duration::from_secs(180), "fused sources")
+    else {
+        return;
+    };
     let _scratch = Scratch::open();
     let out = Command::new(native()).args(["--pixels", "Notepad"]).output();
     let Ok(out) = out else {

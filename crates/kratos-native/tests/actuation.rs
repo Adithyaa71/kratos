@@ -15,6 +15,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use kratos_protocol::{ops, Frame};
+
+mod common;
 use serde_json::{json, Value};
 
 const GRACE: Duration = Duration::from_secs(10);
@@ -165,8 +167,143 @@ fn find<'a>(els: &'a [Value], role: &str, label: &str) -> Option<&'a Value> {
     els.iter().find(|e| e["role"] == json!(role) && e["label"] == json!(label))
 }
 
+/// Start the backend and hand back its `uia` connection.
+///
+/// The backend attaches three times, once per source. Only the tree acts, so
+/// only that connection is useful here -- but all three have to be accepted or
+/// the ones left waiting fill the listener's queue.
+async fn attach_uia(pipe: &str) -> Option<(Conn, Child)> {
+    let mut broker = Broker { listener: kratos_ipc::PipeListener::bind(pipe).expect("bind") };
+    let backend = Command::new(env!("CARGO_BIN_EXE_kratos-native"))
+        .env("KRATOS_PIPE", pipe)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn kratos-native");
+
+    let mut uia = None;
+    for _ in 0..3 {
+        match tokio::time::timeout(GRACE, broker.accept()).await {
+            Ok(conn) if conn.source == "uia" => uia = Some(conn),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    uia.map(|c| (c, backend))
+}
+
+/// The three kinds that are not input: starting something, going somewhere,
+/// and moving the focus.
+///
+/// These were the Python backend's and not this one's, so retiring it without
+/// them would have taken away the ability to start anything. The refusals are
+/// as much the point as the successes: every literal comes from the operator's
+/// sentence, so a missing one is a refusal and never a guess, and a name this
+/// machine does not have comes back with what it does have.
+#[tokio::test]
+async fn starting_things_and_moving_the_focus() {
+    let Some(_desktop) =
+        common::Desktop::take_or_skip(std::time::Duration::from_secs(180), "starting things")
+    else {
+        return;
+    };
+    let pipe = format!("kratos-native-launch-{}", std::process::id());
+    let Some((mut uia, mut backend)) = attach_uia(&pipe).await else {
+        panic!("kratos-native never attached as uia");
+    };
+
+    // -- the refusals, which do not depend on this machine at all -----------
+    let res = uia.call(ops::BACKEND_ACT, json!({"kind": "open"})).await.expect("open");
+    assert_eq!(res["applied"], json!(false), "{res}");
+    assert!(
+        res["detail"].as_str().unwrap_or_default().contains("no application is named"),
+        "{res}"
+    );
+
+    let res = uia.call(ops::BACKEND_ACT, json!({"kind": "navigate"})).await.expect("navigate");
+    assert_eq!(res["applied"], json!(false), "{res}");
+    assert!(res["detail"].as_str().unwrap_or_default().contains("no URL is named"), "{res}");
+
+    let res = uia.call(ops::BACKEND_ACT, json!({"kind": "focus"})).await.expect("focus");
+    assert_eq!(res["applied"], json!(false), "{res}");
+    assert!(res["detail"].as_str().unwrap_or_default().contains("no window is named"), "{res}");
+
+    // A name nothing on this machine answers to: refused, with what it does
+    // have. "No" on its own is not actionable.
+    let res = uia
+        .call(ops::BACKEND_ACT, json!({"kind": "open", "text": "qzxvbnmlkjhgfdsa"}))
+        .await
+        .expect("open nonsense");
+    assert_eq!(res["applied"], json!(false), "{res}");
+    let detail = res["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("qzxvbnmlkjhgfdsa"), "{res}");
+    assert!(
+        detail.contains("Nearest:") || detail.contains("catalogued"),
+        "a refusal should say what this machine has: {res}"
+    );
+
+    // -- and the one application every Windows machine has ------------------
+    let before = std::process::Command::new("tasklist")
+        .args(["/fi", "imagename eq notepad.exe"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("notepad.exe"))
+        .unwrap_or(false);
+
+    let res = uia
+        .call(ops::BACKEND_ACT, json!({"kind": "open", "text": "notepad"}))
+        .await
+        .expect("open notepad");
+    assert_eq!(res["applied"], json!(true), "{res}");
+    let detail = res["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("notepad"), "the detail should name what ran: {res}");
+
+    // It really started: the process exists afterwards even if the window has
+    // not drawn, and a locked session draws nothing.
+    let running = std::process::Command::new("tasklist")
+        .args(["/fi", "imagename eq notepad.exe"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("notepad.exe"))
+        .unwrap_or(false);
+    assert!(running, "notepad was started and is not running; before={before}");
+
+    // -- focus: never reported as done when Windows refused it --------------
+    let res = uia
+        .call(ops::BACKEND_ACT, json!({"kind": "focus", "text": "Notepad"}))
+        .await
+        .expect("focus notepad");
+    let detail = res["detail"].as_str().unwrap_or_default().to_string();
+    match res["applied"].as_bool() {
+        Some(true) => {
+            // Claimed: then the window it settled on is named, so a wrong
+            // match is visible rather than silent.
+            assert!(
+                res["readback"].as_str().unwrap_or_default().to_lowercase().contains("notepad"),
+                "{res}"
+            );
+        }
+        _ => {
+            // Refused: it must say why, because the next step is a keypress
+            // and a keypress goes to whatever has focus.
+            assert!(
+                detail.contains("refused") || detail.contains("no visible window"),
+                "a focus that did not happen must say so: {res}"
+            );
+        }
+    }
+
+    // Tidy up: this test started it.
+    let _ = std::process::Command::new("taskkill").args(["/f", "/im", "notepad.exe"]).output();
+    let _ = backend.kill();
+    let _ = backend.wait();
+}
+
 #[tokio::test]
 async fn a_real_window_is_read_and_driven_through_its_own_patterns() {
+    let Some(_desktop) =
+        common::Desktop::take_or_skip(std::time::Duration::from_secs(180), "patterns")
+    else {
+        return;
+    };
     let Some(_scratch) = Scratch::open() else {
         eprintln!("could not open the scratch window; skipping");
         return;
@@ -181,9 +318,13 @@ async fn a_real_window_is_read_and_driven_through_its_own_patterns() {
         .spawn()
         .expect("spawn kratos-native");
 
-    // It attaches once per source; the tree is the one that acts.
+    // It attaches once per source -- three of them -- and the tree is the one
+    // that acts. All three are accepted even though two are unused: a
+    // connection nobody accepts leaves the backend waiting on the listener,
+    // and a backend waiting on a connection is a backend not answering this
+    // one.
     let mut uia = None;
-    for _ in 0..2 {
+    for _ in 0..3 {
         match tokio::time::timeout(GRACE, broker.accept()).await {
             Ok(conn) if conn.source == "uia" => uia = Some(conn),
             Ok(_) => {}
@@ -258,6 +399,40 @@ async fn a_real_window_is_read_and_driven_through_its_own_patterns() {
         labels.iter().any(|l| l == &format!("sent to {typed}")),
         "the window should say what it did; labels were {labels:?}"
     );
+
+    // -- a real keypress ----------------------------------------------------
+    //
+    // Through SendInput, into the window that has focus, with an element
+    // attached that this backend must ignore: the broker passes along
+    // whatever the decision model picked as the place the key is expected to
+    // land, and resolving it is how `press Enter` fails because something
+    // unrelated moved. The id here is deliberately one that cannot resolve.
+    let res = uia
+        .call(
+            ops::BACKEND_ACT,
+            json!({"kind": "key", "key": "enter",
+                   "target": {"id": "uia:dead:9.9.9", "bbox": [0, 0, 1, 1]}}),
+        )
+        .await
+        .expect("keypress");
+    assert_eq!(
+        res["applied"],
+        json!(true),
+        "a keypress must not fail because an element it never needed is gone: {res}"
+    );
+    assert_eq!(res["method"], json!("physical"), "there is no pattern for a keypress: {res}");
+    assert!(
+        res["detail"].as_str().unwrap_or_default().to_lowercase().contains("enter"),
+        "the detail should say which key: {res}"
+    );
+
+    // A key this build does not know is refused by name rather than pressed
+    // as something else.
+    let res = uia
+        .call(ops::BACKEND_ACT, json!({"kind": "key", "key": "nosuchkey"}))
+        .await
+        .expect("bad keypress");
+    assert_eq!(res["applied"], json!(false), "{res}");
 
     // -- toggle -------------------------------------------------------------
     if let Some(urgent) = urgent {

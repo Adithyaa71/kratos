@@ -5,13 +5,13 @@
 | piece | required? | what happens without it |
 |---|---|---|
 | **broker** (`kratos-broker.exe`) | yes | nothing works. Starts itself — see below. |
-| **a perception backend** | **yes** | the broker can decide nothing: it cannot see the screen. Every `act` fails `no_backend`. |
+| **a perception backend** | **yes** | the broker can decide nothing: it cannot see the screen. Every `act` fails `no_backend`. The broker starts one itself, so this is normally nothing to do. |
 | **a decision-model key** | **yes** | every `act` is refused `decider_unconfigured`. |
 | **browser extension** | no, but | browser targeting falls back to UI Automation, which reports a flat list with no containers and no selectors — the thing that makes two fields labelled "To" indistinguishable. |
 
-The status screen tells you which are missing. If it says *"None connected"*
-under Perception backends and *"missing — actions will be refused"* next to API
-key, you have the first two to go.
+`kratos-broker.exe doctor` tells you which are missing, one line each with the
+evidence beside it, and changes nothing. The status screen in the settings
+window says the same thing while a broker is running.
 
 ---
 
@@ -32,15 +32,23 @@ Same request shape, same Bearer auth; only the URL differs.
 
 ## 2. A perception backend
 
+There is nothing to do here. The broker starts `kratos-native.exe` on its
+first call, restarts it with backoff if it dies, and takes it down with itself
+— a perception backend outliving the thing it reports to is a process reading
+somebody's screen for nobody.
+
 ```
-python D:\Kratos\backends\kratos_backend.py
+backends.spawn_native   on by default; off to drive a browser and nothing else
 ```
 
-Or `start-backend.cmd`. It waits for the broker and reconnects on its own, so
-the order does not matter and it survives a broker restart. Leave it running in
-a terminal — it is the thing that reads the screen.
+It reads the accessibility tree, captures the window, runs OCR offline against
+the language packs this machine already has, and finds the controls nothing
+declares. Measured here: **57 elements in 32ms** from Notepad, **206 in 78ms**
+from File Explorer. Per source and per window, the numbers are in
+[`native-benchmarks.md`](native-benchmarks.md).
 
-Measured on your machine: **92 elements in 431ms** from a live Brave window.
+Until P7 this step was a Python process somebody had to remember to start.
+It is gone; `git log` has it.
 
 ---
 
@@ -147,8 +155,9 @@ Agents SDK, or anything else with an MCP stdio client. In a JSON config:
 
 The MCP shim is a translator with no policy in it. Any language that can open a
 Windows named pipe can be a first-class peer: send NDJSON, start with `hello`,
-and everything in `docs/protocol.md` is available. `backends/kratos_backend.py` is a
-working 480-line example of exactly that in Python.
+and everything in `docs/protocol.md` is available. `crates/kratos-native` is a
+working example of exactly that: three sources, one connection each, no policy
+in it, nothing but observe and act.
 
 ### Several harnesses at once
 

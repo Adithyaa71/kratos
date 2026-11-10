@@ -5,6 +5,176 @@ Newest phase first.
 
 ---
 
+## P7 — the Python backend is gone, and the screen was locked
+
+### Done
+
+* **The Python backend is retired.** `backends/` and `start-backend.cmd` are
+  deleted; `backends.spawn_native` now defaults to **on**, so the broker starts
+  `kratos-native.exe` itself. Nothing to install, nothing to remember to
+  start, no `pip`, no Tesseract.
+* **Parity first, retirement second.** Three kinds only the Python backend
+  could do are now in the Rust one: `open`, `focus` and `navigate`. The app
+  catalogue is the Start Menu plus the system tools that have no shortcut —
+  enumerate, do not guess — and a name this machine does not have comes back
+  as a refusal *with candidates*, which is the shape every other ambiguity
+  here takes.
+* **Two long-standing gaps in CLAUDE.md are closed.**
+  * *An act that fails before the decide stage is never journalled.* It is now:
+    no window, no backend, a pin that is gone. Those are the lines you most
+    want afterwards, because they say the machine could not get as far as
+    judging the instruction.
+  * *`press Enter` has never been tested end to end.* It is, twice — through
+    the broker to a recording backend, and through the real keyboard into a
+    real window.
+* **A keypress ignores the element attached to it.** Found by that first test:
+  the decision model answers both of its questions for a keypress too, so the
+  broker passes along whatever scored highest as "where the key is expected to
+  land". The backend was looking it up, which is how `press Enter` fails
+  because an unrelated link scrolled out of the tree. Documented in
+  `docs/protocol.md` §3.0.
+* **A spawned perception backend dies with its broker.** It did not: the
+  benchmark starts three brokers to measure a cold start, and left three
+  `kratos-native.exe` processes behind, retrying a pipe nobody was listening
+  on, for ever. `native.rs` claimed this was impossible on the strength of
+  tokio's `kill_on_drop`, which does not run when the parent exits without
+  dropping the handle and cannot run at all when the parent is force-killed.
+  The broker now says "you were started by a broker" in the environment, and a
+  backend that cannot find one for fifteen seconds exits.
+* **A locked screen is reported, not dispatched into.** New error code
+  `screen_locked`, a `doctor` row, and the physical path refuses instead of
+  sending input that Windows discards.
+* **The full matrix**, the spec's P7 acceptance item: two agents, two browser
+  instances, four kill scopes, pause on and off — 16 cells, one test.
+
+### Evidence
+
+```text
+P7 matrix: brave and chrome, 2 pause settings x 4 kill scopes x 2 lanes, 16 cells
+424 tests, no clippy warnings
+```
+
+`kratos-broker.exe doctor` on this machine, which is also the reason half of
+this section says "not run":
+
+```text
+[ok  ] kratos-native.exe  D:\Kratos\target\release\kratos-native.exe
+[FAIL] session            locked. Nothing that needs the mouse, the keyboard
+                          or a visible window can run until the person at this
+                          machine unlocks it; a `dom-ext` action through a
+                          browser still can.
+[ok  ] decision model     jev/jev-latest with a sealed key
+[ok  ] bridge registry    registered for brave, chrome, edge, vivaldi, chromium
+```
+
+What a locked session actually does, measured here rather than assumed — the
+first two versions of the check were both wrong:
+
+| | |
+|---|---|
+| UI Automation | works |
+| A control's own pattern | works: typed into a real box, read the value back |
+| `open "notepad"` | works: the process was running afterwards |
+| `SetForegroundWindow` | **refused** |
+| `SendInput` | **unreliable**: returned 0 events sent at least once |
+| Window capture | **unreliable**: the same window, 16ms with ten lines of text one minute and 428ms with nothing in it the next |
+| Full-screen capture | 1.7s, against the 30ms it costs on a desktop in use |
+
+Two probes for "is this locked" were tried and discarded before the right one:
+`OpenInputDesktop` succeeding (it succeeds while locked) and the input
+desktop's *name* being `Default` (it is `Default` while locked — Windows 10
+and 11 draw the lock screen with an ordinary app on the ordinary desktop; only
+UAC moves input to `Winlogon`). The answer is
+`WTSQuerySessionInformationW(WTSSessionInfoEx)`, which is the question rather
+than a proxy for it.
+
+Benchmarks, regenerated on this build:
+
+```text
+broker cold start   p50 36.3ms  best 25.2ms   (P4-era figure: 26ms p50)
+mcp cold            p50 16.3ms  best 15.4ms
+status round trip   p50 0.064ms
+gate verdict        p50 0.006ms
+screen capture      not measured: this session was locked
+```
+
+The p50s are a little above the P4-era run and the best-case figures match it,
+which is load on the machine rather than a regression. One real number did
+change: with `spawn_native` on, the cold start was p50 40.6ms / best 38.4ms
+against best 25.2ms with it off — so launching the perception backend costs
+roughly 13ms on the cold path. The benchmark rig turns it off, because this
+file measures the broker's own overhead and a second process starting is not
+that.
+
+### Decisions
+
+* **The locked-screen refusal lives in the backend, not the broker.** The
+  first attempt put it before the input lease, which would have failed every
+  integration test on a locked machine: the broker cannot know whether the
+  backend it is about to dispatch to needs local input, and `dom-ext`, a
+  remote backend and the tests' fake ones all do not. `kratos-native` is the
+  thing that needs the mouse, so it is the thing that says so.
+* **And only in the physical path.** The first version refused every act and
+  every pixel observation. Then the native benchmark read ten lines out of a
+  real window on this locked machine and the actuation test typed through a
+  ValuePattern. A blanket refusal turns a working path off and gives a reason
+  that is not true of it, which is worse than no check.
+* **A test skips on a locked screen; it does not fail.** A red suite that
+  means "your screen was locked" is a suite people learn to ignore. Six live
+  tests check first and say which one skipped.
+* **The live tests take the broker's own machine-wide input guard**, so they
+  run one at a time and do not fight a broker the operator has running. Found
+  the hard way: two Notepads up at once, a title search landing on the wrong
+  one, and a capture read while another test was typing into it — one failure
+  in about a dozen runs, which is the worst frequency a test can have.
+* **A benchmark that cannot measure something leaves the cell empty.** It
+  already prints `--` for a capture that failed; a locked session now gets the
+  same treatment plus a note saying why. `kratos-native --bench` refuses
+  outright and writes nothing, because half its rows would be about the lock
+  screen and that file exists to be quoted.
+
+### Known gaps
+
+* **The four real tasks have not been run.** The screen was locked for the
+  whole session and three of the four are browser work that needs a window
+  brought to the front. The scripts are written out step by step, with what
+  each step should return, in [`docs/real-tasks.md`](docs/real-tasks.md); the
+  loop itself was exercised live in P6 against a canvas app, so what is
+  missing is the run, not the design. **This is the one P7 acceptance item
+  that is not met.**
+* **`kratos-bench --live-tasks` is not built.** It would drive four tasks
+  whose last step is irreversible, and it cannot be tested without a screen.
+  An untested driver for that is the wrong thing to hand over, so the scripts
+  are data and prose instead. With a desktop it is one sitting's work.
+* **No scored accuracy for the fixture corpus.** Spec §10 asks for recall,
+  label exactness and bbox IoU per source and fused. What exists checks
+  *invariants* — ids unique within an observation, rectangles that are
+  somewhere, roles from one vocabulary, containers that name something —
+  which is what a fusion pass can silently break. Scoring needs a golden
+  element list per window, and the corpus is deliberately not committed
+  because a UIA dump carries what is on the operator's screen. So the golden
+  lists would have to be hand-labelled on each machine.
+* **No GPU numbers for the icon detector.** Still CPU-only here: 352-700ms
+  against the spec's 60ms, which is a GPU figure. Not met, and not claimed.
+* **The sparse-tree threshold still does not fire on a canvas app** (P6's
+  gap, unchanged): six title-bar elements is above "<=2", so the pixel path
+  has to be asked for by name.
+* **Pause's paused branch is not in the matrix.** It fires on real keyboard
+  and mouse input, and input this process injects is ignored on purpose —
+  that is the whole point of the `LLMHF_INJECTED` check — so no test outside
+  the broker's own process can produce the condition. The branch is covered by
+  `activity::tests`; the matrix checks that the setting is honoured, reported,
+  and does not stop a DOM action that needs no pointer.
+
+### Next
+
+Unlock the screen and run `docs/real-tasks.md`, recording the per-segment
+numbers in `docs/benchmarks.md`. Then regenerate both benchmark files from an
+unlocked session, which fills in the screen rows and gives the native
+measurements a desktop that is actually drawing.
+
+---
+
 ## P6 — the allocation lives in the settings window
 
 ### Done

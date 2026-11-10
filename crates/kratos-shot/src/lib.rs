@@ -588,6 +588,10 @@ mod tests {
     #[test]
     fn three_grabs_cost_less_than_eight() {
         // The claim behind the optimisation, measured rather than asserted.
+        if !kratos_ipc::win::session_is_unlocked() {
+            eprintln!("this session is locked; skipping the capture timing");
+            return;
+        }
         let Some(_) = capture() else { return };
         let t0 = std::time::Instant::now();
         for _ in 0..3 {
@@ -707,6 +711,13 @@ mod tests {
     fn capture_cost_is_small_against_an_action_cycle() {
         let (w, h) = screen_size();
         if w <= 0 || h <= 0 {
+            return;
+        }
+        // A locked desktop has nothing drawn to copy, and copying it took
+        // 1.7 seconds here against the 35ms this asserts. The number says
+        // something about the lock screen, not about this code.
+        if !kratos_ipc::win::session_is_unlocked() {
+            eprintln!("this session is locked; skipping the capture timing");
             return;
         }
         let start = std::time::Instant::now();

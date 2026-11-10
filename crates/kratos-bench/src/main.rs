@@ -123,6 +123,12 @@ impl Rig {
             // a lane would make these numbers depend on which browser the
             // machine has open.
             "defaults": {"browser": "none"},
+            // And no perception backend, for the same reason. It is on by
+            // default now, and leaving it on moved the cold-start figure from
+            // 26ms to 41ms -- which is the cost of launching a second
+            // process, not of starting a broker. What that backend costs is
+            // measured by `kratos-native --bench`, against real windows.
+            "backends": {"spawn_native": false},
             "thresholds": {"default": 0.0}
         }))
         .unwrap();
@@ -463,9 +469,31 @@ async fn main() {
     rows.push(Row::new("gate verdict", "block, deny, review, brand, rate", bench_gate(20_000)));
 
     // --- the eyes ----------------------------------------------------------
+    //
+    // Only when there is something to look at. A locked session has nothing
+    // drawn to copy: the grab still succeeds and took 1.7 seconds here
+    // against the 30-odd milliseconds it costs on a desktop somebody is
+    // using. That number describes the lock screen, not this code, and a
+    // benchmark file is exactly where a number like that does the most
+    // damage -- so the rows are left empty, which already prints `--`, and a
+    // note says why.
+    let unlocked = kratos_ipc::win::session_is_unlocked();
+    if !unlocked {
+        notes.push(
+            "**The screen rows were not measured.** This session was locked when the benchmark \
+             ran. A locked desktop has nothing drawn to copy, so a capture of it is both blank \
+             and slow -- 1.7s against the 30-odd ms it costs on a desktop in use -- and \
+             recording that as a capture cost would describe the lock screen rather than this \
+             code. Run it again from an unlocked session."
+                .to_string(),
+        );
+    }
     let mut grabs = Vec::new();
     let mut shot = None;
     for _ in 0..20 {
+        if !unlocked {
+            break;
+        }
         let t0 = Instant::now();
         let s = kratos_shot::capture();
         grabs.push(ms(t0.elapsed()));
@@ -478,6 +506,7 @@ async fn main() {
             let (w, h) = s.size();
             format!("{w}x{h} virtual desktop, BitBlt + DIB")
         }
+        None if !unlocked => "not measured: this session was locked".to_string(),
         None => "capture unavailable (no session?)".to_string(),
     };
     rows.push(Row::new("screen capture", geometry, grabs));
