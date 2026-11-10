@@ -220,16 +220,41 @@ elements. That is the `ambiguous_window` case the protocol has an error code
 for, and the benchmark has no business resolving it silently — it is named
 here rather than worked around.
 
+### A defect found by watching somebody try to approve a harness
+
+The operator said they had ticked `claude-code`, and the config still read
+`"approved": false` with a write timestamp from before they started. The tab
+is the cause: the checkbox edits `self.draft.harnesses`, and only the **Apply**
+button sends `config.set`. A tick on its own changes a local buffer and
+nothing else, and the tab gives no sign of it — no "unsaved", no enabled/
+disabled Apply, nothing. It looks exactly like a setting that took effect.
+
+Every tab in this window works that way, which is a defensible design (edit,
+then commit) and an indefensible presentation of it. **The window should say
+when the draft differs from the config**, and until it does, every tab can
+silently discard what somebody thought they had set. This is a gap in P6's
+work, found in P7, and it is not fixed here.
+
+The same approval was also offered the way it is meant to be — the broker's
+own dialog, which has Always / Once / Deny and writes the config on Always. It
+was raised three times over about twenty minutes, in front, at 777,440 on a
+single 1920x1080 display, 426x257, and went unanswered each time. So the
+mechanism works; what is missing is a person's click, and neither the agent
+nor anything it may legitimately do can supply that.
+
 ### Next
 
 Run `docs/real-tasks.md` and record the per-segment numbers. Still waiting on
-one thing, which is not something an agent may do for itself: `claude-code` is
-listed in the Harnesses tab and not ticked.
+one thing, which is not something an agent may do for itself:
 
 ```text
 [ok  ] session     unlocked: there is a desktop to drive
 [warn] harnesses   1 known, 0 approved: claude-code (not approved)
 ```
+
+Either answer the dialog the first call raises, or in the Harnesses tab tick
+`claude-code` **and press Apply** — the tick alone saves nothing, which is
+the defect above.
 
 ---
 
