@@ -54,3 +54,25 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# -- what the build is allowed to cost on disk ------------------------------
+#
+# `target/debug` reached 23.5 GB on this machine, against 2.0 GB for the
+# release tree, on a 70 GB drive -- it was the single largest thing on the
+# disk and it left 0.1 GB free. Almost all of it is debug info, and most of
+# that belongs to dependencies nobody here steps through: the `windows`
+# crate's bindings and ort are the bulk.
+#
+# Line tables keep what is actually used -- a backtrace with file names and
+# line numbers -- and drop the rest. Dependencies get none at all.
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# The test profile inherits dev, and the test binaries were a large share of
+# those 23.5 GB: one per integration test file, each statically linked.
+[profile.test]
+debug = "line-tables-only"

@@ -322,20 +322,62 @@ fn check_bridge(r: &mut Report, exe_dir: Option<&Path>) {
             let path = m["path"].as_str().unwrap_or_default();
             let origins = m["allowed_origins"].as_array().map(|a| a.len()).unwrap_or(0);
             let p = PathBuf::from(path);
-            let mut notes = Vec::new();
+            // Owned, because the policy note below names the ids it found.
+            let mut notes: Vec<String> = Vec::new();
             if !p.is_absolute() {
-                notes.push("the path is relative, and a browser resolves it against its own \
-                            working directory");
+                notes.push(
+                    "the path is relative, and a browser resolves it against its own working \
+                     directory"
+                        .to_string(),
+                );
             }
             if !p.is_file() {
-                notes.push("the path does not point at a file");
+                notes.push("the path does not point at a file".to_string());
             }
             if let (Some(dir), true) = (exe_dir, p.is_file()) {
                 let expected = dir.join("kratos-host.exe");
                 if expected.is_file() && expected != p {
-                    notes.push("it points at a different build than the one beside this broker");
+                    notes.push(
+                        "it points at a different build than the one beside this broker"
+                            .to_string(),
+                    );
                 }
             }
+
+            // The question that matters, and the one this did not ask.
+            //
+            // A browser loads the extension a policy force-installs, and
+            // Chromium refuses `connectNative` when the caller's origin is
+            // not in this manifest. On this machine the policy installed
+            // `eefdlif...`, the packed .crx, and the manifest allowed only
+            // `ldgfddp...`, the id an unpacked copy gets from its path. Both
+            // files existed and pointed at real things, so every check here
+            // passed while the bridge could not connect at all -- and the
+            // only thing that worked was loading the unpacked copy by hand
+            // from the extensions page, which produced the allowed id.
+            let allowed: Vec<String> = m["allowed_origins"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str())
+                        .filter_map(|o| {
+                            o.strip_prefix("chrome-extension://")
+                                .map(|rest| rest.trim_end_matches('/').to_lowercase())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let orphaned: Vec<String> =
+                forced_extension_ids().into_iter().filter(|id| !allowed.contains(id)).collect();
+            if !orphaned.is_empty() {
+                notes.push(format!(
+                    "a policy force-installs {} and the manifest does not allow it, so that \
+                     extension cannot reach the host however the browser is started: press \
+                     Register in the Browser tab",
+                    orphaned.join(", ")
+                ));
+            }
+
             let v = if notes.is_empty() { Verdict::Ok } else { Verdict::Fail };
             r.add(
                 v,
@@ -436,6 +478,76 @@ fn read_registry_sz(key: &str) -> Option<String> {
 #[cfg(not(windows))]
 fn read_registry_sz(_key: &str) -> Option<String> {
     None
+}
+
+/// Where each brand keeps `ExtensionInstallForcelist`, under HKCU.
+const FORCELIST_KEYS: [&str; 5] = [
+    r"Software\Policies\BraveSoftware\Brave-Browser\ExtensionInstallForcelist",
+    r"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
+    r"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
+    r"Software\Policies\Vivaldi\ExtensionInstallForcelist",
+    r"Software\Policies\Chromium\ExtensionInstallForcelist",
+];
+
+/// Every extension id a policy on this machine force-installs.
+///
+/// Entries are numbered named values holding `<id>;<update_url>`. Read by
+/// number because that is the documented shape of the key.
+///
+/// The same list exists in `kratos-ui`'s `bridge.rs`, duplicated on purpose:
+/// the broker does not depend on the settings window, and the alternative is
+/// a registry reader in the one crate whose whole claim is that it does no
+/// I/O. If one changes, change the other.
+#[cfg(windows)]
+fn forced_extension_ids() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in FORCELIST_KEYS {
+        for n in 1..=20u32 {
+            let Some(value) = read_registry_named(key, &n.to_string()) else { continue };
+            let id = value.split(';').next().unwrap_or_default().trim().to_lowercase();
+            let looks_like_an_id =
+                id.len() == 32 && id.bytes().all(|b| b.is_ascii_lowercase() && b <= b'p');
+            if looks_like_an_id && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+fn forced_extension_ids() -> Vec<String> {
+    Vec::new()
+}
+
+/// One named registry value, where `read_registry_sz` reads a key's default.
+#[cfg(windows)]
+fn read_registry_named(key: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+
+    let wide: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
+    let value: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = [0u16; 1024];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: both strings are NUL-terminated and outlive the call; buf and
+    // size describe one buffer, and size is updated to the bytes written.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let chars = (size as usize / 2).saturating_sub(1).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..chars]))
 }
 
 /// What a running broker says about itself.

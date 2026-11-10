@@ -151,23 +151,30 @@ function openPort() {
   // connectNative resolves lazily: a bad id or a missing registration shows up
   // on the disconnect listener below, not here.
 
-  // Who we are, before anything else. The host cannot ask -- it has no way to
-  // address the extension -- so this is unsolicited by design, and it is
-  // re-sent on every reconnect because the host it reaches may be a new
-  // process that has never heard it.
-  send({
-    v: 1,
-    t: "evt",
-    op: "instance",
-    payload: { token: instanceToken, brand },
-  });
-
+  // The listeners go on BEFORE anything is sent. They used to go on after,
+  // and the gap leaked a host process every time it was hit: if the instance
+  // message below threw, `send` dropped our only reference to the port while
+  // `connectNative` had already started a kratos-host.exe -- with no
+  // disconnect listener attached and nobody left to call disconnect(). The
+  // host then sat on its stdin for ever, because Chromium does not close a
+  // dropped port's stdin.
   port.onMessage.addListener(onBrokerMessage);
   port.onDisconnect.addListener(() => {
     const why = chrome.runtime.lastError ? chrome.runtime.lastError.message : "closed";
     port = null;
     ready = false;
     schedule(why);
+  });
+
+  // Who we are, now that somebody is listening. The host cannot ask -- it has
+  // no way to address the extension -- so this is unsolicited by design, and
+  // it is re-sent on every reconnect because the host it reaches may be a new
+  // process that has never heard it.
+  send({
+    v: 1,
+    t: "evt",
+    op: "instance",
+    payload: { token: instanceToken, brand },
   });
   lastReason = "waiting for the native host to answer";
   // Amber, not green: the host has not spoken yet.
@@ -199,9 +206,28 @@ function send(message) {
     return true;
   } catch (e) {
     console.warn("[kratos] send failed", e);
-    port = null;
+    dropPort();
     schedule("send failed");
     return false;
+  }
+}
+
+/// Let go of the port, and tell the browser so.
+///
+/// Nulling the reference on its own is not enough and was the second half of
+/// the leak: the host process stays alive until Chromium closes the port, and
+/// Chromium only does that when it is asked or when the whole worker dies. A
+/// dropped-but-not-disconnected port is a kratos-host.exe nobody will ever
+/// reap, and five of them accumulated from a single browser start.
+function dropPort() {
+  const dying = port;
+  port = null;
+  ready = false;
+  if (!dying) return;
+  try {
+    dying.disconnect();
+  } catch (_) {
+    /* already gone, which is the outcome we wanted */
   }
 }
 

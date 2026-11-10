@@ -67,16 +67,58 @@ pub fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_lowercase() && b <= b'p')
 }
 
-/// The manifest text for an id and a host path.
+/// Where each brand keeps `ExtensionInstallForcelist`, under HKCU.
+///
+/// This is how `setup-browser.ps1` installs the bridge: packed to a .crx and
+/// force-installed by policy, so it loads however the browser is started and
+/// needs no flag and no launcher. The ids it installs therefore have to be in
+/// the host manifest, and nothing was putting them there.
+const FORCELIST_KEYS: [&str; 5] = [
+    r"Software\Policies\BraveSoftware\Brave-Browser\ExtensionInstallForcelist",
+    r"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
+    r"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
+    r"Software\Policies\Vivaldi\ExtensionInstallForcelist",
+    r"Software\Policies\Chromium\ExtensionInstallForcelist",
+];
+
+/// Every extension id a policy on this machine force-installs.
+///
+/// Forcelist entries are numbered string values holding `<id>;<update_url>`.
+/// Read by number rather than enumerated because the numbering is the
+/// documented shape of the key and twenty is far past any real list; an
+/// enumeration would be more code for the same answer.
+pub fn forced_ids() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in FORCELIST_KEYS {
+        for n in 1..=20u32 {
+            let Ok(value) = read_value(key, &n.to_string()) else { continue };
+            let id = value.split(';').next().unwrap_or_default().trim().to_lowercase();
+            if valid_id(&id) && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// The manifest text for a host path and every id allowed to reach it.
 ///
 /// Hand-rolled rather than serialised so the field order is stable and the
-/// file stays diffable; the only values that vary are two paths we control.
-pub fn manifest_json(id: &str, host_exe: &Path) -> String {
+/// file stays diffable; the only values that vary are paths and ids we
+/// control.
+///
+/// **Plural on purpose.** It took one id before, and the Browser tab takes one
+/// id, so pressing Register cut the policy-installed extension out of its own
+/// manifest -- after which Chromium refused `connectNative` for it and the
+/// only thing that worked was loading the unpacked copy by hand.
+pub fn manifest_json(ids: &[String], host_exe: &Path) -> String {
     let path = host_exe.display().to_string().replace('\\', "\\\\");
+    let origins: Vec<String> =
+        ids.iter().map(|id| format!("    \"chrome-extension://{id}/\"")).collect();
     format!(
         "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"kratos browser bridge\",\n  \
-         \"path\": \"{path}\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\n    \
-         \"chrome-extension://{id}/\"\n  ]\n}}\n"
+         \"path\": \"{path}\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\n{}\n  ]\n}}\n",
+        origins.join(",\n")
     )
 }
 
@@ -123,8 +165,19 @@ pub fn register(id: &str, brands: &[String]) -> Result<Report, String> {
     if let Some(dir) = manifest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    // Every id that may legitimately reach the host, not just the one that
+    // was typed: a policy-installed extension has an id nobody types, and
+    // leaving it out is what made the bridge unreachable on this machine
+    // until the manifest was repaired by hand.
+    let mut ids = vec![id.to_lowercase()];
+    for forced in forced_ids() {
+        if !ids.contains(&forced) {
+            ids.push(forced);
+        }
+    }
+
     // Plain UTF-8, no BOM: Chromium's parser rejects one.
-    std::fs::write(&manifest, manifest_json(id, &host))
+    std::fs::write(&manifest, manifest_json(&ids, &host))
         .map_err(|e| format!("{}: {e}", manifest.display()))?;
 
     let mut lines = Vec::new();
@@ -254,6 +307,38 @@ fn read_default_value(subkey: &str) -> Result<String, String> {
     Ok(String::from_utf16_lossy(&buf[..chars]))
 }
 
+/// One *named* value, where `read_default_value` beside it reads a key's
+/// default.
+///
+/// `ExtensionInstallForcelist` holds its entries as numbered named values, so
+/// reading the policy needs this.
+fn read_value(subkey: &str, name: &str) -> Result<String, String> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+
+    let path = wide(subkey);
+    let value = wide(name);
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    // SAFETY: both strings are NUL-terminated and outlive the call; buf and
+    // len describe one buffer, and len is updated to the bytes written.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            path.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!("not set (error {rc})"));
+    }
+    let chars = (len as usize / 2).saturating_sub(1).min(buf.len());
+    Ok(String::from_utf16_lossy(&buf[..chars]))
+}
+
 fn delete_key(subkey: &str) -> Result<(), String> {
     use windows_sys::Win32::System::Registry::{RegDeleteKeyW, HKEY_CURRENT_USER};
 
@@ -287,7 +372,7 @@ mod tests {
     #[test]
     fn the_manifest_escapes_windows_separators() {
         let json = manifest_json(
-            "ldgfddpecnjhdahallkmdlpiglnflige",
+            &["ldgfddpecnjhdahallkmdlpiglnflige".to_string()],
             Path::new(r"D:\Kratos\target\release\kratos-host.exe"),
         );
         // A raw backslash here would make the file invalid JSON and the host
@@ -301,10 +386,50 @@ mod tests {
 
     #[test]
     fn an_id_round_trips_through_the_manifest() {
-        let json = manifest_json("abcdefghijklmnopabcdefghijklmnop", Path::new("x.exe"));
+        let json =
+            manifest_json(&["abcdefghijklmnopabcdefghijklmnop".to_string()], Path::new("x.exe"));
         let (_, rest) = json.split_once("chrome-extension://").unwrap();
         let (id, _) = rest.split_once('/').unwrap();
         assert_eq!(id, "abcdefghijklmnopabcdefghijklmnop");
+    }
+
+    #[test]
+    fn every_id_reaches_the_manifest_and_the_json_stays_valid() {
+        // The bug this exists for: the manifest held one origin, the policy
+        // force-installed a different id, and Chromium refuses connectNative
+        // for an origin that is not listed -- so the extension that was
+        // actually loaded could never reach the host, and the only thing that
+        // worked was loading an unpacked copy by hand.
+        let ids = vec![
+            "ldgfddpecnjhdahallkmdlpiglnflige".to_string(),
+            "eefdlifpdhceoglncjjmgelhobbfdfgp".to_string(),
+        ];
+        let json = manifest_json(&ids, Path::new(r"D:\Kratos\target\release\kratos-host.exe"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let origins = parsed["allowed_origins"].as_array().expect("a list");
+        assert_eq!(origins.len(), 2, "{json}");
+        for id in &ids {
+            assert!(
+                origins.iter().any(|o| o == &serde_json::json!(format!("chrome-extension://{id}/"))),
+                "{id} is not in {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_the_forcelist_never_invents_an_id() {
+        // It reads whatever this machine has, which a test cannot know, so
+        // what it asserts is the shape: every id that comes back is a real
+        // Chromium id, and there are no duplicates. An empty answer is
+        // correct on a machine with no policy.
+        let ids = forced_ids();
+        for id in &ids {
+            assert!(valid_id(id), "{id:?} is not a Chromium extension id");
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "duplicate ids: {ids:?}");
     }
 
     #[test]

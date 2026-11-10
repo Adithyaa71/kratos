@@ -13,22 +13,58 @@ use std::process::Command;
 
 mod common;
 
-/// Open something with text in it, so there is a window to read.
+/// The window this test reads. A title nothing else on the machine has.
 ///
-/// Notepad, because it is on every Windows machine, starts in well under a
-/// second, and its own title bar and menus are text even when the document
-/// is empty.
+/// **Not Notepad.** That was the first version and it was a quiet trap: one
+/// Windows 11 Notepad process puts 35 visible top-level windows on screen,
+/// all titled "Notepad" or "Untitled - Notepad", because the app is XAML and
+/// its islands are windows in their own right. Finding a window by title then
+/// returns whichever the z-order offers first, and most of them have nothing
+/// drawn in them -- so this test passed alone and failed in the full suite,
+/// where other tests move windows about. That is the `ambiguous_window` case
+/// the protocol has an error code for, met in a test.
+const TITLE: &str = "Kratos Capture Test";
+
+/// WinForms through PowerShell: no build step, no dependency, and the label
+/// below is real rendered text for OCR to find.
+const SCRATCH: &str = r#"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Kratos Capture Test"
+$form.Size = New-Object System.Drawing.Size(520, 200)
+$form.StartPosition = "CenterScreen"
+$form.TopMost = $true
+$label = New-Object System.Windows.Forms.Label
+$label.Text = "Kratos capture probe: the quick brown fox"
+$label.Font = New-Object System.Drawing.Font("Segoe UI", 16)
+$label.AutoSize = $true
+$label.Location = New-Object System.Drawing.Point(20, 60)
+$form.Controls.Add($label)
+[void]$form.ShowDialog()
+"#;
+
+/// Open a window with text in it, so there is something to read.
 struct Scratch {
     child: Option<std::process::Child>,
+    script: std::path::PathBuf,
 }
 
 impl Scratch {
     fn open() -> Scratch {
-        let child = Command::new("notepad.exe").spawn().ok();
-        // Notepad takes a moment to put a window up; without this the find
-        // below races it.
-        std::thread::sleep(std::time::Duration::from_millis(1200));
-        Scratch { child }
+        let script =
+            std::env::temp_dir().join(format!("kratos-capture-{}.ps1", std::process::id()));
+        if std::fs::write(&script, SCRATCH).is_err() {
+            return Scratch { child: None, script };
+        }
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+            .arg(&script)
+            .spawn()
+            .ok();
+        // The form takes a moment to appear; without this the find races it.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        Scratch { child, script }
     }
 }
 
@@ -38,6 +74,7 @@ impl Drop for Scratch {
             let _ = c.kill();
             let _ = c.wait();
         }
+        let _ = std::fs::remove_file(&self.script);
     }
 }
 
@@ -63,7 +100,7 @@ fn a_window_is_captured_and_read() {
         return;
     };
     let _scratch = Scratch::open();
-    let out = Command::new(native()).args(["--ocr", "Notepad"]).output();
+    let out = Command::new(native()).args(["--ocr", TITLE]).output();
     let Ok(out) = out else {
         eprintln!("could not run kratos-native; skipping");
         return;
@@ -122,7 +159,7 @@ fn the_pixel_path_labels_every_element_with_its_source() {
         return;
     };
     let _scratch = Scratch::open();
-    let out = Command::new(native()).args(["--pixels", "Notepad"]).output();
+    let out = Command::new(native()).args(["--pixels", TITLE]).output();
     let Ok(out) = out else {
         eprintln!("could not run kratos-native; skipping");
         return;

@@ -22,6 +22,13 @@ use crate::state::Broker;
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// `CREATE_NO_WINDOW`: a console-subsystem child runs with a console that has
+/// no window on screen. Spelled out here rather than pulled from a Windows
+/// binding crate this one does not otherwise need; the value is the one in the
+/// `CreateProcess` documentation.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Where `kratos-native.exe` is: beside this broker, as every other binary in
 /// this build is, with an override for a split install.
 pub fn exe() -> Option<PathBuf> {
@@ -47,7 +54,8 @@ pub fn supervise(broker: Arc<Broker>, pipe: String) {
         let mut backoff = BACKOFF_MIN;
         loop {
             eprintln!("kratos-broker: starting {}", exe.display());
-            let child = tokio::process::Command::new(&exe)
+            let mut command = tokio::process::Command::new(&exe);
+            command
                 .env("KRATOS_PIPE", &pipe)
                 // "You were started by a broker." A backend that knows this
                 // exits when it cannot find one, instead of retrying for
@@ -61,8 +69,21 @@ pub fn supervise(broker: Arc<Broker>, pipe: String) {
                 // thing it reports to is a process reading somebody's screen
                 // for nobody.
                 .kill_on_drop(true)
-                .stdin(std::process::Stdio::null())
-                .spawn();
+                .stdin(std::process::Stdio::null());
+
+            // Nothing the operator can see. The broker is started detached, so
+            // it owns no console, and Windows hands a console-subsystem child
+            // that can inherit none a brand new console -- which is the window
+            // that appeared when the settings window started a broker and then
+            // sat there for as long as it ran. It was always an empty window:
+            // the broker's own stderr is the null device and this child
+            // inherits that handle, so nothing was ever printed in it. The flag
+            // only takes the window away; the inherited stderr still reaches a
+            // console when somebody runs the broker in one by hand.
+            #[cfg(windows)]
+            command.creation_flags(CREATE_NO_WINDOW);
+
+            let child = command.spawn();
 
             let mut child = match child {
                 Ok(c) => c,
