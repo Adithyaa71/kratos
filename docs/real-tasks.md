@@ -41,6 +41,30 @@ step that parks on `needs_confirmation`. So none of them was run. They are
 written out here in full so that running them is a transcription job and not a
 design job.
 
+### And a second blocker, which is the system working
+
+A browser action goes through the page's own event system and needs no
+pointer, so the obvious thought is to run all four through `dom-ext` and
+ignore the lock. That was tried. It stops one step earlier:
+
+```text
+hello   -> peer a-4  decider jev/jev-latest  backends ocr,pixel,uia
+observe -> not_approved: A dialog is on screen now asking whether
+           "claude-code" may drive this machine. Once somebody answers it,
+           try again.
+```
+
+A harness that has never been approved may ask who it is and nothing else.
+The approval is a dialog a person clicks, and on a locked screen nobody can.
+**An agent cannot approve itself** — that is one of the invariants, not an
+oversight, and the way to run these tasks is not to work around it. The
+operator ticks `claude-code` in the Harnesses tab, or answers the dialog, and
+then the scripts below run.
+
+So there are two independent reasons none of this ran, and both of them are
+the design holding: the screen was locked, and nobody had said this client may
+drive the machine.
+
 **Do not re-run them unattended.** Every one ends at a step a person has to
 approve, which is the whole point of the suite.
 
@@ -51,6 +75,8 @@ approve, which is the whole point of the suite.
 ```bash
 # 1. Unlock the screen, then check:
 ./target/release/kratos-broker.exe doctor
+# `session` must say unlocked. Then tick this harness in the settings window,
+# Harnesses tab -- or answer the dialog the first call raises.
 
 # 2. Point a harness at the broker (the Connect tab generates this):
 claude mcp add kratos -- D:/Kratos/target/release/kratos-mcp.exe --agent agent-one

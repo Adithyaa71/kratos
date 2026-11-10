@@ -135,13 +135,32 @@ that.
 
 ### Known gaps
 
-* **The four real tasks have not been run.** The screen was locked for the
-  whole session and three of the four are browser work that needs a window
-  brought to the front. The scripts are written out step by step, with what
-  each step should return, in [`docs/real-tasks.md`](docs/real-tasks.md); the
-  loop itself was exercised live in P6 against a canvas app, so what is
-  missing is the run, not the design. **This is the one P7 acceptance item
-  that is not met.**
+* **The four real tasks have not been run**, for two independent reasons,
+  and both of them are the design holding rather than a defect.
+
+  The screen was locked for the whole session, and three of the four tasks are
+  browser work that needs a window brought to the front.
+
+  Running them through `dom-ext` instead, which needs no pointer, was tried
+  and stops a step earlier: a harness nobody has approved may ask who it is
+  and nothing else.
+
+  ```text
+  hello   -> peer a-4  decider jev/jev-latest  backends ocr,pixel,uia
+  observe -> not_approved: A dialog is on screen now asking whether
+             "claude-code" may drive this machine. Once somebody answers it,
+             try again.
+  ```
+
+  The approval is a dialog a person clicks, and an agent cannot approve
+  itself. Working around that would mean breaking an invariant to tick an
+  acceptance box.
+
+  The scripts are written out step by step, with the operator sentence for
+  each one and what it should return, in
+  [`docs/real-tasks.md`](docs/real-tasks.md); the loop itself was exercised
+  live in P6 against a canvas app, so what is missing is the run, not the
+  design. **This is the one P7 acceptance item that is not met.**
 * **`kratos-bench --live-tasks` is not built.** It would drive four tasks
   whose last step is irreversible, and it cannot be tested without a screen.
   An untested driver for that is the wrong thing to hand over, so the scripts
